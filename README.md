@@ -19,24 +19,19 @@ Optimization-based control for FLUX flow-map image generation: receding-horizon 
 ## Setup
 
 ```bash
-conda activate flowmaps   # or your PyTorch + diffusers env
+# Create conda env (Python 3.10, PyTorch CUDA 12.1, diffusers, torchao, etc.)
+conda env create -f environment.yml
+conda activate flowmaps
+
+# Optional: HPSv2 + ImageReward backends
+bash scripts/setup_reward_models.sh
 
 export HF_TOKEN=hf_...    # required for FLUX.1-dev
 export HF_HUB_DISABLE_XET=1   # recommended
 
 # FMRG LoRA checkpoint (~345 MB) — not in repo
-mkdir -p fmrg/checkpoints
-# download flux-flowmap-lora into fmrg/checkpoints/flux-flowmap-lora
-# (see fmrg/README or HuggingFace model card)
-```
-
-Install Python dependencies (minimum):
-
-```bash
-pip install torch diffusers transformers torchao matplotlib tqdm huggingface_hub
-# optional reward models:
-pip install hpsv2          # --reward hpsv2
-pip install ImageReward    # --reward imagereward
+bash fmrg/checkpoints_download.sh
+# or manually into fmrg/checkpoints/flux-flowmap-lora
 ```
 
 ## Quick start

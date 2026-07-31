@@ -1,0 +1,73 @@
+# Conda environment for FLUX MPC / FMRG image control (run_sweep.py, image_mpc.py).
+#
+# Create:
+#   conda env create -f environment.yml
+#   conda activate flowmaps
+#
+# Optional reward backends (ImageReward, HPSv2) need a post-install step — see
+# scripts/setup_reward_models.sh or fmrg/install.sh.
+#
+# After activating:
+#   export HF_TOKEN=hf_...          # required for FLUX.1-dev
+#   export HF_HUB_DISABLE_XET=1     # recommended
+#   export FMRG_DIR=$PWD/fmrg       # default in run_sweep.py
+#
+# Download FlowMap LoRA weights (not in repo):
+#   bash fmrg/checkpoints_download.sh
+
+name: flowmaps
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  - pip:
+      # ── PyTorch (CUDA 12.1) ────────────────────────────────────────────────
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
+      - torchvision==0.20.1+cu121
+      - triton==3.1.0
+
+      # ── FLUX / diffusion ─────────────────────────────────────────────────
+      - diffusers==0.34.0
+      - transformers>=4.41.2,<4.54
+      - accelerate==1.12.0
+      - peft>=0.15.0,<0.18
+      - sentencepiece
+      - safetensors>=0.4.0
+      - huggingface-hub>=0.23.0,<0.35.0
+
+      # ── Quantization (run_sweep.py --quantize int8/int4/nf4) ─────────────
+      - torchao==0.9.0
+      - bitsandbytes>=0.43.0
+
+      # ── Scientific / plotting ────────────────────────────────────────────
+      - numpy>=1.26,<3
+      - scipy>=1.11
+      - matplotlib>=3.8
+      - pandas>=2.0
+      - pillow>=10.0
+      - tqdm
+      - einops
+      - ftfy
+      - regex
+      - protobuf>=4.21.6,<5
+
+      # ── Config / utilities ───────────────────────────────────────────────
+      - pyyaml>=6.0
+      - hydra-core>=1.3
+      - omegaconf>=2.3
+      - setuptools<70          # pkg_resources needed by CLIP / reward installs
+
+      # ── Metrics (fmrg scripts) ───────────────────────────────────────────
+      - torchmetrics>=1.3,<1.4
+      - lpips>=0.1.4
+      - scikit-image
+
+      # ── GitHub CLI (optional, for repo management) ───────────────────────
+      # - gh  # install via: conda install -c conda-forge gh
