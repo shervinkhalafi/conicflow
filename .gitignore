@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.ipynb_checkpoints/
+*.so
+
+# Sweep / experiment outputs
+results/
+
+# Local artifacts
+unguided_sample.png
+
+# Model weights (download separately — see README)
+**/checkpoints/
+
+# Experiment tracking
+wandb/
+**/wandb/
+
+# Datasets (download separately)
+fmrg/data/
+flow-maps/py/data/
+flow-maps/py/checkpoints/
+
+# HuggingFace / torch caches
+.cache/
+.huggingface/
+
+# Secrets
+.env
+.env.*
+*.pem
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Slurm / cluster logs
+*.out
+*.err
