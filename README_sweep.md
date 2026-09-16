@@ -26,6 +26,16 @@ python run_sweep.py
 
 # Run only entries 0 and 2 from SWEEP_CONFIGS
 python run_sweep.py --configs 0,2
+
+# MPC with CLIP constraints, sweep thresholds
+python run_sweep.py \
+  --sweep_prompt "a portrait of a man" \
+  --sweep_control_type mpc \
+  --sweep_N 10 --sweep_H 3 \
+  --constraint_prompts "a smiling face" "with glasses" \
+  --sweep_constraint_thresholds 0.3 0.4 0.5 \
+  --lr_dual 0.5 --mu_init 0.0 \
+  --reward clip
 ```
 
 ---
@@ -37,6 +47,8 @@ All outputs land in `--out_dir` (default: `results/`). Each run produces files t
 ```
 {idx}__{control_type}__N{N}__H{H}__lam{lam}__{sample_mode}__{prompt}__images.png
 {idx}__{control_type}__N{N}__H{H}__lam{lam}__{sample_mode}__{prompt}__reward.png
+{idx}__{control_type}__N{N}__H{H}__lam{lam}__{sample_mode}__{prompt}__constraints.png  (MPC + constraints only)
+{idx}__{control_type}__N{N}__H{H}__lam{lam}__{sample_mode}__{prompt}__thr{...}__...     (when thresholds are swept)
 {idx}__{control_type}__N{N}__H{H}__lam{lam}__{sample_mode}__{prompt}__img_unc.png
 {idx}__{control_type}__N{N}__H{H}__lam{lam}__{sample_mode}__{prompt}__img_ctrl.png
 results/summary.csv
@@ -46,6 +58,7 @@ results/summary.csv
 |------|----------|
 | `__images.png` | Side-by-side uncontrolled vs controlled image |
 | `__reward.png` | Reward trajectory over denoising steps + control input bar chart |
+| `__constraints.png` | Constraint values `h_i(z_t)` and Lagrange multipliers `μ_i` over time (MPC + constraints only) |
 | `__img_unc.png` | Uncontrolled image (standalone) |
 | `__img_ctrl.png` | Controlled image (standalone) |
 | `summary.csv` | One row per run: all hyperparams, `r_unc`, `r_ctrl`, `delta_r`, `ctrl_energy`, wall times |
@@ -63,6 +76,11 @@ results/summary.csv
 | `sample_mode` | Flow map variant |
 | `warmstart` | MPC warm-start enabled |
 | `drift_detach` | MPC drift-detach approximation enabled |
+| `constraint_on` | Where MPC evaluates reward/constraints: `horizon` or `endpoint` |
+| `n_constraints` | Number of CLIP inequality constraints |
+| `constraint_thresholds` | Comma-separated CLIP thresholds (one per constraint prompt) |
+| `lr_dual` | Dual-ascent step size for Lagrange multipliers |
+| `mu_init` | Initial Lagrange multiplier value |
 | `r_unc` | Final reward of uncontrolled image |
 | `r_ctrl` | Final reward of controlled image |
 | `delta_r` | `r_ctrl − r_unc` |
@@ -90,7 +108,7 @@ results/summary.csv
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--quantize` | `int8` | Transformer weight quantization. `none` = bfloat16 (~12 GB, fastest); `int8` (~6 GB); `int4` (~3 GB); `nf4` (~3 GB, best quality at 4-bit). Fixed at load time. |
+| `--quantize` | `int8` | Transformer weight quantization. `none` = bfloat16 (~12 GB, fastest); `int8` (~6 GB, GPU-side quantize after load); `int4` (~3 GB, GPU-side); `nf4` (~3 GB, CPU layer swap then GPU pack). Fixed at load time. |
 | `--fast` | `false` | `true` disables VAE tiling/slicing (always safe) and transformer gradient checkpointing (only when safe — kept on for FMRG and MPC with `drift_detach=false`). Also skips per-step `gc/empty_cache`. |
 
 > **Note:** With `drift_detach=true` (the MPC default), the transformer is never backpropped through in the inner solve, so `--fast true` only speeds up VAE decode. The largest `--fast` benefit is for FMRG or MPC with `drift_detach=false`.
@@ -99,7 +117,7 @@ results/summary.csv
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--reward` | `clip` | Reward model used for both guidance and evaluation. Choices: `clip`, `hpsv2`, `pickscore`, `imagereward`. |
+| `--reward` | `clip` | Reward model used for both guidance and evaluation. Choices: `clip`, `hpsv2`, `pickscore`, `imagereward`, `none`. Use `none` when steering is done entirely via constraints. |
 
 | Model | Basis | Extra package |
 |-------|-------|---------------|
@@ -116,6 +134,19 @@ results/summary.csv
 | `--reward_device` | `auto` | Device for the reward model. `auto` picks a second GPU if available, otherwise CPU. Explicit values: `cpu`, `cuda:0`, `cuda:1`, etc. |
 
 With two GPUs, FLUX runs on `cuda:0` and the reward model on `cuda:1`, eliminating reward-model VRAM pressure on the generation GPU.
+
+### CLIP constraints (MPC only)
+
+Inequality constraints of the form `h_i(z) = threshold_i − clip_score(z, prompt_i) ≤ 0`, i.e. each constraint enforces **clip_score ≥ threshold** (a lower bound on similarity). Constraints are enforced softly via a Lagrangian penalty; dual ascent adapts the multipliers when `lr_dual > 0`.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--constraint_prompts` | `[]` | One or more CLIP constraint prompts (global across all runs) |
+| `--constraint_thresholds` | `[]` | Per-prompt thresholds paired with `--constraint_prompts`. Missing values default to `0.0`. Used when `--sweep_constraint_thresholds` is not set. |
+| `--lr_dual` | `0.0` | Dual-ascent step size for Lagrange multipliers. `0` = frozen at `mu_init` (fixed penalty weight). |
+| `--mu_init` | `0.0` | Initial value for all Lagrange multipliers |
+
+Constraints require a CLIP model (loaded automatically when constraints are set, even if `--reward none`).
 
 ---
 
@@ -138,8 +169,43 @@ Each `--sweep_*` argument accepts **one or more values**. The script takes the C
 | `--sweep_width` | — | `256` | Output image width in pixels |
 | `--sweep_warmstart` | — | `true` | MPC only. Reuse the previous window's optimized trajectory as the warm-start for the next step. Usually converges faster. |
 | `--sweep_drift_detach` | — | `true` | MPC only. Treat the flow drift as locally constant inside the inner solve (no transformer backward). Much faster; gradient cosine similarity ~0.999 in practice. Set `false` for exact gradients (requires more VRAM, keep `--fast false`). |
+| `--sweep_constraint_on` | — | `horizon` | MPC only. Where to evaluate reward and constraints: `horizon` (at `x_H`) or `endpoint` (flow-map prediction to final image). |
+| `--sweep_constraint_thresholds` | — | — | Sweep CLIP constraint thresholds. Each spec is one float broadcast to all `--constraint_prompts` (e.g. `0.3`) or comma-separated floats, one per prompt (e.g. `0.3,0.4`). Requires `--constraint_prompts`. |
 
 Boolean sweep flags accept `true`/`false` strings, e.g. `--sweep_drift_detach true false`.
+
+### Sweeping constraint thresholds
+
+`--constraint_prompts` is global (same prompts for every run). Thresholds can be swept with `--sweep_constraint_thresholds`, which participates in the usual Cartesian product with other `--sweep_*` axes.
+
+**Broadcast one threshold to all constraints** — a single float is applied to every prompt:
+
+```bash
+python run_sweep.py \
+  --sweep_prompt "a portrait of a man" \
+  --sweep_control_type mpc \
+  --constraint_prompts "a smiling face" "with glasses" \
+  --sweep_constraint_thresholds 0.3 0.4 0.5 \
+  --lr_dual 0.5 --mu_init 0.0
+```
+
+This produces 3 runs with thresholds `[0.3, 0.3]`, `[0.4, 0.4]`, and `[0.5, 0.5]`.
+
+**Different threshold per constraint** — comma-separated values, count must match `--constraint_prompts`:
+
+```bash
+python run_sweep.py \
+  --sweep_prompt "a portrait of a man" \
+  --constraint_prompts "a smiling face" "with glasses" \
+  --sweep_constraint_thresholds 0.28,0.25 0.32,0.30 0.36,0.35 \
+  --sweep_lam 5000.0 10000.0
+```
+
+This produces 3 × 2 = 6 runs.
+
+**Combined with other axes** — e.g. `--sweep_N 8 10 --sweep_constraint_thresholds 0.3 0.4` → 4 runs.
+
+When thresholds are swept, output filenames include a `__thr{...}` suffix so runs do not overwrite each other.
 
 ### Sample modes
 
@@ -157,7 +223,7 @@ Boolean sweep flags accept `true`/`false` strings, e.g. `--sweep_drift_detach tr
 
 At each outer step `j`, solves a finite-horizon optimization over `H` future trajectory states to minimize control energy subject to maximizing terminal reward. Only the first step of the solution is applied, then the window shifts forward.
 
-Key parameters: `N`, `H`, `lam`, `n_inner`, `lr_inner`, `warmstart`, `drift_detach`.
+Key parameters: `N`, `H`, `lam`, `n_inner`, `lr_inner`, `warmstart`, `drift_detach`, `constraint_on`, `constraint_prompts`, `constraint_thresholds`, `lr_dual`, `mu_init`.
 
 **Cost per inner tick** (with `drift_detach=true`, `H=2`): 1 transformer fwd (no_grad) + 1 VAE fwd + 1 reward backward. No transformer backward.
 

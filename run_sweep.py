@@ -28,7 +28,7 @@ import itertools
 import os
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -38,9 +38,15 @@ matplotlib.use("Agg")          # no display needed
 import matplotlib.pyplot as plt
 
 # ── path setup ───────────────────────────────────────────────────────────────
-FMRG_DIR = os.environ.get("FMRG_DIR", os.path.expanduser("~/flow_matching/fmrg"))
+# This is a standalone copy (sungcho) — image_mpc.py / fluxfm_sampler_reward.py
+# are NOT duplicated here, they're imported read-only from Shervin's original
+# checkout. Override FLOW_MATCHING_DIR / FMRG_DIR env vars once you have your
+# own copies of those modules.
+FLOW_MATCHING_DIR = os.environ.get("FLOW_MATCHING_DIR", "/home/shervink/flow_matching")
+FMRG_DIR = os.environ.get("FMRG_DIR", os.path.join(FLOW_MATCHING_DIR, "fmrg"))
 sys.path.insert(0, FMRG_DIR)
-sys.path.insert(0, os.path.dirname(__file__))   # image_mpc.py lives here
+sys.path.insert(0, FLOW_MATCHING_DIR)           # image_mpc.py lives here (read-only import)
+sys.path.insert(0, os.path.dirname(__file__))
 
 from image_mpc import (
     make_flux_wrappers,
@@ -49,6 +55,21 @@ from image_mpc import (
     trajectory_rewards,
     tune_sampler_speed,
 )
+def stack_constraints(fns):
+    """Combine scalar constraint functions into one (B, C) callable.
+
+    Inlined from mpc_cell.py to avoid importing that module's demo code.
+    Each fn must return (B,) or (B,1); the result is (B, C) column-stacked.
+    """
+    def combined(x):
+        cols = []
+        for fn in fns:
+            v = fn(x)
+            if v.dim() == 1:
+                v = v.unsqueeze(-1)
+            cols.append(v)
+        return torch.cat(cols, dim=-1)
+    return combined
 from fluxfm_sampler_reward import (
     FluxFlowMapSampler,
     CLIPReward,
@@ -64,7 +85,7 @@ try:
 except ImportError:
     raise SystemExit("transformers not installed. Run: pip install transformers")
 
-REWARD_CHOICES = ["clip", "hpsv2", "pickscore", "imagereward"]
+REWARD_CHOICES = ["clip", "hpsv2", "pickscore", "imagereward", "none"]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -73,7 +94,8 @@ REWARD_CHOICES = ["clip", "hpsv2", "pickscore", "imagereward"]
 
 @dataclass
 class RunConfig:
-    prompt:       str   = "a cat wearing sunglasses on a beach"
+    prompt:       str   = "a cat wearing sunglasses on a beach"     # image-generation prompt
+    edit_prompt:  Optional[str] = None  # reward-model target prompt; falls back to `prompt` if None
     N:            int   = 4       # total denoising steps
     H:            int   = 2       # MPC planning horizon (ignored for fmrg)
     control_type: str   = "mpc"   # "mpc" | "fmrg" | "none"
@@ -86,6 +108,13 @@ class RunConfig:
     width:        int   = 256
     warmstart:    bool  = True    # MPC only
     drift_detach: bool  = True    # MPC only (approx but fast)
+    constraint_on: str  = "horizon"  # MPC only; "horizon" | "endpoint"
+    # CLIP inequality constraints: h_i(z) = threshold_i - clip(z, prompt_i) <= 0
+    # Each prompt pairs with the same-index threshold.  Empty → no constraint.
+    constraint_prompts:    List[str]   = field(default_factory=list)
+    constraint_thresholds: List[float] = field(default_factory=list)
+    lr_dual:  float = 0.0   # dual-ascent step size (0 = frozen multipliers)
+    mu_init:  float = 0.0   # initial value for all Lagrange multipliers
     # populated at runtime:
     seed:         int   = 42
     out_dir:      str   = "results"
@@ -108,6 +137,11 @@ SWEEP_CONFIGS: List[RunConfig] = [
     RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="mpc",  lam=200.0),
     # ── sample mode comparison ───────────────────────────────────────────────
     RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="mpc",  lam=50.0, sample_mode="flow_map1"),
+    # ── edit_prompt example: generate with one prompt, reward against another ──
+    RunConfig(prompt="a portrait of a man",             edit_prompt="a smiling face",
+              N=4, H=2, control_type="mpc",  lam=50.0),
+    RunConfig(prompt="a portrait of a man",             edit_prompt="a smiling face",
+              N=4, H=2, control_type="fmrg", lam=5.0),
 ]
 
 
@@ -224,7 +258,11 @@ def _build_reward_fn(sampler, cfg, reward_device, dtype, reward_model: str = "cl
     """
     reward_model = reward_model.lower()
     preprocess = create_clip_preprocess(224)
-    prompt = cfg.prompt
+    # Reward is scored against edit_prompt when set, else falls back to the
+    # generation prompt (e.g. cfg.prompt="a portrait of a man",
+    # cfg.edit_prompt="a smiling face" edits toward the CLIP-smiling direction
+    # while still generating a man's portrait as the starting image).
+    prompt = cfg.edit_prompt if cfg.edit_prompt else cfg.prompt
 
     # ── CLIP ────────────────────────────────────────────────────────────────
     if reward_model == "clip":
@@ -306,6 +344,15 @@ def _build_reward_fn(sampler, cfg, reward_device, dtype, reward_model: str = "cl
             loss = reward_obj(preprocess(img_01), prompt)
             return (2.0 - loss).unsqueeze(0).to(z.device)
 
+    # ── none ─────────────────────────────────────────────────────────────────
+    elif reward_model == "none":
+        # Zero reward everywhere — use when steering is done entirely via
+        # the constraint function h (CLIP-as-constraint mode).
+        reward_obj = None
+
+        def r_image(z: torch.Tensor) -> torch.Tensor:
+            return z.new_zeros(z.shape[0])
+
     else:
         raise ValueError(
             f"Unknown reward_model '{reward_model}'. "
@@ -313,6 +360,59 @@ def _build_reward_fn(sampler, cfg, reward_device, dtype, reward_model: str = "cl
         )
 
     return r_image, reward_obj
+
+
+def _build_clip_constraint_fn(
+    sampler,
+    cfg,
+    reward_device: torch.device,
+    preprocess,
+    clip_model,
+    tokenizer,
+):
+    """Build h(z) -> (B, C) from cfg.constraint_prompts / constraint_thresholds.
+
+    Each pair (prompt_i, threshold_i) contributes one constraint column:
+        h_i(z) = threshold_i - clip_score(z, prompt_i)   [h_i <= 0 means satisfied]
+
+    The CLIP model and tokenizer are passed in so they can be shared with the
+    reward function when ``--reward clip`` is also used (avoids double-loading).
+
+    Returns None when cfg.constraint_prompts is empty.
+    """
+    if not cfg.constraint_prompts:
+        return None
+
+    thresholds = list(cfg.constraint_thresholds)
+    # Pad missing thresholds with 0.0 (i.e. "CLIP score must be positive")
+    while len(thresholds) < len(cfg.constraint_prompts):
+        thresholds.append(0.0)
+
+    # Pre-compute frozen text features for every constraint prompt
+    txt_feats = []
+    with torch.no_grad():
+        for p in cfg.constraint_prompts:
+            toks = tokenizer(
+                p, return_tensors="pt", padding=True,
+                max_length=77, truncation=True,
+            ).to(reward_device)
+            tf = clip_model.get_text_features(**toks)
+            tf = tf / tf.norm(dim=-1, keepdim=True)
+            txt_feats.append(tf)
+
+    def _make_hi(txt_feat, threshold):
+        """Factory to capture (txt_feat, threshold) by value."""
+        def hi(z: torch.Tensor) -> torch.Tensor:
+            img = sampler.decode(z)
+            img_01 = ((img + 1.0) / 2.0).float().to(reward_device)
+            img_feat = clip_model.get_image_features(preprocess(img_01))
+            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+            score = (img_feat @ txt_feat.T).squeeze(-1).to(z.device)
+            return threshold - score   # <= 0  ⟺  score >= threshold
+        return hi
+
+    h_fns = [_make_hi(tf, thr) for tf, thr in zip(txt_feats, thresholds)]
+    return stack_constraints(h_fns)
 
 
 def _run_one(
@@ -352,10 +452,43 @@ def _run_one(
     z0 = torch.randn(1, in_ch, cfg.height // vscale, cfg.width // vscale,
                      device=device, dtype=dtype)
 
-    # Reward function
+    # ── Reward function ───────────────────────────────────────────────────────
+    # When constraints are present we need a CLIP model regardless of whether
+    # the reward is also CLIP.  Load it once here so both can share it.
+    preprocess  = None
+    clip_model  = None
+    clip_tokenizer = None
+    if cfg.constraint_prompts or reward_model == "clip":
+        from transformers import AutoProcessor as _AP
+        clip_tokenizer = _AP.from_pretrained(
+            "laion/CLIP-ViT-H-14-laion2B-s32B-b79K", cache_dir=HF_CACHE
+        )
+        _clip_reward_obj = CLIPReward(
+            device=reward_device, dtype=torch.float32,
+            tokenizer=clip_tokenizer, cache_dir=HF_CACHE,
+        )
+        clip_model = _clip_reward_obj.model
+        preprocess = create_clip_preprocess(224)
+
     r_image, _reward_obj = _build_reward_fn(
         sampler, cfg, reward_device, dtype, reward_model=reward_model,
     )
+
+    # ── Constraint function h(z) -> (B, C) ───────────────────────────────────
+    h_fn = None
+    if cfg.constraint_prompts:
+        if cfg.control_type != "mpc":
+            log("  WARNING: constraints are only supported for control_type=mpc; ignoring.")
+        else:
+            if cfg.lr_dual == 0.0:
+                log("  NOTE: lr_dual=0 → Lagrange multipliers are frozen at mu_init "
+                    "(constraint is a fixed penalty, not adaptive dual ascent).")
+            h_fn = _build_clip_constraint_fn(
+                sampler, cfg, reward_device, preprocess, clip_model, clip_tokenizer,
+            )
+            log(f"  constraint: {len(cfg.constraint_prompts)} CLIP constraint(s)  "
+                f"thresholds={cfg.constraint_thresholds}  "
+                f"lr_dual={cfg.lr_dual}  mu_init={cfg.mu_init}")
 
     def eval_r(z):
         with torch.no_grad():
@@ -376,9 +509,10 @@ def _run_one(
     v_theta = None
     time_ctrl = 0.0
     r_ctrl_final = float("nan")
+    mu_hist = None
 
     if cfg.control_type != "none":
-        v_theta, _, _ = make_flux_wrappers(
+        v_theta, _, endpoint_map = make_flux_wrappers(
             sampler, cfg.prompt,
             guidance_scale=cfg.guidance_scale,
             n_mpc_steps=cfg.N,
@@ -389,7 +523,7 @@ def _run_one(
         t0 = time.perf_counter()
 
         if cfg.control_type == "mpc":
-            z_ctrl, traj_ctrl, _, _ = receding_horizon_flow_control(
+            z_ctrl, traj_ctrl, _, _, mu_hist = receding_horizon_flow_control(
                 v_theta=v_theta,
                 r=r_image,
                 x0=z0,
@@ -401,6 +535,11 @@ def _run_one(
                 lr=cfg.lr_inner,
                 warmstart=cfg.warmstart,
                 drift_detach=cfg.drift_detach,
+                h=h_fn,
+                mu_init=cfg.mu_init,
+                lr_dual=cfg.lr_dual,
+                constraint_on=cfg.constraint_on,
+                endpoint_map=endpoint_map,
                 verbose=not quiet,
                 low_memory=low_memory,
                 device=device,
@@ -446,8 +585,29 @@ def _run_one(
         ctrl_norms, ctrl_energy = _ctrl_norms_from_traj(
             traj_ctrl, v_theta, cfg.N, device, dtype,
         )
+
+    # Constraint values along the controlled trajectory: h_i(z_t) for each step t.
+    # Shape: (N+1, C) — mean over batch (B=1 here so trivial).
+    constraint_traj = None   # numpy (N+1, C) or None
+    if traj_ctrl is not None and h_fn is not None:
+        log("  computing constraint trajectory...")
+        vals = []
+        with torch.no_grad():
+            for t_idx in range(traj_ctrl.shape[0]):
+                zt = traj_ctrl[t_idx].to(device=device, dtype=dtype)
+                hv = h_fn(zt)                 # (B, C)
+                vals.append(hv.mean(0).cpu())  # (C,)
+        constraint_traj = torch.stack(vals, dim=0).float().numpy()  # (N+1, C)
+
     if traj_ctrl is not None:
         _free(traj_ctrl)
+
+    # Lagrangian objective J = control_energy / (2*lam) - r_ctrl, matching the
+    # sign/scaling of the inner-loop loss in _horizon_objective (image_mpc.py).
+    # Lower J is better; this is what makes MPC vs. FMRG comparable at a fixed lam.
+    objective = float("nan")
+    if cfg.control_type != "none":
+        objective = ctrl_energy / (2.0 * cfg.lam) - r_ctrl_final
 
     # Free reward model weights after use
     if hasattr(_reward_obj, "cpu"):
@@ -456,18 +616,26 @@ def _run_one(
 
     return dict(
         prompt        = cfg.prompt,
+        edit_prompt   = cfg.edit_prompt if cfg.edit_prompt else cfg.prompt,
         N             = cfg.N,
         H             = cfg.H,
         control_type  = cfg.control_type,
         lam           = cfg.lam,
         n_inner       = cfg.n_inner,
+        lr_inner      = cfg.lr_inner,
         sample_mode   = cfg.sample_mode,
         warmstart     = cfg.warmstart,
         drift_detach  = cfg.drift_detach,
+        constraint_on = cfg.constraint_on,
+        n_constraints = len(cfg.constraint_prompts),
+        constraint_thresholds = _format_thresholds(cfg.constraint_thresholds),
+        lr_dual       = cfg.lr_dual,
+        mu_init       = cfg.mu_init,
         r_unc         = r_unc_final,
         r_ctrl        = r_ctrl_final,
         delta_r       = r_ctrl_final - r_unc_final,
         ctrl_energy   = ctrl_energy,
+        objective     = objective,
         time_unc_s    = time_unc,
         time_ctrl_s   = time_ctrl,
         # image objects (not CSV-serialisable, stripped before writing)
@@ -477,11 +645,17 @@ def _run_one(
         _r_unc_c   = r_unc_curve,
         _r_ctrl_c  = r_ctrl_curve,
         _ctrl_norms = ctrl_norms,
+        # constraint diagnostics (None when no constraints)
+        _constraint_traj = constraint_traj,   # numpy (N+1, C) or None
+        _mu_hist         = mu_hist,           # tensor (N, B, C) or None
+        _constraint_prompts    = list(cfg.constraint_prompts),
+        _constraint_thresholds = list(cfg.constraint_thresholds),
     )
 
 
-def _save_run(result: dict, out_dir: Path, run_idx: int):
-    """Write side-by-side image + reward curve for one run."""
+def _save_run(result: dict, out_dir: Path, run_idx: int) -> str:
+    """Write side-by-side image + reward curve for one run. Returns cfg_tag
+    (the filename prefix) so callers can record it for later image lookup."""
     cfg_tag = (
         f"{run_idx:03d}"
         f"__{result['control_type']}"
@@ -491,6 +665,8 @@ def _save_run(result: dict, out_dir: Path, run_idx: int):
         f"__{result['sample_mode']}"
         f"__{result['prompt'][:30].replace(' ', '_')}"
     )
+    if result.get("n_constraints", 0) > 0 and result.get("constraint_thresholds"):
+        cfg_tag += f"__thr{result['constraint_thresholds'].replace(',', '_')}"
 
     # Side-by-side images
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
@@ -504,8 +680,10 @@ def _save_run(result: dict, out_dir: Path, run_idx: int):
         f"  r={result['r_ctrl']:.4f}"
     ) if result["control_type"] != "none" else "Uncontrolled (reference)"
     axes[1].set_title(ctrl_lbl)
-    plt.suptitle(result["prompt"][:70] + f"\nN={result['N']}  {result['sample_mode']}",
-                 fontsize=9)
+    title = f"gen: {result['prompt'][:60]}"
+    if result["edit_prompt"] != result["prompt"]:
+        title += f"\nedit: {result['edit_prompt'][:60]}"
+    plt.suptitle(title + f"\nN={result['N']}  {result['sample_mode']}", fontsize=9)
     plt.tight_layout()
     fig.savefig(out_dir / f"{cfg_tag}__images.png", dpi=100)
     plt.close(fig)
@@ -544,7 +722,10 @@ def _save_run(result: dict, out_dir: Path, run_idx: int):
         )
         ax_u.grid(True, alpha=0.3, axis="y")
 
-    plt.suptitle(result["prompt"][:70], fontsize=9)
+    title = f"gen: {result['prompt'][:60]}"
+    if result["edit_prompt"] != result["prompt"]:
+        title += f"   |   edit: {result['edit_prompt'][:60]}"
+    plt.suptitle(title, fontsize=9)
     plt.tight_layout()
     fig.savefig(out_dir / f"{cfg_tag}__reward.png", dpi=100)
     plt.close(fig)
@@ -553,12 +734,111 @@ def _save_run(result: dict, out_dir: Path, run_idx: int):
     if result["control_type"] != "none":
         result["_img_ctrl"].save(out_dir / f"{cfg_tag}__img_ctrl.png")
 
+    # Constraint diagnostic plot (only when constraints were active)
+    if result.get("_constraint_traj") is not None:
+        _save_constraint_plot(result, out_dir, cfg_tag)
+
+    return cfg_tag
+
+
+def _save_constraint_plot(result: dict, out_dir: Path, cfg_tag: str) -> None:
+    """Save a side-by-side figure:
+        left  — h_i(z_t) trajectory for each constraint, threshold as dotted line.
+        right — mu_i trajectory for each Lagrange multiplier.
+    """
+    import numpy as np
+
+    c_traj   = result["_constraint_traj"]     # (N+1, C) numpy
+    mu_hist  = result["_mu_hist"]             # tensor (N, B, C) or None
+    prompts  = result["_constraint_prompts"]
+    threshs  = result["_constraint_thresholds"]
+    N_steps  = c_traj.shape[0] - 1
+    C        = c_traj.shape[1]
+
+    # x-axis: progress time s=0..1 sampled at each MPC outer step
+    t_steps = np.linspace(0.0, 1.0, N_steps + 1)
+
+    fig, (ax_h, ax_mu) = plt.subplots(1, 2, figsize=(12, 4))
+
+    # ── left: constraint values + threshold lines ─────────────────────────
+    for i in range(C):
+        label = prompts[i][:40] if i < len(prompts) else f"h_{i}"
+        ax_h.plot(t_steps, c_traj[:, i], "o-", linewidth=2, markersize=5,
+                  label=f"$h_{{{i}}}$: {label}")
+        thr = threshs[i] if i < len(threshs) else 0.0
+        # h_i(z) = threshold - clip_score; threshold line is where h=0
+        ax_h.axhline(0.0, color=ax_h.lines[-1].get_color(),
+                     linestyle="--", linewidth=1.2, alpha=0.7,
+                     label=f"threshold (thr={thr:.3f})")
+
+    ax_h.set_xlabel("Progress time $s$  (0 = noise, 1 = data)")
+    ax_h.set_ylabel(r"$h_i(z_t) = \theta_i - \mathrm{clip}(z_t, p_i)$")
+    ax_h.set_title("Constraint trajectory\n"
+                   r"(satisfied when $h_i \leq 0$)")
+    ax_h.legend(fontsize=7, loc="upper right")
+    ax_h.grid(True, alpha=0.3)
+
+    # ── right: mu trajectory ─────────────────────────────────────────────
+    if mu_hist is not None:
+        # mu_hist: (N, B, C) → take mean over batch → (N, C)
+        mu_np = mu_hist.float().mean(dim=1).cpu().numpy()  # (N, C)
+        t_mu  = np.linspace(1.0 / N_steps, 1.0, N_steps)  # after each step
+        for i in range(C):
+            label = prompts[i][:40] if i < len(prompts) else f"mu_{i}"
+            ax_mu.plot(t_mu, mu_np[:, i], "s-", linewidth=2, markersize=5,
+                       label=f"$\\mu_{{{i}}}$: {label}")
+        ax_mu.set_xlabel("Progress time $s$")
+        ax_mu.set_ylabel(r"$\mu_i$  (Lagrange multiplier)")
+        ax_mu.set_title(
+            f"Lagrange multiplier trajectory\n"
+            f"lr_dual={result['lr_dual']}  mu_init={result['mu_init']}"
+        )
+        ax_mu.legend(fontsize=7, loc="upper left")
+        ax_mu.grid(True, alpha=0.3)
+    else:
+        ax_mu.text(0.5, 0.5, "lr_dual=0\n(multipliers frozen)",
+                   ha="center", va="center", transform=ax_mu.transAxes, fontsize=11)
+        ax_mu.set_axis_off()
+
+    title = f"gen: {result['prompt'][:60]}"
+    if result["edit_prompt"] != result["prompt"]:
+        title += f"  |  edit: {result['edit_prompt'][:40]}"
+    plt.suptitle(title, fontsize=9)
+    plt.tight_layout()
+    fig.savefig(out_dir / f"{cfg_tag}__constraints.png", dpi=100)
+    plt.close(fig)
+
 
 CSV_KEYS = [
-    "prompt", "N", "H", "control_type", "lam", "n_inner", "sample_mode",
-    "warmstart", "drift_detach", "r_unc", "r_ctrl", "delta_r",
-    "ctrl_energy", "time_unc_s", "time_ctrl_s",
+    "tag", "prompt", "edit_prompt", "N", "H", "control_type", "lam", "n_inner", "lr_inner",
+    "sample_mode", "warmstart", "drift_detach", "constraint_on",
+    "n_constraints", "constraint_thresholds", "lr_dual", "mu_init",
+    "r_unc", "r_ctrl", "delta_r",
+    "ctrl_energy", "objective", "time_unc_s", "time_ctrl_s",
 ]
+
+
+def _parse_threshold_sweep_spec(spec: str, n_prompts: int) -> List[float]:
+    """Parse one --sweep_constraint_thresholds entry into a per-prompt list.
+
+    A single float (e.g. ``0.3``) is broadcast to every constraint prompt.
+    Comma-separated floats (e.g. ``0.3,0.4``) must match the prompt count.
+    """
+    parts = [float(x.strip()) for x in spec.split(",")]
+    if len(parts) == 1:
+        return parts * max(n_prompts, 1)
+    if len(parts) != n_prompts:
+        raise ValueError(
+            f"threshold spec {spec!r} has {len(parts)} value(s) but "
+            f"{n_prompts} constraint prompt(s); use one float to broadcast "
+            f"or {n_prompts} comma-separated floats."
+        )
+    return parts
+
+
+def _format_thresholds(thresholds: List[float]) -> str:
+    """Compact string for CSV / filename tags."""
+    return ",".join(f"{t:g}" for t in thresholds)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -579,14 +859,30 @@ def _build_configs_from_args(args) -> List[RunConfig]:
     axes = {}
     defaults = RunConfig()
     sweep_fields = [
-        "prompt", "N", "H", "control_type", "lam", "n_inner",
+        "prompt", "edit_prompt", "N", "H", "control_type", "lam", "n_inner",
         "lr_inner", "sample_mode", "guidance_scale",
-        "height", "width", "warmstart", "drift_detach",
+        "height", "width", "warmstart", "drift_detach", "constraint_on",
+        "constraint_thresholds",
     ]
     for f in sweep_fields:
         val = getattr(args, f"sweep_{f}", None)
         if val is not None:
             axes[f] = val
+
+    # Parse threshold sweep specs into List[float] entries.
+    if "constraint_thresholds" in axes:
+        n_prompts = len(args.constraint_prompts)
+        if n_prompts == 0:
+            raise SystemExit(
+                "--sweep_constraint_thresholds requires --constraint_prompts."
+            )
+        try:
+            axes["constraint_thresholds"] = [
+                _parse_threshold_sweep_spec(spec, n_prompts)
+                for spec in axes["constraint_thresholds"]
+            ]
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     if not axes:
         return []
@@ -616,12 +912,54 @@ Sweep via CLI (cartesian product of all provided lists):
       --sweep_control_type mpc fmrg \\
       --sweep_lam 50.0 200.0
 
+  # separate generation prompt vs. editing/reward prompt:
+  python run_sweep.py \\
+      --sweep_prompt "a portrait of a man" \\
+      --sweep_edit_prompt "a smiling face" \\
+      --sweep_control_type mpc fmrg \\
+      --sweep_lam 5.0 50.0 200.0
+
+  # CLIP as constraint only (r = zero):
+  python run_sweep.py \\
+      --sweep_prompt "a portrait of a man" \\
+      --sweep_control_type mpc \\
+      --sweep_lam 10000.0 \\
+      --reward none \\
+      --constraint_prompts "a smiling face" \\
+      --constraint_thresholds 0.28 \\
+      --lr_dual 0.1 --mu_init 1.0 \\
+      --sweep_constraint_on endpoint
+
+  # Two CLIP constraints + separate reward:
+  python run_sweep.py \\
+      --sweep_prompt "a portrait of a man" \\
+      --sweep_edit_prompt "a portrait of a man" \\
+      --reward clip \\
+      --constraint_prompts "a smiling face" "with glasses" \\
+      --sweep_constraint_thresholds 0.28 0.32 0.36 \\
+      --lr_dual 0.05 --mu_init 0.5
+
+  # Per-constraint threshold pairs (must match prompt count):
+  python run_sweep.py \\
+      --sweep_prompt "a portrait of a man" \\
+      --constraint_prompts "a smiling face" "with glasses" \\
+      --sweep_constraint_thresholds 0.28,0.25 0.32,0.30 0.36,0.35
+
 Use SWEEP_CONFIGS in the file when no --sweep_* flags are given.
 Filter SWEEP_CONFIGS by index with --configs 0,2,4.
         """,
     )
     # ── infrastructure ───────────────────────────────────────────────────────
-    parser.add_argument("--out_dir",   default="results")
+    # Absolute default (anchored to this script's own directory) so a relative
+    # "results" never lands inside Shervin's original repo if this is invoked
+    # from a different cwd (e.g. cwd = flow_matching to pick up its imports).
+    # Timestamp-prefixed subfolder: keeps runs chronologically sortable and
+    # avoids different sweeps colliding on the same run_idx-based image tags.
+    default_out_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "results",
+        time.strftime("%Y%m%d_%H%M%S"),
+    )
+    parser.add_argument("--out_dir",   default=default_out_dir)
     parser.add_argument("--seed",      type=int, default=42)
     parser.add_argument("--hf_token",  default=None,
                         help="HuggingFace token (or set HF_TOKEN env var)")
@@ -638,7 +976,8 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     parser.add_argument("--reward",      default="clip",
                         choices=REWARD_CHOICES,
                         help="Reward model for control guidance and evaluation "
-                             "(default: clip). Options: clip, hpsv2, pickscore, imagereward")
+                             "(default: clip). Options: clip, hpsv2, pickscore, imagereward, none. "
+                             "Use 'none' when steering is done entirely via --constraint_prompts.")
     parser.add_argument("--flux_device", default="cuda:0",
                         help="Device for FLUX transformer + VAE (default: cuda:0)")
     parser.add_argument("--reward_device", default="auto",
@@ -652,6 +991,10 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     # ── sweep axes (each accepts 1+ values; cartesian product is taken) ──────
     d = RunConfig()   # defaults
     parser.add_argument("--sweep_prompt",        nargs="+", metavar="PROMPT")
+    parser.add_argument("--sweep_edit_prompt",   nargs="+", metavar="EDIT_PROMPT",
+                        help="Reward-model target prompt(s); combined via cartesian "
+                             "product with --sweep_prompt. Omit to reward against "
+                             "the generation prompt itself.")
     parser.add_argument("--sweep_N",             nargs="+", type=int,   metavar="N")
     parser.add_argument("--sweep_H",             nargs="+", type=int,   metavar="H")
     parser.add_argument("--sweep_control_type",  nargs="+",
@@ -669,6 +1012,31 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                         metavar="BOOL")
     parser.add_argument("--sweep_drift_detach",  nargs="+", type=lambda x: x.lower() != "false",
                         metavar="BOOL")
+    parser.add_argument("--sweep_constraint_on", nargs="+",
+                        choices=["horizon", "endpoint"], metavar="MODE",
+                        help="MPC only. Where to evaluate reward and constraint h(x): "
+                             "'horizon' (at x_H, default) or 'endpoint' (flow-map to t=1).")
+
+    # ── CLIP constraint flags (global, not sweep axes) ───────────────────────
+    parser.add_argument("--constraint_prompts", nargs="+", default=[], metavar="PROMPT",
+                        help="One or more CLIP constraint prompts (MPC only). "
+                             "Each prompt enforces: clip_score(image, prompt) >= threshold.")
+    parser.add_argument("--constraint_thresholds", nargs="+", type=float, default=[],
+                        metavar="THRESH",
+                        help="Per-prompt CLIP thresholds paired with --constraint_prompts. "
+                             "Missing thresholds default to 0.0. "
+                             "Used when --sweep_constraint_thresholds is not set. "
+                             "h_i(z) = threshold_i - clip(z, prompt_i) <= 0.")
+    parser.add_argument("--sweep_constraint_thresholds", nargs="+", metavar="THRESH_SPEC",
+                        help="Sweep CLIP constraint thresholds (cartesian product axis). "
+                             "Each spec is one float broadcast to all prompts (e.g. 0.3) "
+                             "or comma-separated floats, one per --constraint_prompt "
+                             "(e.g. 0.3,0.4). Requires --constraint_prompts.")
+    parser.add_argument("--lr_dual", type=float, default=0.0,
+                        help="Dual-ascent step size for Lagrange multipliers "
+                             "(default 0 = frozen multipliers, i.e. fixed Lagrangian penalty).")
+    parser.add_argument("--mu_init", type=float, default=0.0,
+                        help="Initial value for all Lagrange multipliers (default 0.0).")
 
     args = parser.parse_args()
 
@@ -694,18 +1062,23 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
         else:
             print(f"Using all {len(configs)} SWEEP_CONFIGS entries")
 
-    # Apply seed and out_dir to all configs
+    # Apply seed, out_dir, and constraint params to all configs
     for cfg in configs:
-        cfg.seed = args.seed
+        cfg.seed    = args.seed
         cfg.out_dir = args.out_dir
+        cfg.constraint_prompts = args.constraint_prompts
+        if args.sweep_constraint_thresholds is None:
+            cfg.constraint_thresholds = args.constraint_thresholds
+        cfg.lr_dual  = args.lr_dual
+        cfg.mu_init  = args.mu_init
 
     flux_device, reward_device = _resolve_devices(args.flux_device, args.reward_device)
     if not args.quiet:
         print(f"Devices: FLUX={flux_device}  reward({args.reward})={reward_device}")
 
     # Load sampler once
-    lora_path = args.lora_path or os.path.expanduser(
-        "~/flow_matching/fmrg/checkpoints/flux-flowmap-lora"
+    lora_path = args.lora_path or os.path.join(
+        FMRG_DIR, "checkpoints", "flux-flowmap-lora"
     )
     print(f"Loading FluxFlowMapSampler (quantize_mode={args.quantize})...")
     # Use the first prompt as the initial cached embedding; it will be
@@ -724,45 +1097,58 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     dtype  = next(sampler.pipeline.transformer.parameters()).dtype
     low_memory = not args.fast
 
-    # Run sweep
-    rows = []
-    for run_idx, cfg in enumerate(configs):
-        print(f"\n{'='*60}")
-        print(f"Run {run_idx+1}/{len(configs)}: "
-              f"control={cfg.control_type} N={cfg.N} H={cfg.H} "
-              f"lam={cfg.lam} mode={cfg.sample_mode}")
-        print(f"  prompt: {cfg.prompt[:60]}")
-
-        try:
-            result = _run_one(
-                sampler, cfg, device, reward_device, dtype, quiet=args.quiet,
-                fast=args.fast, low_memory=low_memory, reward_model=args.reward,
-            )
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            import traceback; traceback.print_exc()
-            continue
-
-        _save_run(result, out_dir, run_idx)
-
-        row = {k: result[k] for k in CSV_KEYS}
-        rows.append(row)
-
-        if not args.quiet:
-            energy = result["ctrl_energy"]
-            energy_str = f"{energy:.4f}" if energy == energy else "n/a"
-            print(f"  r_unc={result['r_unc']:.4f}  r_ctrl={result['r_ctrl']:.4f}"
-                  f"  Δr={result['delta_r']:+.4f}"
-                  f"  Σ‖u‖²Δt={energy_str}"
-                  f"  t_ctrl={result['time_ctrl_s']:.1f}s")
-
-    # Write CSV summary
+    # Run sweep — CSV is written incrementally (one row per run, flushed to
+    # disk immediately) so a crash/OOM/kill partway through a long sweep loses
+    # at most the in-flight run, not every result computed so far.
     csv_path = out_dir / "summary.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_KEYS)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nResults saved to {out_dir}/")
+    csv_file = open(csv_path, "w", newline="")
+    writer = csv.DictWriter(csv_file, fieldnames=CSV_KEYS)
+    writer.writeheader()
+    csv_file.flush()
+
+    n_rows = 0
+    try:
+        for run_idx, cfg in enumerate(configs):
+            print(f"\n{'='*60}")
+            print(f"Run {run_idx+1}/{len(configs)}: "
+                  f"control={cfg.control_type} N={cfg.N} H={cfg.H} "
+                  f"lam={cfg.lam} mode={cfg.sample_mode}")
+            print(f"  prompt: {cfg.prompt[:60]}")
+            if cfg.edit_prompt:
+                print(f"  edit_prompt: {cfg.edit_prompt[:60]}")
+
+            try:
+                result = _run_one(
+                    sampler, cfg, device, reward_device, dtype, quiet=args.quiet,
+                    fast=args.fast, low_memory=low_memory, reward_model=args.reward,
+                )
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                import traceback; traceback.print_exc()
+                continue
+
+            result["tag"] = _save_run(result, out_dir, run_idx)
+
+            row = {k: result[k] for k in CSV_KEYS}
+            writer.writerow(row)
+            csv_file.flush()
+            os.fsync(csv_file.fileno())
+            n_rows += 1
+
+            if not args.quiet:
+                energy = result["ctrl_energy"]
+                energy_str = f"{energy:.4f}" if energy == energy else "n/a"
+                obj = result["objective"]
+                obj_str = f"{obj:.4f}" if obj == obj else "n/a"
+                print(f"  r_unc={result['r_unc']:.4f}  r_ctrl={result['r_ctrl']:.4f}"
+                      f"  Δr={result['delta_r']:+.4f}"
+                      f"  Σ‖u‖²Δt={energy_str}"
+                      f"  J={obj_str}"
+                      f"  t_ctrl={result['time_ctrl_s']:.1f}s")
+    finally:
+        csv_file.close()
+
+    print(f"\n{n_rows}/{len(configs)} runs completed. Results saved to {out_dir}/")
     print(f"CSV summary: {csv_path}")
 
 
