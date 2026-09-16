@@ -11,8 +11,9 @@ Optimization-based control for FLUX flow-map image generation: receding-horizon 
 | `README_sweep.md` | Full CLI reference for `run_sweep.py` |
 | `image_tests.ipynb` | Interactive MPC / FMRG demos on FLUX latents |
 | `evalution.ipynb` | Analyze `results/summary.csv` |
-| `flow_map_tests.ipynb` | 2D flow-map MPC / FMRG experiments |
 | `mpc_cell.py` | Standalone MPC cell utilities |
+| `lowdim/` | Low-dimensional (2D flow-map) MPC / HardFlow / FMRG experiments, sweeps and Pareto plots |
+| `fmocc_core/` | Extracted, self-contained core for running the MPC / HardFlow / FMRG comparisons |
 | `fmrg/` | FLUX FlowMap sampler + reward models ([upstream](https://github.com/jrrhuang/fmrg), locally patched) |
 | `flow-maps/` | Flow-map training code ([upstream](https://github.com/nmboffi/flow-maps), locally patched) |
 
