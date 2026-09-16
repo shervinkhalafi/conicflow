@@ -8,6 +8,7 @@ __pycache__/
 
 # Sweep / experiment outputs
 results/
+lowdim/results*/
 
 # Local artifacts
 unguided_sample.png
