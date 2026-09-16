@@ -56,7 +56,8 @@ dependencies:
       - einops
       - ftfy
       - regex
-      - protobuf>=4.21.6,<5
+      - protobuf>=4.21.6      # tensorflow (below) requires >=5, uncapped here
+      - scikit-learn>=1.3
 
       # ── Config / utilities ───────────────────────────────────────────────
       - pyyaml>=6.0
@@ -69,5 +70,41 @@ dependencies:
       - lpips>=0.1.4
       - scikit-image
 
+      # ── Flow-map notebook + training (flow_map_tests.ipynb, py/launchers/learn.py) ──
+      # torchcfm: conditional-flow-matching losses / OT couplings
+      # flax + jax[cuda12]: JAX/Flax flow-map training and checkpoint (de)serialization.
+      #   GPU jaxlib is required for py/launchers/learn.py (uses jax.pmap across all
+      #   local GPUs); the notebook itself only needs msgpack_restore (CPU is enough
+      #   there, but training and the notebook share this env).
+      #   NOTE: pulls in nvidia-cudnn-cu12 >9.1.0.70, newer than the version torch
+      #   above pins. In practice both torch and jax load the newer cuDNN fine
+      #   (verified with conv2d fwd/bwd on GPU + jax.devices() detecting all GPUs),
+      #   so this is left unpinned rather than forcing a downgrade.
+      # tensorflow / tensorflow-datasets / ml_collections: transitive imports pulled
+      #   in by flow-maps/py/common/datasets.py (sample_two_moons)
+      # seaborn / wandb: used by flow-maps/py/common/logging.py during training
+      - torchcfm==1.0.7
+      - flax>=0.10
+      - jax[cuda12]>=0.6
+      - tensorflow>=2.15
+      - tensorflow-datasets>=4.9
+      - ml-collections>=1.1
+      - seaborn>=0.13
+      - wandb>=0.16.5
+
       # ── GitHub CLI (optional, for repo management) ───────────────────────
       # - gh  # install via: conda install -c conda-forge gh
+
+# ── Known post-install fix: libstdc++ ABI mismatch ───────────────────────────
+# scipy (imported via sklearn -> common/datasets.py) is built against a newer
+# libstdc++ (CXXABI_1.3.15) than the system one at /lib/x86_64-linux-gnu, but
+# conda already ships a compatible libstdc++ under $CONDA_PREFIX/lib. Without
+# this, `import scipy.spatial` fails with:
+#   ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found
+# Fix (one-time, per env) — add a conda activate hook so it's picked up automatically:
+#   mkdir -p $CONDA_PREFIX/etc/conda/activate.d $CONDA_PREFIX/etc/conda/deactivate.d
+#   printf 'export _FLOWMAPS_OLD_LD_LIBRARY_PATH="$LD_LIBRARY_PATH"\nexport LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"\n' \
+#     > $CONDA_PREFIX/etc/conda/activate.d/libstdcxx_fix.sh
+#   printf 'export LD_LIBRARY_PATH="$_FLOWMAPS_OLD_LD_LIBRARY_PATH"\nunset _FLOWMAPS_OLD_LD_LIBRARY_PATH\n' \
+#     > $CONDA_PREFIX/etc/conda/deactivate.d/libstdcxx_fix.sh
+#   (then `conda deactivate && conda activate flowmaps` to pick it up)
