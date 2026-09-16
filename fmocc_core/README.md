@@ -109,9 +109,23 @@ N-dependence:
 hardflow_reg = 1 / (2·lam·dt) = N / (2·lam)       # NOT 1/lam
 ```
 
-A `reg` matched to a `lam` at one step count is *not* matched at another. Set it
-explicitly per arm; `run_preflight` prints the implied equivalent `lam` on every
-HardFlow run so a mismatch shows up in the log.
+**As of 2026-09-16 this is derived, not supplied.** Omit `--sweep_hardflow_reg`
+and each config computes its own `reg = N/(2·lam)`, so a HardFlow arm is
+regularized at the `lam` on its own CSV row. Supplying the flag overrides the
+derivation and is never recomputed — that is how `reg=0.0` (the pre-2026-09-09
+no-penalty runs) stays reproducible.
+
+Before that date `reg` defaulted to a fixed `5e-4`, which is `N/(2·lam)` at
+`lam=10000` and `N=10` **and nowhere else**. Because `reg` is N-dependent, every
+other `(N, lam)` point silently mismatched the MPC arm it was plotted against:
+an `N=20` HardFlow arm ran half as regularized as its MPC counterpart. Runs
+before 2026-09-16 that did not pass `--sweep_hardflow_reg` explicitly are only
+matched to their `lam` if they happened to use `N=10, lam=10000`.
+
+`run_preflight` still prints the implied equivalent `lam` on every HardFlow run.
+It now also warns when an explicitly-supplied `reg` disagrees with the row's
+`lam`, and predicts the `lr·reg ≥ 1` raise at config time instead of after FLUX
+has loaded.
 
 **HardFlow has a `lam` floor.** `hardflow_image` raises when `lr·reg ≥ 1`, i.e.
 below `lam = N·lr/2` (12.5 at N=10, lr=2.5). Its inner loop is explicit

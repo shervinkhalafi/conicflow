@@ -56,8 +56,11 @@ spread in runtime.
 
 ## 2. `hardflow_reg` per λ (N = 10, lr = 2.5)
 
-`reg = N/(2λ)`. Maintained **by hand** per arm rather than computed in the loop,
-so the table is auditable at a glance.
+`reg = N/(2λ)`. **Computed automatically as of 2026-09-16** — omit
+`--sweep_hardflow_reg` and each config derives its own. The table below is kept
+as the expected values, and is reproduced exactly by the derivation (verified
+2026-09-16 against every row), so it remains the auditable reference even though
+nothing is now maintained by hand.
 
 | λ | reg | `lr·reg` | status |
 |---|---|---|---|
@@ -76,7 +79,13 @@ so the guard's message is recorded rather than the gap being unexplained.
 
 **Runs before 2026-09-09 used `hardflow_reg=0.0`** — no effort penalty at all —
 so their energy metrics are not comparable with later ones. Pass
-`--sweep_hardflow_reg 0.0` to reproduce them.
+`--sweep_hardflow_reg 0.0` to reproduce them; an explicit value still overrides
+the derivation and is never recomputed.
+
+**Runs between 2026-09-09 and 2026-09-16** used the fixed `5e-4` default unless
+the flag was passed. That is `N/(2λ)` only at `N=10, λ=10000`, so any such run
+at another `(N, λ)` was not matched to its own `λ` — check the `hardflow_reg`
+and `N` columns before comparing one against an MPC arm.
 
 ---
 

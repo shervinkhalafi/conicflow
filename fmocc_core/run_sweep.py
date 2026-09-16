@@ -598,12 +598,23 @@ class RunConfig:
     # column records the value on every row, so no row is ambiguous.
     hardflow_margin:     float = 0.0    # was 0.02 = their constraint tightening
     hardflow_activation: float = 0.0    # fraction of steps to skip (theirs: 0.5)
-    # 5e-4 = N/(2*lam) at lam=10000, N=10 -- the value that makes HardFlow's
-    # control-effort penalty match MPC's per step (derivation above). Changed
-    # from 0.0 on 2026-09-09. Runs before that date used 0.0, i.e. NO effort
-    # penalty at all, so they are not comparable to runs after it on any energy
-    # metric. Pass --sweep_hardflow_reg 0.0 to reproduce them.
-    hardflow_reg:        float = 5e-4   # deviation penalty weight
+    # None = DERIVE as reg = N/(2*lam) (derivation above), the value that makes
+    # HardFlow's control-effort penalty match MPC's per step.
+    #
+    # Was a fixed 5e-4 until 2026-09-16. WHY THAT CHANGED: 5e-4 is N/(2*lam) at
+    # lam=10000 and N=10 AND NOWHERE ELSE -- reg is N-dependent, so every other
+    # (N, lam) point silently mismatched the MPC arm it was plotted against (an
+    # N=20 hardflow arm ran half as regularized as its MPC counterpart). A
+    # constant cannot track two axes. Deriving also makes `lam` mean the same
+    # thing on both paths; it used to be read-but-inert on this one.
+    #
+    # An explicit --sweep_hardflow_reg is passed through UNTOUCHED and never
+    # recomputed -- that is how reg=0.0 (the pre-2026-09-09 no-effort-penalty
+    # runs) and any deliberate lam/reg mismatch stay reproducible.
+    #
+    # Resolved to a float by _resolve_hardflow_reg before any run executes;
+    # run_preflight raises if an unresolved None reaches a hardflow run.
+    hardflow_reg:        Optional[float] = None  # deviation penalty; None = derive
     # "flow_map1" | "flow_matching" | "mpc_rollout".
     # The first two are single-NFE terminal estimates, which is HardFlow's
     # efficiency claim. "mpc_rollout" is the ESTIMATOR ABLATION (2026-09-08):
@@ -1755,8 +1766,61 @@ def run_preflight(
     # --quiet, which sets log to a no-op, and this one line is run provenance
     # rather than progress chatter -- suppressing it is how the reg/lam
     # mismatch would go unnoticed in exactly the runs that matter.
+    # main() resolves hardflow_reg for every config it builds, but this is the
+    # universal funnel and a future entry point (the Step 3 calibration script,
+    # say) could construct a RunConfig directly. An unresolved None would reach
+    # hardflow_image as a penalty weight and TypeError deep in the inner loop;
+    # raise here, at the top of the run, naming the fix.
+    if cfg.control_type == "hardflow" and cfg.hardflow_reg is None:
+        raise ValueError(
+            "hardflow config reached run_preflight with hardflow_reg=None. "
+            "Call _resolve_hardflow_reg(cfg) after building the config (main() "
+            "does this for every sweep path), or set an explicit value."
+        )
     _log_hardflow_reg_equivalence(cfg)
     return n_constraints
+
+
+# The pre-2026-09-16 fixed default. Retained ONLY for non-hardflow control
+# types, which never read reg -- see _resolve_hardflow_reg's docstring for why
+# those rows deliberately keep the old number instead of acquiring a new one.
+_HARDFLOW_REG_LEGACY_DEFAULT = 5e-4
+
+
+def _resolve_hardflow_reg(cfg: RunConfig, *, log: Callable = print) -> None:
+    """Resolve ``cfg.hardflow_reg`` in place; ``None`` means derive N/(2*lam).
+
+    WHY DERIVED RATHER THAN SUPPLIED (2026-09-16). reg and lam are the same
+    physical quantity -- the coefficient on the squared displacement away from
+    the nominal flow -- but MPC gets N/(2*lam) structurally out of its energy
+    term (``resid^2 / (2*lam*dt)`` with ``dt = 1/N``), while HardFlow took reg
+    as a raw number that nothing derived and nothing checked. Since reg carries
+    an N-dependence, a value matched to a lam at one step count is wrong at
+    every other one, silently. Deriving removes that entire class of error.
+
+    NOT APPLIED to non-hardflow control types. reg is never passed to the
+    mpc/fmrg/boffi_fmrg paths, so it is inert there; those rows keep
+    _HARDFLOW_REG_LEGACY_DEFAULT rather than acquiring a freshly-computed
+    number in an existing CSV column, which keeps pre-2026-09-16 mpc/fmrg rows
+    comparable with post- ones on a column that never meant anything for them.
+
+    LOUD FAIL on lam <= 0 rather than a fallback: N/(2*lam) is undefined at
+    lam=0 and NEGATIVE for lam<0, and a negative reg flips the penalty into a
+    reward for deviation -- precisely the sign bug this port exists to fix.
+    """
+    if cfg.hardflow_reg is not None:
+        return                          # explicit override: never recomputed
+    if cfg.control_type != "hardflow":
+        cfg.hardflow_reg = _HARDFLOW_REG_LEGACY_DEFAULT
+        return
+    if cfg.lam <= 0.0:
+        raise ValueError(
+            f"hardflow with lam={cfg.lam!r}: reg = N/(2*lam) is undefined for "
+            f"lam <= 0. Either use lam > 0, or pass --sweep_hardflow_reg to "
+            f"set the deviation penalty directly (0.0 = no penalty at all, "
+            f"the pre-2026-09-09 behaviour)."
+        )
+    cfg.hardflow_reg = cfg.N / (2.0 * cfg.lam)
 
 
 def _log_hardflow_reg_equivalence(cfg: RunConfig, *, log: Callable = print) -> None:
@@ -1765,28 +1829,49 @@ def _log_hardflow_reg_equivalence(cfg: RunConfig, *, log: Callable = print) -> N
     WHY THIS IS PRINTED RATHER THAN ASSERTED. hardflow_reg and lam are the same
     physical quantity under reg = N/(2*lam) (see the RunConfig comment for the
     derivation), so a HardFlow run implies an equivalent lam whether or not
-    anyone intended one. But `cfg.lam` is INERT on the hardflow path -- it is
-    never passed to hardflow_image -- so its value on a hardflow config is
-    whatever the default happened to be (10.0), not a statement of intent.
-    There is therefore nothing trustworthy to assert AGAINST: a guard comparing
-    reg to N/(2*cfg.lam) would fire on every correctly-configured run.
+    anyone intended one.
 
-    What can go wrong silently is the N-dependence: reg=5e-4 matches lam=10000
-    at N=10 and nothing else, so a run at N=20 is quietly twice as weakly
-    regularized as the MPC arm it will be plotted against. Printing the implied
-    lam puts that in the log of every run, where a mismatch is one line away
-    from the N it belongs to.
+    UPDATED 2026-09-16. This docstring used to say `cfg.lam` is INERT on the
+    hardflow path and that a guard comparing reg to N/(2*cfg.lam) "would fire
+    on every correctly-configured run". Both stopped being true when
+    _resolve_hardflow_reg started deriving reg FROM lam: the derived case now
+    agrees with cfg.lam by construction, so a disagreement means someone passed
+    --sweep_hardflow_reg explicitly and it no longer matches the lam on the
+    same row. That is worth saying out loud.
+
+    Still WARNED, not raised. A deliberate lam/reg mismatch is a legitimate
+    ablation -- reg=0.0 reproducing the pre-2026-09-09 no-penalty runs is
+    exactly one -- so this reports what the run actually is instead of refusing
+    to run it.
     """
     if cfg.control_type != "hardflow":
         return
     if cfg.hardflow_reg == 0.0:
         log("  hardflow_reg=0.0 -- NO control-effort penalty (equivalent lam = inf). "
             "This is the pre-2026-09-09 behaviour; energy metrics are not "
-            "comparable with runs that use the 5e-4 default.")
+            "comparable with runs that derive reg from lam.")
         return
     lam_equiv = cfg.N / (2.0 * cfg.hardflow_reg)
     log(f"  hardflow_reg={cfg.hardflow_reg:g} at N={cfg.N} == MPC lam {lam_equiv:g} "
         f"(reg = N/(2*lam)). Compare against MPC arms run at that lam.")
+
+    # See the docstring: derived reg agrees with cfg.lam by construction, so a
+    # disagreement can only come from an explicit --sweep_hardflow_reg.
+    if not math.isclose(lam_equiv, cfg.lam, rel_tol=1e-9):
+        log(f"  !! reg was supplied explicitly and does NOT match cfg.lam="
+            f"{cfg.lam:g} -- this run is regularized as lam={lam_equiv:g}, and "
+            f"the `lam` column on its CSV row is NOT what it was regularized "
+            f"at. Omit --sweep_hardflow_reg to derive reg from lam.")
+
+    # hardflow_image raises when lr*reg >= 1 (its inner ascent is explicit
+    # fixed-step, so the deviation error stops contracting). Predicted here, at
+    # config time, because the alternative is discovering it after FLUX has
+    # spent ~90s loading. Deriving reg makes this reachable from a low lam,
+    # which is why it is worth predicting now and was not before.
+    if cfg.lr_inner * cfg.hardflow_reg >= 1.0:
+        log(f"  !! lr_inner={cfg.lr_inner:g} * reg={cfg.hardflow_reg:g} = "
+            f"{cfg.lr_inner * cfg.hardflow_reg:g} >= 1 -- hardflow_image WILL "
+            f"raise. The floor is lam >= N*lr/2 = {cfg.N * cfg.lr_inner / 2.0:g}.")
 
 
 def _build_constraint_fn(
@@ -3866,9 +3951,14 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "opposite of --sweep_lam which divides. Same "
                              "physical quantity as lam, but the conversion is "
                              "reg = N/(2*lam), NOT 1/lam -- it depends on N. "
-                             "Default 5e-4 = N/(2*lam) at lam=10000, N=10. "
-                             "Pass 0.0 to reproduce runs from before "
-                             "2026-09-09, which had no effort penalty.")
+                             "OMIT THIS FLAG and reg is DERIVED per config as "
+                             "N/(2*lam), which is what matches HardFlow's "
+                             "effort penalty to MPC's per step -- that is the "
+                             "default as of 2026-09-16 (it was a fixed 5e-4, "
+                             "correct only at lam=10000/N=10). Supplying it "
+                             "OVERRIDES the derivation and is never "
+                             "recomputed: pass 0.0 to reproduce runs from "
+                             "before 2026-09-09, which had no effort penalty.")
     parser.add_argument("--sweep_hardflow_endpoint_mode", nargs="+",
                         choices=["flow_map1", "flow_matching", "mpc_rollout"],
                         metavar="MODE",
@@ -4098,6 +4188,12 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
             cfg.constraint_thresholds = []
         cfg.lr_dual = args.lr_dual
         cfg.mu_init = args.mu_init
+        # 2026-09-16: hardflow_reg now derives from N and lam unless supplied.
+        # Done HERE because this loop is the one place both config sources --
+        # the CLI cartesian product and SWEEP_CONFIGS -- funnel through, and it
+        # runs before the pre-FLUX run_preflight pass below, which raises on an
+        # unresolved None.
+        _resolve_hardflow_reg(cfg)
 
     if args.reward == "style" and not args.style_ref_paths:
         parser.error("--reward style requires --style_ref_paths (one or more image paths)")
