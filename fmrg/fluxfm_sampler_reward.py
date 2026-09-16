@@ -262,8 +262,10 @@ class FluxFlowMapSampler:
         Args:
             quantize_mode: one of
                 "none"     – no quantization (bfloat16, ~12 GB)
-                "int8"     – torchao int8 weight-only (~6 GB, small quality loss)
-                "int4"     – torchao int4 weight-only (~3 GB, moderate quality loss)
+                "int8"     – torchao int8 weight-only (~6 GB, small quality loss;
+                              quantized on GPU after load)
+                "int4"     – torchao int4 weight-only (~3 GB, moderate quality loss;
+                              quantized on GPU after load)
                 "nf4"      – bitsandbytes NF4 4-bit (~3 GB, best low-bit quality)
         """
         self.device = device
@@ -339,21 +341,39 @@ class FluxFlowMapSampler:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # int8 and nf4 can be prepared on CPU so only compressed weights move to VRAM.
-        # int4 (torchao) uses a CUDA-only packing kernel and must run after .to(device).
-        if self.quantize_mode in ("int8", "nf4"):
-            self._quantize_transformer()   # CPU-side preparation
+        # nf4: replace Linear layers on CPU; 4-bit packing happens on .to(cuda).
+        # int8/int4: stream the move block-by-block, quantizing each block as it
+        #            lands, so the full bf16 tensor never exists on the GPU.
+        if self.quantize_mode == "nf4":
+            self._quantize_transformer()   # CPU-side layer replacement only
             gc.collect()
 
-        print("Moving transformer to GPU...")
-        self.pipeline.transformer.to(self.device)
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        if self.quantize_mode == "int4":
-            # _convert_weight_to_int4pack is CUDA-only: must quantize after .to(device).
-            # Peak VRAM reaches full bfloat16 (~12 GB) but drops to ~3 GB afterward.
-            self._quantize_transformer()
+        if self.quantize_mode in ("int8", "int4"):
+            # 2026-09-05 (sungcho): this used to be a bulk
+            # `transformer.to(device)` followed by `_quantize_transformer()`.
+            # That put the FULL bf16 transformer (11.90 B params ~= 23.8 GB) on
+            # the card before compressing it to 12.26 GB, for a MEASURED
+            # transient peak of 24.21 GB on a 24,564 MiB A5000 -- 4 GB ABOVE the
+            # peak of the MPC run that follows. So the binding memory
+            # requirement for a whole sweep was set by model LOAD, not by the
+            # run, and any co-tenant holding ~1 GB killed us during `.to(cuda)`
+            # -- before run_sweep.py's try/except or even its summary.csv
+            # existed, leaving an empty results dir that every aggregator
+            # silently skips. See results/20260904_224351_lpr2c.log:55.
+            #
+            # Streaming caps the in-flight bf16 chunk at one transformer block
+            # (340 M params ~= 0.68 GB), so the peak becomes
+            # "accumulated int8 + one block" ~= 13 GB.
+            #
+            # This is bit-identical to the bulk path: torchao's int8/int4
+            # weight-only quantization is per-tensor/per-channel and purely
+            # local, so quantizing block A before block B has been moved cannot
+            # change block A's weights. Verified against a stored uncontrolled
+            # trajectory (see 260905-memory-optimization.md).
+            self._stream_move_and_quantize()
+        else:
+            print("Moving transformer to GPU...")
+            self.pipeline.transformer.to(self.device)
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -376,11 +396,67 @@ class FluxFlowMapSampler:
         mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
         print(f"FLUX FlowMap loaded (mode={self.quantize_mode}, GPU mem allocated: {mem_gb:.1f} GB)")
 
-    def _quantize_transformer(self):
-        """Quantize the transformer's Linear weights on CPU before GPU transfer.
+    def _stream_move_and_quantize(self):
+        """Move the transformer to GPU one block at a time, quantizing as we go.
 
-        Called while the transformer is still on CPU so that only the compressed
-        weights are ever copied to VRAM.
+        Added 2026-09-05 (sungcho) to remove the 24.21 GB load-time transient --
+        see the comment at the call site in _load_model for the full rationale.
+
+        Peak GPU memory is "everything quantized so far + the single largest
+        unit still in bf16". FLUX.1-dev's largest unit is one of the 19 double
+        blocks at 340 M params (~0.68 GB bf16), so the peak lands near 13 GB
+        instead of 24.21 GB.
+
+        Equivalent to the previous bulk path, not an approximation: torchao's
+        weight-only quantization is per-tensor/per-channel, so the quantized
+        result for a given Linear does not depend on what else is resident.
+        """
+        mode = self.quantize_mode
+        try:
+            from torchao.quantization import quantize_, int8_weight_only, int4_weight_only
+        except ImportError:
+            raise ImportError(
+                "torchao is required for int8/int4 quantization. "
+                "Run: pip install 'torchao==0.9.0'"
+            )
+        quant_fn = int8_weight_only() if mode == "int8" else int4_weight_only(group_size=64)
+
+        tf = self.pipeline.transformer
+
+        # Flatten to the units we stream. ModuleList children (transformer_blocks,
+        # single_transformer_blocks) hold ~99.5% of the parameters and are split
+        # element-wise; everything else moves whole, since each is <=32 M params.
+        units = []
+        for name, child in tf.named_children():
+            if isinstance(child, torch.nn.ModuleList):
+                units.extend((f"{name}.{i}", blk) for i, blk in enumerate(child))
+            else:
+                units.append((name, child))
+
+        print(f"Moving transformer to GPU ({mode}, streaming {len(units)} units)...")
+        for i, (name, mod) in enumerate(units):
+            mod.to(self.device)
+            quantize_(mod, quant_fn)
+            if torch.cuda.is_available() and (i + 1) % 10 == 0:
+                print(f"    {i+1}/{len(units)} units  "
+                      f"({torch.cuda.memory_allocated()/1e9:.1f} GB)", flush=True)
+
+        # Buffers and any parameters held directly on the transformer (not via a
+        # child module) are untouched by the loop above; this catches them and is
+        # a no-op for everything already moved.
+        tf.to(self.device)
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            print(f"  torchao {mode} done (streamed); "
+                  f"load peak {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
+
+    def _quantize_transformer(self):
+        """Quantize the transformer's Linear weights.
+
+        Load order (handled by _load_model):
+        - int8/int4: transformer must already be on CUDA (torchao quantize_).
+        - nf4:       run on CPU to swap in bnb Linear4bit; packing on .cuda().
 
         Modes
         -----
@@ -396,14 +472,14 @@ class FluxFlowMapSampler:
         devices = {p.device.type for p in transformer.parameters()}
         on_cuda = "cuda" in devices
 
-        if mode == "int4" and not on_cuda:
+        if mode in ("int8", "int4") and not on_cuda:
             raise RuntimeError(
-                "int4 quantization requires the transformer to be on CUDA first. "
+                f"{mode} quantization requires the transformer to be on CUDA first. "
                 "This is handled automatically by _load_model."
             )
-        if mode in ("int8", "nf4") and on_cuda:
+        if mode == "nf4" and on_cuda:
             print(f"WARNING: transformer already on GPU for mode={mode}; "
-                  "peak VRAM was not reduced by CPU-side quantization.")
+                  "peak VRAM was not reduced by CPU-side layer replacement.")
 
         print(f"Quantizing transformer weights ({mode})...")
 
