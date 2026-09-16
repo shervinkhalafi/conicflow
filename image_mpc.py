@@ -64,12 +64,21 @@ def _grad_checkpointing_enabled(module) -> bool:
     return bool(getattr(module, "gradient_checkpointing", False))
 
 
-def _pbar_postfix(outer: int, outer_total: int, reward: float, control: float) -> dict:
-    return {
+def _pbar_postfix(
+    outer: int,
+    outer_total: int,
+    reward: float,
+    control: float,
+    mu: Optional[float] = None,
+) -> dict:
+    d: dict = {
         "step": f"{outer}/{outer_total}",
         "r": f"{reward:.4f}",
         "|u|": f"{control:.4e}",
     }
+    if mu is not None:
+        d["μ"] = f"{mu:.4e}"
+    return d
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -200,15 +209,23 @@ def _horizon_objective(
         energy = energy + resid.pow(2).flatten(1).sum(1) / (2.0 * lam * dt)
 
     x_H = x_full[-1]
-    obj = energy - r(x_H)  # (B,)
+
+    # Resolve the point at which both reward and constraints are evaluated.
+    # "horizon"  → x_H (end of the planning window).
+    # "endpoint" → flow-map prediction of the final image latent from x_H.
+    #   reward uses grad=True so gradients flow back through the rollout;
+    #   constraint uses grad=False (detached) since it only needs the value.
+    if constraint_on == "endpoint" and endpoint_map is not None:
+        z_r = endpoint_map(t_horizon.expand(x_H.shape[0]), x_H, grad=True)
+        z_h = endpoint_map(t_horizon.expand(x_H.shape[0]), x_H, grad=False)
+    else:
+        z_r = z_h = x_H
+
+    obj = energy - r(z_r)  # (B,)
 
     # Lagrangian penalty for inequality constraint h(z) <= 0
     if h is not None and mu is not None:
-        if constraint_on == "endpoint" and endpoint_map is not None:
-            z = endpoint_map(t_horizon.expand(x_H.shape[0]), x_H)
-        else:
-            z = x_H
-        hx = h(z)
+        hx = h(z_h)
         if hx.dim() == 1:
             hx = hx.unsqueeze(-1)
         obj = obj + (mu.detach() * hx).sum(dim=-1)
@@ -365,8 +382,8 @@ def receding_horizon_flow_control(
         mu_init:       initial scalar value for all Lagrange multipliers.
         h:             inequality constraint  h(x) -> (B, C),  h(x) <= 0.
                        Pass None to run unconstrained.
-        constraint_on: "horizon"  — evaluate h at x_H.
-                       "endpoint" — evaluate h at endpoint_map(t_H, x_H).
+        constraint_on: "horizon"  — evaluate r and h at x_H.
+                       "endpoint" — evaluate r and h at endpoint_map(t_H, x_H).
         endpoint_map:  Callable(t_batch, x) -> (B, *).  Required when
                        constraint_on="endpoint".
         lr_dual:       projected dual-ascent step size (>= 0).
@@ -392,10 +409,12 @@ def receding_horizon_flow_control(
         device:        torch device (defaults to x0.device).
 
     Returns:
-        x_N:      final controlled samples,    shape (B, *).
-        traj:     full trajectory,             shape (N+1, B, *).
-        controls: applied controls u_j*,       shape (N, B, *).
-        mu_final: final per-sample multipliers, shape (B, C), or None.
+        x_N:      final controlled samples,          shape (B, *).
+        traj:     full trajectory,                   shape (N+1, B, *).
+        controls: applied controls u_j*,             shape (N, B, *).
+        mu_final: final per-sample multipliers,      shape (B, C), or None.
+        mu_hist:  per-step multipliers after each
+                  dual-ascent update,                shape (N, B, C), or None.
     """
     if device is None:
         device = x0.device
@@ -406,6 +425,7 @@ def receding_horizon_flow_control(
     x = x0.detach().clone()
     traj = [x.clone()]
     controls = []
+    mu_history: list = []
 
     mu_t = None
     if h is not None:
@@ -465,6 +485,9 @@ def receding_horizon_flow_control(
                     hx = hx.unsqueeze(-1)
                 mu_t = (mu_t + lr_dual * hx).clamp_min(0.0)
 
+        if mu_t is not None:
+            mu_history.append(mu_t.clone())
+
         # Apply first MPC step, reusing the drift computed above
         with torch.no_grad():
             u_star = (x1_star - x) / dt - v_j
@@ -474,8 +497,14 @@ def receding_horizon_flow_control(
         controls.append(u_star.clone())
 
         if pbar is not None:
+            mu_mean_val = mu_t.mean().item() if mu_t is not None else None
+            if constraint_on == "endpoint" and endpoint_map is not None:
+                with torch.no_grad():
+                    x_disp = endpoint_map(t_grid[j + 1].expand(x.shape[0]), x)
+            else:
+                x_disp = x
             pbar.set_postfix(_pbar_postfix(
-                j + 1, N, _reward_mean(r, x), _flat_norm_mean(u_star),
+                j + 1, N, _reward_mean(r, x_disp), _flat_norm_mean(u_star), mu_mean_val,
             ))
 
         if verbose:
@@ -493,7 +522,8 @@ def receding_horizon_flow_control(
     if pbar is not None:
         pbar.close()
 
-    return x, torch.stack(traj, dim=0), torch.stack(controls, dim=0), mu_t
+    mu_hist = torch.stack(mu_history, dim=0) if mu_history else None
+    return x, torch.stack(traj, dim=0), torch.stack(controls, dim=0), mu_t, mu_hist
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -651,13 +681,22 @@ def make_flux_wrappers(
         img = sampler.decode(z)              # (B, 3, H, W) in [-1, 1], grads flow
         return img.mean(dim=(1, 2, 3))
 
-    def endpoint_map(s_mpc: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Predict the final latent by rolling the uncontrolled FLUX flow to t=0."""
+    def endpoint_map(s_mpc: torch.Tensor, z: torch.Tensor, grad: bool = False) -> torch.Tensor:
+        """Predict the final latent by rolling the uncontrolled FLUX flow to t=0.
+
+        Args:
+            grad: if True, keep gradients flowing through the rollout so that
+                  the result can be used as a differentiable reward target.
+                  If False (default), the rollout runs under no_grad and the
+                  input is detached — suitable for constraint evaluation and
+                  dual-ascent updates where no backward is needed.
+        """
         t_start = 1.0 - s_mpc.item()
         n_remain = max(1, round(t_start * n_mpc_steps))
         ts = torch.linspace(t_start, 0.0, n_remain + 1, device=z.device, dtype=z.dtype)
-        z_run = z.detach().clone()
-        with torch.no_grad():
+        z_run = z if grad else z.detach().clone()
+        ctx = torch.enable_grad() if grad else torch.no_grad()
+        with ctx:
             for i in range(n_remain):
                 t_c = ts[i].item()
                 t_n = _t_next_for_mode(t_c)
@@ -752,7 +791,7 @@ def run_image_mpc_demo(
 
     # MPC-controlled run
     print("Running MPC...")
-    z_mpc, traj_mpc, controls_mpc, mu_final = receding_horizon_flow_control(
+    z_mpc, traj_mpc, controls_mpc, mu_final, _ = receding_horizon_flow_control(
         v_theta   = v_theta_mpc,
         r         = r_image,
         x0        = z0,
@@ -987,7 +1026,7 @@ def trajectory_rewards(
 #
 # -- or build wrappers manually and call receding_horizon_flow_control --
 # v_theta, r, endpoint_map = make_flux_wrappers(sampler, PROMPT)
-# z_mpc, traj, controls, mu = receding_horizon_flow_control(
+# z_mpc, traj, controls, mu, mu_hist = receding_horizon_flow_control(
 #     v_theta, r, z0, N=4, H=2, lam=1.0,
 #     optimizer="adam", n_iters=20, lr=1e-3, verbose=True,
 # )

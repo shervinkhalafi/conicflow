@@ -11,6 +11,7 @@ h(x) <= 0 enforced via a Lagrangian dual term and projected dual ascent:
 
 where z is either x_H (constraint_on="horizon") or the flow-map prediction of
 the true endpoint X(t_{j+H}, 1; x_H) (constraint_on="endpoint").
+Both r and h are evaluated at the same z.
 
 After each inner solve, mu is updated via projected dual ascent:
     mu <- max(0, mu + lr_dual * h(z))
@@ -111,14 +112,19 @@ def _horizon_objective(
         energy = energy + resid.pow(2).sum(dim=-1) / (2.0 * lam * dt)
 
     x_H = x_full[-1]
-    obj = energy - r(x_H)  # (B,)
+
+    # Resolve the point at which both reward and constraints are evaluated.
+    # "horizon"  → x_H (end of the planning window).
+    # "endpoint" → flow-map prediction of the final image latent from x_H.
+    if constraint_on == "endpoint" and endpoint_map is not None:
+        z = endpoint_map(t_horizon.expand(x_H.shape[0]), x_H)
+    else:
+        z = x_H
+
+    obj = energy - r(z)  # (B,)
 
     # Inequality constraint term: <mu, h(z)>  (mu detached; grad flows through h)
     if h is not None and mu is not None:
-        if constraint_on == "endpoint" and endpoint_map is not None:
-            z = endpoint_map(t_horizon.expand(x_H.shape[0]), x_H)
-        else:
-            z = x_H
         hx = h(z)                           # (B, C)
         if hx.dim() == 1:
             hx = hx.unsqueeze(-1)           # (B,) -> (B, 1)
@@ -218,7 +224,7 @@ def receding_horizon_flow_control(
                        (B,) or (B, 1).  For multiple constraints use
                        stack_constraints([fn1, fn2, ...]) to get (B, C).
                        Pass None to run unconstrained.
-        constraint_on: where to evaluate h for the Lagrangian and dual update:
+        constraint_on: where to evaluate r and h for the Lagrangian and dual update:
                        "horizon"  — evaluate at x_H  (default).
                        "endpoint" — evaluate at the flow-map prediction
                                     X(t_{j+H}, 1; x_H) of the true endpoint.
