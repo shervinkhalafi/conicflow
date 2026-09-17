@@ -37,8 +37,18 @@ Two things to know about that boundary:
   from a fresh clone of the upstream, you need that change or FLUX will spike
   above 24 GB while loading.
 
-Environment: conda env `flowmaps`. FLUX (`black-forest-labs/FLUX.1-dev`) and the
-reward models are pulled from HuggingFace on first run and cached at `HF_HOME`.
+Environment: conda env `flowmaps`, or the uv project at the repo root — `uv
+sync && ./scripts/uv_postinstall.sh`, then `uv run --project .. python
+run_sweep.py ...` from here. uv resolves the same stack through a lockfile, so
+two machines can be made identical; `environment.yml` is annotated with what
+each conda pin is for. The uv env deliberately omits the jax/flax/tensorflow
+flow-map *training* stack, which cannot share a resolved environment with torch
+2.5.1's cuDNN pin (that combination is broken in the conda env too — see the
+comment block in `pyproject.toml`); it lives in
+`requirements-flowmaps-training.txt` and gets its own venv.
+
+FLUX (`black-forest-labs/FLUX.1-dev`) and the reward models are pulled from
+HuggingFace on first run and cached at `HF_HOME`.
 
 ---
 
@@ -189,7 +199,64 @@ so the old `if pbar is not None` guards always fired.
 
 ---
 
-## 5. Key flags
+## 5. Comparing methods after a sweep
+
+Two scripts read `summary.csv` files and compare runs *across* methods. Both
+take `--runs <dir> ...` (globs are fine), read only what is on disk, and never
+touch a GPU.
+
+| script | what it produces |
+|---|---|
+| `sweep_diagnostics.py` | **win rates** — per (λ, seed) combo, which method reached the lowest objective, plus MPC-beats-FMRG/HardFlow/both — and a **Pareto** reward-vs-energy scatter with per-method frontiers and the globally non-dominated points ringed. One flag per diagnostic (`--diag_winrates`, `--diag_pareto`, `--all`), derived from a registry so a new diagnostic needs no change in its callers. |
+| `compare_methods.py` | figures of four images in a row — uncontrolled, MPC, HardFlow, FMRG — at a **matched operating point**: `--match reward` holds achieved reward as equal as the grid allows and lets energy differ, `--match energy` does the reverse, `both` writes both. Each panel carries its λ and config; energy and reward go underneath. `--num_rows N` removes the runs already used and repeats the match, so one figure can show several operating points. |
+
+The same `--diag_*` flags are accepted by `run_sweep.py` (run after the sweep)
+and by `auto_sweep.sh` via `DIAG=` (run once all three methods are done, since
+each writes its own `out_dir` and no single `run_sweep.py` invocation ever sees
+all three).
+
+**Win rates need a shared λ grid** (`SHARED_GRID=1`): the objective is only
+comparable between methods at equal λ. With per-method grids no combo contains
+all three and the diagnostic honestly reports zero combos. The Pareto plot is
+unaffected — energy-vs-reward does not depend on what λ means.
+
+### Several configs per method
+
+A sweep may run one method at more than one setting: `MPC_NI="12 24"` in
+`auto_sweep.sh` (every per-method knob there takes a space-separated list), or
+`--sweep_n_inner 12 24` directly. Each distinct tuple of a method's
+hyperparameter columns is a **config**, labelled by only the fields that vary
+within that method (`ni=24`), and both scripts keep configs apart rather than
+pooling them:
+
+- **Pareto** draws each config in its own shade of the method's hue, with its
+  own frontier line, so configs stay separable without blurring the three
+  methods into each other.
+- **Win rates** represent a method at each combo by its lowest-J config;
+  `winrates.csv` records which one in `cfg_<method>` and the printout names it.
+  **Best-of is a max, so a method handed more configs gets more draws** — an
+  advantage that belongs to the sweep design, not to the method. The printout
+  warns whenever the candidate counts differ; a clean comparison gives every
+  method the same number.
+- **`compare_methods.py --configs best`** (the default) first picks, per method,
+  the config that reached the lowest J most often across that method's own
+  combos — ties on mean J; a method whose configs never share a combo falls back
+  to lowest mean J and says so — then matches operating points using only those
+  three. Each method is therefore shown at its strongest, not at whichever
+  config happened to land near the others. `--configs all` pools every config
+  into the candidate set instead.
+
+Measured on the seed-50 sweeps by adding an MPC `n_inner=24` arm next to
+`n_inner=12` (2× the compute, 607 s vs 309 s per λ): `ni=24` had the lower
+objective at 5/5 λ under both rewards. It moved **CLIP** win rates from MPC 40%
+to 80% and shifted MPC's whole frontier left — at λ=6.1, more reward (0.161 vs
+0.152) for 42% less energy (0.144 vs 0.251); nearer the top the gap narrows to
+about 1.5×. **ImageReward** stayed at 40%: that reward is already near its
+`r≈1.98` ceiling, so the doubled inner budget buys energy, not wins.
+
+---
+
+## 6. Key flags
 
 | flag | notes |
 |---|---|
@@ -199,13 +266,14 @@ so the old `if pbar is not None` guards always fired.
 | `--sweep_endpoint_surrogate` | `rollout` (default) or `jump`. **mpc only.** `jump` replaces the inner objective's (N−j−H)-step endpoint rollout with ONE flow-map call at `t_next=0`, making MPC's cost linear in N instead of quadratic. Only the surrogate the optimiser differentiates changes — the applied trajectory, and everything scored from it, are unaffected. Measured at N=8/H=4: −33% wall clock, objective better at λ=1 and inside the noise floor at λ=10/100. Opt-in because it has not been re-checked at the suite's N=10. |
 | `--pbar_rewards` | Off by default. Computes the reward shown in the MPC progress bar; costs ~4% of a run. |
 | `--hardflow_lr_alpha` | Off by default. Lifts HardFlow's `lr·reg ≥ 1` admissible floor: any run whose `lr_inner·reg` would reach 1 uses `lr = α/reg` instead (0 < α < 1; 0.5 is dead-beat at the final step), so the inner loop's contraction factor is uniform in λ. Runs above the floor are unchanged; the lr actually used is written to the `hardflow_lr_eff` column. Needed to run HardFlow on a shared λ grid with MPC/FMRG in the regularised regime. |
-| `lambda_autorange.py` / `auto_sweep.sh` | Automatic λ range finding per (reward, prompt, method), and a wrapper that chains it into the sweep. `SHARED_GRID=1` runs all methods on one grid (at a shared λ all three solve the same first-order problem — see `lambda_autorange.shared_grid`); `HF_ALPHA=0.5` passes the floor-lifting alpha through. See `docs/lambda_autorange_report.html`. |
+| `lambda_autorange.py` / `auto_sweep.sh` | Automatic λ range finding per (reward, prompt, method), and a wrapper that chains it into the sweep. `SHARED_GRID=1` runs all methods on one grid (at a shared λ all three solve the same first-order problem — see `lambda_autorange.shared_grid`); `HF_ALPHA=0.5` passes the floor-lifting alpha through; `DIAG="--diag_winrates --diag_pareto"` runs the cross-method diagnostics at the end. Per-method knobs (`MPC_NI`, `MPC_H`, `HF_NI`, `HF_LR`, `FMRG_NOPT`) take lists. See `docs/lambda_autorange_report.html`. |
+| `--diag_winrates` / `--diag_pareto` / `--all` | Post-sweep cross-method diagnostics, on `run_sweep.py` and standalone on `sweep_diagnostics.py`. See §5. |
 | `--quantize` | `int8` (default) / `int4` / `nf4` / `none`. See the nf4 warning above. **`int4` cannot be used for MPC or FMRG at all**: `aten::_weight_int4pack_mm` has no backward kernel, so any gradient-based control raises. |
 | `--reward_dtype` | `fp32` default, matching every result on disk. `fp16` halves reward-model memory but changes their values. |
 | `--resume` | Skips configs already in `<out_dir>/summary.csv` with `run_ok=True`, retries failures, appends rather than truncating. |
 | `--continue_on_oom` | Off by default: an OOM aborts rather than marching the rest of a sweep through a contended card. |
 
-## 6. Output
+## 7. Output
 
 `<out_dir>/summary.csv` — one self-describing row per run: config, `r_unc`,
 `r_ctrl`, `delta_r`, `ctrl_energy`, `objective`, `time_unc_s`, `time_ctrl_s`,
@@ -219,7 +287,13 @@ better.
 Failed runs are never deleted or skipped: they get `run_ok=False`, a
 `FAILED_`-prefixed artifact dir, and the exception text in `error_msg`.
 
-## 7. Conventions
+The §5 scripts write next to the run dirs rather than into them:
+`<out>/diagnostics/winrates.csv` (one row per (λ, seed) combo: winner, the
+head-to-heads, the config that represented each method, and every method's
+`J_`/`r_ctrl_`/`energy_`), `<out>/diagnostics/pareto__*.png`, and
+`<out>/figs/compare_{reward,energy}__*.png`.
+
+## 8. Conventions
 
 - **Loud fail only** — never silently clamp, fall back, or substitute a default.
 - **Fresh process per config** — no sweeping several configs in one process
