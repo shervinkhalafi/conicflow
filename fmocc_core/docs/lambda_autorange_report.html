@@ -1,0 +1,354 @@
+<title>Lambda Auto-Range</title>
+<style>
+:root{
+  color-scheme:light;
+  --bg:#f5f7f8; --bg-2:#ffffff; --ink:#151d24; --ink-2:#4f5b66; --ink-3:#8a95a0;
+  --rule:#d8dee4; --rule-2:#e9edf0; --accent:#0c6f80; --accent-ink:#0a5e6c; --accent-wash:rgba(12,111,128,.08);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#4a3aa7;
+  --good:#1b7f3b; --warn:#b26a00; --bad:#c23b3b;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+  color-scheme:dark;
+  --bg:#12171b; --bg-2:#1a2126; --ink:#e6ebef; --ink-2:#aab5bf; --ink-3:#74808b;
+  --rule:#2b343c; --rule-2:#222a31; --accent:#3fb4c4; --accent-ink:#6ccbd8; --accent-wash:rgba(63,180,196,.12);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#9085e9;
+  --good:#3fbf6a; --warn:#e0a03a; --bad:#ef6b6b;
+}}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#12171b; --bg-2:#1a2126; --ink:#e6ebef; --ink-2:#aab5bf; --ink-3:#74808b;
+  --rule:#2b343c; --rule-2:#222a31; --accent:#3fb4c4; --accent-ink:#6ccbd8; --accent-wash:rgba(63,180,196,.12);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#9085e9;
+  --good:#3fbf6a; --warn:#e0a03a; --bad:#ef6b6b;
+}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1120px;margin:0 auto;padding-block:32px 72px;padding-inline:20px}
+header.masthead{display:grid;grid-template-columns:1fr;gap:10px;padding-bottom:22px;border-bottom:1px solid var(--rule);margin-bottom:34px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+h1{font-size:clamp(28px,4vw,40px);line-height:1.12;margin:0;font-weight:600;letter-spacing:-.015em;text-wrap:balance;max-width:24ch}
+.lede{font-size:17px;color:var(--ink-2);max-width:66ch;margin:0}
+.meta{display:flex;flex-wrap:wrap;gap:8px 22px;font-family:var(--mono);font-size:12.5px;color:var(--ink-3)}
+.meta b{color:var(--ink-2);font-weight:500}
+h2{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:54px 0 10px;text-wrap:balance;scroll-margin-top:12px}
+h2 .n{font-family:var(--mono);font-size:13px;color:var(--ink-3);margin-right:10px;font-weight:500}
+h3{font-size:16.5px;font-weight:600;margin:28px 0 8px}
+p,li{max-width:70ch}
+p{margin:0 0 12px}
+ul,ol{padding-left:22px;margin:0 0 12px}
+li{margin:4px 0}
+code,.mono{font-family:var(--mono);font-size:.92em}
+code{background:var(--rule-2);padding:1px 5px;border-radius:4px}
+pre{background:var(--bg-2);border:1px solid var(--rule);border-radius:6px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;max-width:100%}
+pre code{background:none;padding:0}
+a{color:var(--accent-ink)}
+.callout{border-left:3px solid var(--accent);background:var(--accent-wash);padding:10px 14px;border-radius:0 6px 6px 0;margin:14px 0 18px;max-width:78ch}
+.callout p{margin:0}
+.callout p+p{margin-top:8px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px;margin:14px 0 8px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;margin:14px 0 8px}
+figure{margin:0;background:var(--bg-2);border:1px solid var(--rule);border-radius:8px;padding:12px 12px 8px;min-width:0}
+figure .ft{font-size:13.5px;font-weight:600;margin:0 0 2px}
+figure .fs{font-size:12.5px;color:var(--ink-3);margin:0 0 6px}
+figure svg{display:block;width:100%;height:auto;overflow:visible}
+figcaption{font-size:12.5px;color:var(--ink-2);margin-top:8px;line-height:1.45}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--ink-2);margin:2px 0 4px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
+table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums}
+.tbl{overflow-x:auto;margin:10px 0 18px;border:1px solid var(--rule);border-radius:8px;background:var(--bg-2)}
+th,td{padding:8px 11px;border-bottom:1px solid var(--rule-2);text-align:left;vertical-align:top}
+th{font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--ink-3);font-weight:600;background:var(--bg-2);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td.num,th.num{text-align:right;font-family:var(--mono);font-size:13px}
+td.k{font-family:var(--mono);font-size:13px;white-space:nowrap}
+.pill{display:inline-block;font-family:var(--mono);font-size:11.5px;padding:1px 8px;border-radius:999px;border:1px solid var(--rule);color:var(--ink-2);white-space:nowrap}
+.pill.good{border-color:var(--good);color:var(--good)}
+.pill.warn{border-color:var(--warn);color:var(--warn)}
+.pill.bad{border-color:var(--bad);color:var(--bad)}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:16px 0 6px}
+.stat div{background:var(--bg-2);border:1px solid var(--rule);border-radius:8px;padding:12px 14px}
+.stat .v{font-family:var(--mono);font-size:26px;font-weight:600;letter-spacing:-.01em;line-height:1.1}
+.stat .l{font-size:12.5px;color:var(--ink-3);margin-top:4px}
+.toc{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13.5px;margin:0 0 6px}
+.toc a{color:var(--ink-2);text-decoration:none;border-bottom:1px solid var(--rule)}
+.toc a:hover{color:var(--accent-ink);border-color:var(--accent)}
+.tip{position:fixed;pointer-events:none;background:var(--bg-2);border:1px solid var(--rule);border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.4;box-shadow:0 4px 14px rgba(0,0,0,.12);z-index:9;display:none;max-width:260px}
+.tip b{font-family:var(--mono);font-weight:600}
+.tip .r{display:flex;gap:8px;align-items:center}
+.tip i{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.small{font-size:13px;color:var(--ink-2)}
+.hl{background:var(--accent-wash);border-radius:3px;padding:0 3px}
+.chart-text{fill:var(--ink-2);font-family:var(--mono);font-size:11px}
+.chart-title{fill:var(--ink);font-family:var(--sans);font-size:12px;font-weight:600}
+.grid-line{stroke:var(--rule-2);stroke-width:1}
+.axis-line{stroke:var(--rule);stroke-width:1}
+.band{opacity:.12}
+.ser{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.dot{stroke:var(--bg-2);stroke-width:2}
+.bar{}
+.hit{fill:transparent;cursor:crosshair}
+.xhair{stroke:var(--ink-3);stroke-width:1;stroke-dasharray:none;opacity:0}
+@media (prefers-reduced-motion:no-preference){ .ser,.dot{transition:opacity .15s} }
+footer{margin-top:60px;padding-top:16px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--ink-3);font-family:var(--mono)}
+</style>
+<div class="tip" id="tip"></div>
+<script>
+// ---------- tiny SVG chart helpers (no library) ----------
+const NS="http://www.w3.org/2000/svg";
+const el=(t,a={},p)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);if(p)p.appendChild(e);return e;};
+const fmt=(v,d)=>{if(v==null||Number.isNaN(v))return"–";if(d!=null)return v.toFixed(d);const a=Math.abs(v);return a>=100?v.toFixed(0):a>=10?v.toFixed(1):a>=1?v.toFixed(2):v.toFixed(3);};
+const tip=document.getElementById("tip");
+function showTip(x,y,html){tip.innerHTML=html;tip.style.display="block";const w=tip.offsetWidth,h=tip.offsetHeight;let L=x+14,T=y+14;if(L+w>innerWidth-8)L=x-w-14;if(T+h>innerHeight-8)T=y-h-14;tip.style.left=L+"px";tip.style.top=T+"px";}
+function hideTip(){tip.style.display="none";}
+function niceTicks(lo,hi,n=5){const span=hi-lo||1;const raw=span/n;const p=Math.pow(10,Math.floor(Math.log10(raw)));const s=[1,2,2.5,5,10].map(m=>m*p).find(m=>span/m<=n+1)||p*10;const t=[];for(let v=Math.ceil(lo/s)*s;v<=hi+1e-9;v+=s)t.push(+v.toFixed(10));return t;}
+/* lineChart: {x:[...] numeric or categorical labels, series:[{name,values:[..],color,band:[[lo,hi],..]}],
+   xlog, xlabel, ylabel, ylo, yhi, refBand:{lo,hi,label}, labelEnd:true, yfmt} */
+function lineChart(host,o){
+  const W=440,H=250,m={l:52,r:14,t:16,b:38};
+  const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":o.aria||o.ylabel||""},host);
+  const xs=o.x.map((v,i)=>o.xcat?i:(o.xlog?Math.log10(v):v));
+  const xlo=Math.min(...xs),xhi=Math.max(...xs);
+  const allv=[];o.series.forEach(s=>{s.values.forEach(v=>{if(v!=null&&!Number.isNaN(v))allv.push(v)});(s.band||[]).forEach(b=>{if(b)allv.push(b[0],b[1])});});
+  if(o.refBand){allv.push(o.refBand.lo,o.refBand.hi)}
+  let ylo=o.ylo!=null?o.ylo:Math.min(...allv),yhi=o.yhi!=null?o.yhi:Math.max(...allv);
+  if(ylo===yhi){ylo-=1;yhi+=1}
+  const pad=(yhi-ylo)*0.08;if(o.ylo==null)ylo-=pad;if(o.yhi==null)yhi+=pad;
+  const X=v=>m.l+(xhi===xlo?0.5:(v-xlo)/(xhi-xlo))*(W-m.l-m.r);
+  const Y=v=>H-m.b-(v-ylo)/(yhi-ylo)*(H-m.t-m.b);
+  // grid + y ticks
+  niceTicks(ylo,yhi,4).forEach(t=>{el("line",{x1:m.l,x2:W-m.r,y1:Y(t),y2:Y(t),class:"grid-line"},svg);el("text",{x:m.l-6,y:Y(t)+3.5,"text-anchor":"end",class:"chart-text"},svg).textContent=o.yfmt?o.yfmt(t):fmt(t);});
+  el("line",{x1:m.l,x2:W-m.r,y1:H-m.b,y2:H-m.b,class:"axis-line"},svg);
+  // x ticks
+  o.x.forEach((lab,i)=>{const px=X(xs[i]);el("line",{x1:px,x2:px,y1:H-m.b,y2:H-m.b+4,class:"axis-line"},svg);el("text",{x:px,y:H-m.b+15,"text-anchor":"middle",class:"chart-text"},svg).textContent=o.xfmt?o.xfmt(lab):lab;});
+  if(o.xlabel)el("text",{x:(m.l+W-m.r)/2,y:H-6,"text-anchor":"middle",class:"chart-text"},svg).textContent=o.xlabel;
+  if(o.ylabel)el("text",{x:12,y:m.t+6,class:"chart-text","text-anchor":"start"},svg).textContent=o.ylabel;
+  // reference band (e.g. baseline ± sd)
+  if(o.refBand){el("rect",{x:m.l,y:Y(o.refBand.hi),width:W-m.l-m.r,height:Math.max(1,Y(o.refBand.lo)-Y(o.refBand.hi)),fill:"var(--ink-3)",class:"band"},svg);
+    el("line",{x1:m.l,x2:W-m.r,y1:Y((o.refBand.lo+o.refBand.hi)/2),y2:Y((o.refBand.lo+o.refBand.hi)/2),stroke:"var(--ink-3)","stroke-width":1,"stroke-dasharray":"3 3"},svg);}
+  // series
+  o.series.forEach(s=>{
+    if(s.band){let d="";const pts=[];s.band.forEach((b,i)=>{if(b)pts.push([X(xs[i]),Y(b[1]),Y(b[0])])});if(pts.length>1){d="M"+pts.map(p=>p[0]+","+p[1]).join("L")+"L"+pts.slice().reverse().map(p=>p[0]+","+p[2]).join("L")+"Z";el("path",{d,fill:s.color,class:"band"},svg);}}
+    const pts=s.values.map((v,i)=>(v==null||Number.isNaN(v))?null:[X(xs[i]),Y(v)]).filter(Boolean);
+    if(pts.length>1)el("path",{d:"M"+pts.map(p=>p.join(",")).join("L"),stroke:s.color,class:"ser"},svg);
+    pts.forEach(p=>el("circle",{cx:p[0],cy:p[1],r:4,fill:s.color,class:"dot"},svg));
+    if(o.labelEnd&&pts.length){const p=pts[pts.length-1];el("text",{x:p[0]+6,y:p[1]+3.5,class:"chart-text"},svg).textContent=s.name;}
+  });
+  // hover: crosshair snapping to nearest x
+  const xh=el("line",{y1:m.t,y2:H-m.b,class:"xhair"},svg);
+  const hit=el("rect",{x:m.l,y:m.t,width:W-m.l-m.r,height:H-m.t-m.b,class:"hit"},svg);
+  const toSvg=e=>{const r=svg.getBoundingClientRect();return (e.clientX-r.left)/r.width*W;};
+  hit.addEventListener("pointermove",e=>{const px=toSvg(e);let bi=0,bd=1e9;xs.forEach((v,i)=>{const d=Math.abs(X(v)-px);if(d<bd){bd=d;bi=i}});xh.setAttribute("x1",X(xs[bi]));xh.setAttribute("x2",X(xs[bi]));xh.style.opacity=1;
+    let h=`<div><b>${o.xlabel?o.xlabel+" = ":""}${o.xfmt?o.xfmt(o.x[bi]):o.x[bi]}</b></div>`;o.series.forEach(s=>{const v=s.values[bi];h+=`<div class="r"><i style="background:${s.color}"></i><b>${o.yfmt?o.yfmt(v):fmt(v)}</b><span>${s.name}</span></div>`;});showTip(e.clientX,e.clientY,h);});
+  hit.addEventListener("pointerleave",()=>{xh.style.opacity=0;hideTip();});
+  return svg;
+}
+/* hbar: {rows:[{label,value,color,note}], xmax, xfmt, unit} horizontal bars <=24px, rounded data-end */
+function hbar(host,o){
+  const rowH=26,W=560,m={l:o.lw||170,r:70,t:6,b:6};const H=m.t+m.b+o.rows.length*rowH;
+  const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":o.aria||""},host);
+  const xmax=o.xmax||Math.max(...o.rows.map(r=>r.value));const X=v=>m.l+v/xmax*(W-m.l-m.r);
+  o.rows.forEach((r,i)=>{const y=m.t+i*rowH+3,h=rowH-8;el("text",{x:m.l-8,y:y+h/2+4,"text-anchor":"end",class:"chart-text"},svg).textContent=r.label;
+    const w=Math.max(2,X(r.value)-m.l);const d=`M${m.l},${y}h${Math.max(0,w-4)}a4,4 0 0 1 4,4v${h-8}a4,4 0 0 1 -4,4h${-Math.max(0,w-4)}z`;
+    const p=el("path",{d,fill:r.color||"var(--accent)",class:"bar"},svg);
+    el("text",{x:X(r.value)+6,y:y+h/2+4,class:"chart-text"},svg).textContent=(o.xfmt?o.xfmt(r.value):fmt(r.value))+(o.unit||"");
+    p.addEventListener("pointermove",e=>showTip(e.clientX,e.clientY,`<div><b>${o.xfmt?o.xfmt(r.value):fmt(r.value)}${o.unit||""}</b> ${r.label}</div>${r.note?`<div class="small">${r.note}</div>`:""}`));p.addEventListener("pointerleave",hideTip);});
+  return svg;
+}
+function legend(host,items){const d=document.createElement("div");d.className="legend";items.forEach(it=>{const s=document.createElement("span");const i=document.createElement("i");i.style.background=it.color;s.appendChild(i);s.appendChild(document.createTextNode(it.name));d.appendChild(s);});host.appendChild(d);return d;}
+function fig(host,title,sub){const f=document.createElement("figure");if(title){const t=document.createElement("p");t.className="ft";t.textContent=title;f.appendChild(t);}if(sub){const s=document.createElement("p");s.className="fs";s.textContent=sub;f.appendChild(s);}host.appendChild(f);return f;}
+function cap(f,text){const c=document.createElement("figcaption");c.textContent=text;f.appendChild(c);}
+</script>
+
+<div class="wrap">
+<header class="masthead">
+  <div class="eyebrow">fmocc_core · MPC / HardFlow / FMRG on FLUX.1-dev · 2026-09-16</div>
+  <h1>Finding the λ range automatically</h1>
+  <p class="lede">A procedure that measures each method's λ response curve for a given reward and prompt pair, brackets its transition, and places the sweep grid where the energy/reward frontier actually moves — so a large sweep can be left running without hand-tuning λ per reward.</p>
+  <div class="meta"><span>prompt <b>"a portrait of a man" → "a smiling face"</b></span><span>rewards tested <b>clip, imagereward, pickscore</b></span><span>proxy N <b>4</b></span><span>target N <b>10</b></span><span>GPU <b>RTX A5000</b></span></div>
+</header>
+<nav class="toc"><a href="#summary">00 Summary</a> <a href="#problem">01 The problem</a> <a href="#method">02 Procedure</a> <a href="#results">03 Results</a> <a href="#grids">04 Recommended grids</a> <a href="#transfer">05 Transfer to the target N</a> <a href="#usage">06 Usage</a> <a href="#caveats">07 Caveats</a></nav>
+
+<h2 id="summary"><span class="n">00</span>Summary</h2>
+<div id="summary-body"></div>
+
+<h2 id="problem"><span class="n">01</span>Why a fixed λ grid wastes most of its points</h2>
+<p>λ is not one knob. In MPC it is a Lagrange weight the optimiser solves against (<span class="mono">J = E/(2λ) − r</span>); in HardFlow it enters as the deviation penalty <span class="mono">reg = N/(2λ)</span>, which is the same physical quantity per step but is also bounded below by a solver-stability floor <span class="mono">λ ≥ N·lr/2</span>; in FMRG it is an open-loop gain on the reward gradient, <span class="mono">z ← z + (dt/n_opt)·λ·∇r</span>, with nothing minimising energy at all. On top of that, its useful range moves with the reward's scale: the repo's own note is that switching LPIPS → ImageReward de-regularises by ~200× at fixed λ.</p>
+<p>The consequence for an unattended sweep is that a grid chosen for one (method, reward) lands in the wrong regime for another. The suite grid <span class="mono">{0.1, 1, 10, 50, 200, 1000, 3000, 10000}</span> was built for MPC on ImageReward — and even there, MPC is 79% of the way to the reward ceiling at λ=1 and fully saturated by λ=10, so six of the eight points measure the same plateau. FMRG on CLIP needs λ three to four orders of magnitude higher than MPC on ImageReward to move at all.</p>
+<div class="callout"><p><strong>The thing that is invariant is the shape of the response.</strong> For every method and every reward, <span class="mono">Δr(λ) = r_ctrl − r_unc</span> is ≈0 while the effort penalty dominates, rises through a transition, and plateaus at whatever the reward model can be pushed to. A grid is only worth its cost where that curve is moving. So the automation problem is: find the transition for this (method, reward, prompt) cheaply, and put the points there.</p></div>
+
+<h2 id="method"><span class="n">02</span>The procedure</h2>
+<p>Implemented as <code>fmocc_core/lambda_autorange.py</code>. It runs in one process — FLUX loads once, the reward model loads once per (reward, edit prompt) — and calls <code>run_sweep._run_one</code> directly, so every guard in that path (locked defaults, plausibility ranges, the non-finite checks) still applies. Range-finding uses a cheap proxy configuration (N=4; MPC with the jump surrogate and <span class="mono">n_inner=6</span>; HardFlow at the authors' <span class="mono">n_inner=40, lr=2.5</span>; FMRG at <span class="mono">n_opt=3</span>) and emits a grid for the N you will actually sweep.</p>
+<ol>
+<li><strong>Probes (seconds, once per reward).</strong> One uncontrolled rollout gives <span class="mono">r_unc</span>. The reward's attainable maximum comes from <code>reward_ranges.REWARD_OBSERVED_RANGE</code>, so <span class="mono">Δr_max ≈ r_max − r_unc</span> is the ceiling the curve should plateau at. One backward pass through the decoder and the reward model at the uncontrolled endpoint gives <span class="mono">‖∇_z r‖</span>. Linearising the reward around that endpoint, the λ at which the whole attainable range gets bought scales as <span class="mono">Δr_max / ‖∇_z r‖²</span> for all three methods (MPC and HardFlow through the energy trade-off, FMRG because its total displacement is ≈ λ‖∇r‖ over the trajectory). That gives a scale-aware starting λ₀; the constant in front was set once from the ImageReward study and only has to be right to within a decade or two, because the next step corrects it.</li>
+<li><strong>Bracket.</strong> Evaluate λ₀, then step ×10 upward until the top is flat — the last decade bought less than <span class="mono">tol</span> (5% of the ceiling) while already high, or Δr is within 10% of the ceiling, or energy tripled for no reward — and ×10 downward until the bottom is inactive (Δr ≤ tol). Runs that raise, such as HardFlow below its <span class="mono">lr·reg ≥ 1</span> floor, are recorded as the admissible boundary rather than retried. Budget: 10 evaluations per method.</li>
+<li><strong>Refine.</strong> Fit a logistic in <span class="mono">log₁₀λ</span> to the measured points (numpy grid search, no scipy) and place the <span class="mono">n_grid</span> final points where the fitted curve passes through equally spaced fractions of its rise (8%…92%). Each grid point then buys a distinct point on the energy/reward frontier instead of another sample of the plateau. If the fit is poor (R² &lt; 0.5) the grid falls back to log-uniform over the bracketed active region. The refined points are evaluated as well, so the output is the whole measured curve, not just a proposal.</li>
+<li><strong>Report for the target N.</strong> MPC's transition is approximately N-invariant (λ is per-step normalised through dt, and the N=4…10 study showed the same knee), so the grid transfers. HardFlow's floor <span class="mono">λ ≥ N·lr/2</span> is not — it is 5 at N=4 and 12.5 at N=10 — so the grid is re-cut at the target N's floor and any dropped points are named.</li>
+</ol>
+<p>Outputs per run: <code>autorange.json</code> (everything), <code>evaluations.csv</code> (one row per λ evaluated), <code>curves.png</code>, and <code>grids.txt</code> with ready-to-paste <code>--sweep_lam</code> lines. Stopping rules, tolerances, budget and the proxy configuration are all flags.</p>
+
+
+<h2 id="results"><span class="n">03</span>Measured response curves</h2>
+<p>Each panel is one (reward, method). Dots are evaluations in the order the search made them; the line is the logistic fit in log λ; green ticks are the recommended grid; the grey dashed line is the ceiling estimate <span class="mono">r_max − r_unc</span> from the reward's observed range; the orange line is HardFlow's admissible floor at the target N. Red ticks are λ values that raised.</p>
+<div id="curves"></div>
+
+<h2 id="grids"><span class="n">04</span>Recommended grids vs. the suite grid</h2>
+<div id="grids-body"></div>
+
+<h2 id="transfer"><span class="n">05</span>Does a grid found at N=4 hold at the target N?</h2>
+<p>The ImageReward MPC grid from the N=4 search was run as-is at N=10 (H=2, n_inner=12, jump surrogate, same seed), plus one plateau point at λ=2. The uncontrolled image differs between the two N (r_unc −1.44 vs −1.60), yet the transition sits at the same λ: Δr crosses 0.5 at λ≈0.19 and reaches ≈2.9 by λ≈0.35 in both. Five of the six grid points land on the rising part of the N=10 curve; the lowest (0.072–0.08) is inactive at both N and is the one point a tighter budget would drop. This is the property the whole approach rests on — λ is per-step normalised through dt in MPC, so the knee is a function of (reward, prompt), not of N — and it held.</p>
+<div id="transfer-body"></div>
+
+<h2 id="usage"><span class="n">06</span>Using it for an unattended sweep</h2>
+<p>Two scripts, both in <code>fmocc_core/</code>. Neither is committed yet.</p>
+<p><strong><code>lambda_autorange.py</code></strong> does the range finding and writes the grid:</p>
+<pre><code>CUDA_VISIBLE_DEVICES=0 python lambda_autorange.py --reward imagereward \
+    --prompt "a portrait of a man" --edit_prompt "a smiling face" \
+    --methods mpc hardflow fmrg --probe_N 4 --target_N 10 --n_grid 6 \
+    --flux_device cuda:0 --reward_device cuda:0 --out_dir results/autorange/imagereward
+# -> grids.txt:
+#    mpc      --sweep_lam 0.072 0.13 0.19 0.25 0.36 0.65
+#    # hardflow: saturated_at_admissible_floor -- every admissible lambda (>= 12.5 at N=10) is on the plateau ...
+#    hardflow --sweep_lam 50 79 130 200 320 500
+#    fmrg     --sweep_lam 0.35 0.77 1.2 1.8 2.8 5.5</code></pre>
+<p><strong><code>auto_sweep.sh</code></strong> chains it into the real sweep, one <code>run_sweep.py</code> invocation per method at the target N on exactly the grid found, with <code>--resume</code> so a killed run picks up where it stopped:</p>
+<pre><code>TARGET_N=10 MPC_H=2 MPC_NI=12 SEEDS="42 43 44" \
+    ./auto_sweep.sh 0 imagereward "a portrait of a man" "a smiling face"
+# results/auto/imagereward/&lt;prompt-slug&gt;/{autorange, mpc_seed42, hardflow_seed42, fmrg_seed42, ...}</code></pre>
+<p>To leave a batch running over several reward × prompt combinations, loop that line; each combination costs the range finding (≈10–15 min at N=4 for three methods) plus the sweep itself. The card is pinned with <code>CUDA_VISIBLE_DEVICES</code> and both device flags stay <code>cuda:0</code> in-process, which is the only safe way to use the second card with ImageReward.</p>
+<h3>Knobs worth knowing</h3>
+<ul>
+<li><code>--tol</code> (default 0.05): flatness as a fraction of the reward ceiling. Raise it for noisy rewards; the noise floor measured earlier today was ~0.05 in J for ImageReward MPC at low λ and considerably larger for HardFlow.</li>
+<li><code>--max_evals</code> (10) and <code>--n_grid</code> (6): bracketing budget per method and the number of final points. The refined points are evaluated too (<code>--evaluate_grid false</code> skips that and roughly halves the cost).</li>
+<li><code>--endpoint_surrogate jump</code> is the default for MPC range finding because it is ~3× cheaper and its transition matched the rollout's within noise at N=8; the sweep itself still runs whatever surrogate you give <code>run_sweep.py</code>.</li>
+<li><code>--hardflow_lr_inner</code>: HardFlow's admissible floor is <span class="mono">N·lr/2</span>. If the finder reports <em>saturated_at_admissible_floor</em>, this is the knob — the transition is below the floor, and lowering lr is the only way to reach it.</li>
+</ul>
+
+<h2 id="caveats"><span class="n">07</span>Caveats</h2>
+<ul>
+<li><strong>One prompt pair, one seed.</strong> The grids above are for "a portrait of a man" → "a smiling face" at seed 42. The point of the tool is that it re-derives the grid per combination; the numbers here are a demonstration, not a table to copy.</li>
+<li><strong>The ceiling from <code>REWARD_OBSERVED_RANGE</code> is the model's, not the prompt's.</strong> CLIP's documented maximum of 0.80 gave a ceiling of 0.65 here, while the attainable plateau on this prompt pair was 0.24. The first version of the stopping rule waited for the ceiling and walked λ up to 3.5×10⁶; the current rule judges flatness on the observed rise and stops within a decade of the plateau. The ceiling is still used as a sanity bound and for the tolerance scale.</li>
+<li><strong>Saturation is not the only failure mode at high λ.</strong> FMRG on CLIP shows Δr <em>falling</em> above λ≈3500 while energy grows past 10⁹ — the image is being destroyed and the reward model scores the wreckage lower. The "falling" stop exists for exactly this; with only the ceiling test, those runs looked like "not saturated yet".</li>
+<li><strong>The prior is a decade-level heuristic.</strong> <span class="mono">λ₀ = c·Δr_max/‖∇r‖</span> landed within about a decade of the knee on both rewards and both were used to set c, so it is calibrated on n=2. A wrong prior costs a few extra bracketing evaluations, not correctness; the bracket does not depend on it.</li>
+<li><strong>Proxy N=4 changes the uncontrolled image</strong> (r_unc differs from the target N), so the curves' absolute Δr differ between N. What transfers is the λ location of the transition — section 05 measures how well.</li>
+<li><strong>FMRG's response is a cliff, and it is not reproducible near it.</strong> On ImageReward it goes from Δr 0.09 at λ=0.77 to 3.15 at λ=1.2; the first pass measured 2.94 at λ=0.83 and the second 0.09 at λ=0.77 — the trajectory bifurcates. An open-loop gain has no energy term pulling it back, so a small change in λ (or in kernel nondeterminism) flips which basin the sample lands in. Grids for FMRG should be denser across its knee than the logistic quantiles alone give, or averaged over seeds.</li>
+<li><strong>Above its floor, HardFlow is not regularised in any useful sense here.</strong> At λ=50, N=4 its penalty weight is <span class="mono">reg = N/(2λ) = 0.04</span>. On PickScore it pushes Δr to 9.6 — past MPC's plateau of 5.0 and past the reward's documented maximum — at energy 400 vs MPC's 16: it is reward-hacking the scorer with a destroyed image. The floor <span class="mono">λ ≥ N·lr/2</span> is what keeps it out of the regime where the comparison would be fair; lowering <code>--hardflow_lr_inner</code> is the fix, and the finder now says so explicitly when it detects the plateau at the floor.</li>
+<li><strong>HardFlow's run-to-run nondeterminism</strong> (documented earlier today: three identical commands spread Δr by ~70% of the smallest value on CLIP) makes its curve the least reliable of the three at a single evaluation per λ. Its grids should be read as the right decade, not the right point.</li>
+</ul>
+<script>
+// ---- summary block, rendered from DATA (deferred: DATA is defined further down the page) ----
+window.addEventListener("DOMContentLoaded", function(){
+  const host=document.getElementById("summary-body");
+  const rewards=Object.keys(DATA.runs); if(!rewards.length) return;
+  const cells=[];
+  let totalEvals=0,totalWall=0;
+  rewards.forEach(rw=>DATA.runs[rw].results.forEach(r=>{ if(r.n_evals){totalEvals+=r.n_evals; totalWall+=r.wall_s;} }));
+  const stat=h("div","stat");
+  const mk=(v,l)=>{const d=h("div");d.appendChild(h("div","v",v));d.appendChild(h("div","l",l));stat.appendChild(d);};
+  mk(String(rewards.length),"reward models range-found with the same command and no per-reward settings");
+  mk(String(totalEvals),"cheap N=4 evaluations in total, "+g2(totalWall/60)+" min of control loop across all methods and rewards");
+  // decade spread of MPC's active region across rewards
+  const mpc=rewards.map(rw=>DATA.runs[rw].results.find(r=>r.method==="mpc")).filter(r=>r&&r.status!=="insufficient");
+  if(mpc.length>1){const lo=Math.min(...mpc.map(r=>r.active_lo)),hi=Math.max(...mpc.map(r=>r.active_hi));mk(g2(Math.log10(hi/lo))+" decades","span of MPC's active λ across the rewards tested — no single grid covers it well");}
+  const inSuite=[];rewards.forEach(rw=>DATA.runs[rw].results.forEach(r=>{if(r.status!=="insufficient")inSuite.push(DATA.suite_grid.filter(l=>l>=r.active_lo&&l<=r.active_hi).length);}));
+  if(inSuite.length)mk(g2(inSuite.reduce((a,b)=>a+b,0)/inSuite.length)+" of 8","suite-grid points that land in the active region, averaged over every (reward, method)");
+  host.appendChild(stat);
+  const p=h("p");p.innerHTML="<strong>What to take away.</strong> The response curve Δr(λ) has the same shape for every method and reward, its location does not; bracketing by decades from a gradient-based prior finds it in roughly ten cheap evaluations per method, and a logistic fit places the final grid across the transition. The result is a per-(reward, method) grid that spends every point where the frontier moves. The one case it cannot fix, it names: HardFlow at the authors' learning rate has its admissible floor above the whole transition for ImageReward, so every λ it can run is on the plateau.";host.appendChild(p);
+});
+</script>
+
+
+<footer>Data: fmocc_core/results/autorange/&lt;reward&gt;/ (autorange.json, evaluations.csv, curves.png, grids.txt). Script: fmocc_core/lambda_autorange.py. Generated 2026-09-16.</footer>
+</div>
+<script id="data" type="application/json">{"runs": {"clip": {"reward": "clip", "prompt": "a portrait of a man", "edit_prompt": "a smiling face", "probe": {"r_unc": 0.14866206049919128, "grad_norm": 0.1924426257610321, "z_norm": 141.35897827148438, "n_latent": 16384}, "ceiling": 0.6513379395008088, "probe_N": 4, "target_N": 10, "args": {"reward": "clip", "prompt": "a portrait of a man", "edit_prompt": "a smiling face", "methods": ["mpc", "hardflow", "fmrg"], "probe_N": 4, "target_N": 10, "n_grid": 6, "max_evals": 10, "tol": 0.05, "tol_abs": 0.0, "evaluate_grid": true, "seed": 42, "sample_mode": "flow_map2", "height": 256, "width": 256, "mpc_H": 2, "mpc_n_inner": 6, "mpc_lr_inner": 0.01, "endpoint_surrogate": "jump", "hardflow_n_inner": 40, "hardflow_lr_inner": 2.5, "fmrg_n_opt": 3, "reward_dtype": "fp32", "fast": true, "flux_device": "cuda:0", "reward_device": "cuda:0", "quantize": "int8", "model_id": "black-forest-labs/FLUX.1-dev", "lora_path": null, "out_dir": "results/autorange/clip"}, "results": [{"method": "mpc", "prior_lam0": 3.3845824797132797, "tol": 0.03256689697504044, "ceiling": 0.6513379395008088, "lam_floor_probe_N": 0.0, "lam_floor_target_N": 0.0, "status": "ok", "dr_plateau_observed": 0.23380708694458008, "active_lo": 3.38, "active_hi": 3380.0, "fit": {"m": 1.6122500336109877, "k": 2.2, "A": 0.23516564330981832, "r2": 0.9896016085845675}, "grid": [3.4, 12.0, 24.0, 47.0, 98.0, 350.0], "grid_for_target_N": [3.4, 12.0, 24.0, 47.0, 98.0, 350.0], "clipped_by_target_floor": [], "points": [{"method": "mpc", "lam": 3.38, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.16689027845859528, "dr": 0.01822821795940399, "E": 0.4509544372558594, "J": -0.1001810421781427, "t_ctrl": 23.25480127381161, "err": "", "wall_s": 33.94309490220621}, {"method": "mpc", "lam": 3.4, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.16477862000465393, "dr": 0.016116559505462646, "E": 0.4433555603027344, "J": -0.09957927290131063, "t_ctrl": 23.877491185907274, "err": "", "wall_s": 35.077654478140175}, {"method": "mpc", "lam": 12.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.19944611191749573, "dr": 0.05078405141830444, "E": 0.6308174133300781, "J": -0.17316205302874246, "t_ctrl": 23.873318389989436, "err": "", "wall_s": 35.12082081194967}, {"method": "mpc", "lam": 24.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.227694571018219, "dr": 0.07903251051902771, "E": 1.0208206176757812, "J": -0.20642747481664023, "t_ctrl": 23.871653649024665, "err": "", "wall_s": 35.12245269911364}, {"method": "mpc", "lam": 33.8, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.26862362027168274, "dr": 0.11996155977249146, "E": 1.1692047119140625, "J": -0.2513276925806463, "t_ctrl": 23.74529899796471, "err": "", "wall_s": 34.90809139423072}, {"method": "mpc", "lam": 47.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.2832946181297302, "dr": 0.13463255763053894, "E": 1.5561981201171875, "J": -0.2667393189795474, "t_ctrl": 23.86737234191969, "err": "", "wall_s": 35.091391939204186}, {"method": "mpc", "lam": 98.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.3041600286960602, "dr": 0.1554979681968689, "E": 2.8489837646484375, "J": -0.28962439724377226, "t_ctrl": 23.856907956767827, "err": "", "wall_s": 35.11866789218038}, {"method": "mpc", "lam": 338.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.36321690678596497, "dr": 0.21455484628677368, "E": 6.2957763671875, "J": -0.3539036281362793, "t_ctrl": 24.079293692018837, "err": "", "wall_s": 35.34879189589992}, {"method": "mpc", "lam": 350.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.34772831201553345, "dr": 0.19906625151634216, "E": 6.2745361328125, "J": -0.33876468896865847, "t_ctrl": 23.8423818401061, "err": "", "wall_s": 35.05779438884929}, {"method": "mpc", "lam": 3380.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.38246914744377136, "dr": 0.23380708694458008, "E": 12.71112060546875, "J": -0.3805888041589387, "t_ctrl": 23.907061765901744, "err": "", "wall_s": 35.13951572217047}], "n_evals": 10, "wall_s": 350.13258454576135}, {"method": "hardflow", "prior_lam0": 3.3845824797132797, "tol": 0.03256689697504044, "ceiling": 0.6513379395008088, "lam_floor_probe_N": 5.0, "lam_floor_target_N": 12.5, "status": "ok", "dr_plateau_observed": 0.19293934106826782, "active_lo": 50.0, "active_hi": 5000.0, "fit": {"m": 1.6656366710026855, "k": 1.4000000000000001, "A": 0.21164109926680105, "r2": 0.9601180194332979}, "grid": [50.0, 130.0, 320.0, 790.0, 2000.0, 5000.0], "grid_for_target_N": [50.0, 130.0, 320.0, 790.0, 2000.0, 5000.0], "clipped_by_target_floor": [], "points": [{"method": "hardflow", "lam": 5.0, "ok": false, "r_unc": null, "r_ctrl": null, "dr": null, "E": null, "J": null, "t_ctrl": null, "err": "ValueError: lr=2.5 * hardflow_reg=0.4 = 1.0 >= 1: the inner ascent on the deviation penalty is unstable and will diverge to inf/NaN by the final step (alpha -> 1). Reduce e", "wall_s": 2.2178828101605177}, {"method": "hardflow", "lam": 50.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.2602148652076721, "dr": 0.11155280470848083, "E": 0.6678619384765625, "J": -0.2535362458229065, "t_ctrl": 16.664796536788344, "err": "", "wall_s": 27.223476650658995}, {"method": "hardflow", "lam": 130.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.2814464569091797, "dr": 0.1327843964099884, "E": 1.5257453918457031, "J": -0.27557820540208083, "t_ctrl": 16.661081138066947, "err": "", "wall_s": 27.788243509829044}, {"method": "hardflow", "lam": 320.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.30920344591140747, "dr": 0.1605413854122162, "E": 2.084320068359375, "J": -0.30594669580459594, "t_ctrl": 16.656060083769262, "err": "", "wall_s": 27.701178688090295}, {"method": "hardflow", "lam": 500.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.32697075605392456, "dr": 0.17830869555473328, "E": 2.5666656494140625, "J": -0.3244040904045105, "t_ctrl": 16.65278935804963, "err": "", "wall_s": 27.66419953899458}, {"method": "hardflow", "lam": 790.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.3228801488876343, "dr": 0.174218088388443, "E": 2.8045082092285156, "J": -0.32110514369192, "t_ctrl": 16.68502705078572, "err": "", "wall_s": 27.713775058742613}, {"method": "hardflow", "lam": 2000.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.34992390871047974, "dr": 0.20126184821128845, "E": 3.772632598876953, "J": -0.3489807505607605, "t_ctrl": 16.70380604080856, "err": "", "wall_s": 27.739993324968964}, {"method": "hardflow", "lam": 5000.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.3416014015674591, "dr": 0.19293934106826782, "E": 3.9129791259765625, "J": -0.34121010365486143, "t_ctrl": 16.669569527730346, "err": "", "wall_s": 27.714701146818697}], "n_evals": 8, "wall_s": 195.9716488290578}, {"method": "fmrg", "prior_lam0": 6.7691649594265595, "tol": 0.03256689697504044, "ceiling": 0.6513379395008088, "lam_floor_probe_N": 0.0, "lam_floor_target_N": 0.0, "status": "ok", "dr_plateau_observed": 0.19728150963783264, "active_lo": 6.77, "active_hi": 677.0, "fit": {"m": 1.7639220020184776, "k": 2.7, "A": 0.20455434686995053, "r2": 0.9753747646899}, "grid": [6.8, 18.0, 31.0, 50.0, 88.0, 230.0], "grid_for_target_N": [6.8, 18.0, 31.0, 50.0, 88.0, 230.0], "clipped_by_target_floor": [], "points": [{"method": "fmrg", "lam": 6.77, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.1638379544019699, "dr": 0.015175893902778625, "E": 0.06345963478088379, "J": -0.15915112760869932, "t_ctrl": 15.280421087983996, "err": "", "wall_s": 25.0722651979886}, {"method": "fmrg", "lam": 6.8, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.1646689772605896, "dr": 0.016006916761398315, "E": 0.06872367858886719, "J": -0.1596157655996435, "t_ctrl": 15.285467471927404, "err": "", "wall_s": 25.03377807792276}, {"method": "fmrg", "lam": 18.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.18923617899417877, "dr": 0.04057411849498749, "E": 0.18829631805419922, "J": -0.18400572571489546, "t_ctrl": 15.27689058193937, "err": "", "wall_s": 25.045289095956832}, {"method": "fmrg", "lam": 31.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.2084866464138031, "dr": 0.059824585914611816, "E": 0.5312881469726562, "J": -0.19991748275295382, "t_ctrl": 15.276506120804697, "err": "", "wall_s": 25.078816018998623}, {"method": "fmrg", "lam": 50.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.23259851336479187, "dr": 0.08393645286560059, "E": 1.0614814758300781, "J": -0.2219836986064911, "t_ctrl": 15.279812450055033, "err": "", "wall_s": 25.029710073024035}, {"method": "fmrg", "lam": 67.7, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.284626841545105, "dr": 0.1359647810459137, "E": 2.181915283203125, "J": -0.26851225304286624, "t_ctrl": 15.28529639262706, "err": "", "wall_s": 25.142898146994412}, {"method": "fmrg", "lam": 88.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.27010685205459595, "dr": 0.12144479155540466, "E": 3.3506622314453125, "J": -0.2510689984668385, "t_ctrl": 15.284312380012125, "err": "", "wall_s": 25.081594021059573}, {"method": "fmrg", "lam": 230.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.3108443319797516, "dr": 0.1621822714805603, "E": 17.3948974609375, "J": -0.2730293374994527, "t_ctrl": 15.28977471916005, "err": "", "wall_s": 25.164893991779536}, {"method": "fmrg", "lam": 677.0, "ok": true, "r_unc": 0.14866206049919128, "r_ctrl": 0.3459435701370239, "dr": 0.19728150963783264, "E": 131.241455078125, "J": -0.24901487362437622, "t_ctrl": 15.29461036901921, "err": "", "wall_s": 25.114571299869567}], "n_evals": 9, "wall_s": 225.97014252701774}]}, "imagereward": {"reward": "imagereward", "prompt": "a portrait of a man", "edit_prompt": "a smiling face", "probe": {"r_unc": -1.4439373016357422, "grad_norm": 12.278018951416016, "z_norm": 141.35897827148438, "n_latent": 16384}, "ceiling": 3.343937301635742, "probe_N": 4, "target_N": 10, "args": {"reward": "imagereward", "prompt": "a portrait of a man", "edit_prompt": "a smiling face", "methods": ["mpc", "hardflow", "fmrg"], "probe_N": 4, "target_N": 10, "n_grid": 6, "max_evals": 10, "tol": 0.05, "tol_abs": 0.0, "evaluate_grid": true, "seed": 42, "sample_mode": "flow_map2", "height": 256, "width": 256, "mpc_H": 2, "mpc_n_inner": 6, "mpc_lr_inner": 0.01, "endpoint_surrogate": "jump", "hardflow_n_inner": 40, "hardflow_lr_inner": 2.5, "fmrg_n_opt": 3, "reward_dtype": "fp32", "fast": true, "flux_device": "cuda:0", "reward_device": "cuda:0", "quantize": "int8", "model_id": "black-forest-labs/FLUX.1-dev", "lora_path": null, "out_dir": "results/autorange/imagereward"}, "results": [{"method": "mpc", "prior_lam0": 0.2723515344672186, "tol": 0.1671968650817871, "ceiling": 3.343937301635742, "lam_floor_probe_N": 0.0, "lam_floor_target_N": 0.0, "status": "ok", "dr_plateau_observed": 3.2234888076782227, "active_lo": 0.0272, "active_hi": 2.72, "fit": {"m": -0.5987644292991348, "k": 6.0, "A": 3.2294755553413403, "r2": 0.963598166997228}, "grid": [0.072, 0.13, 0.19, 0.25, 0.36, 0.65], "grid_for_target_N": [0.072, 0.13, 0.19, 0.25, 0.36, 0.65], "clipped_by_target_floor": [], "points": [{"method": "mpc", "lam": 0.0272, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -1.4578680992126465, "dr": -0.013930797576904297, "E": 0.4616508483886719, "J": 9.944096929886763, "t_ctrl": 23.910263082943857, "err": "", "wall_s": 32.00643986230716}, {"method": "mpc", "lam": 0.072, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -1.4012985229492188, "dr": 0.04263877868652344, "E": 0.4799995422363281, "J": 4.734628677368164, "t_ctrl": 23.859302080236375, "err": "", "wall_s": 31.93719285307452}, {"method": "mpc", "lam": 0.13, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -1.2666115760803223, "dr": 0.17732572555541992, "E": 0.4971427917480469, "J": 3.1786992366497335, "t_ctrl": 23.81236548209563, "err": "", "wall_s": 31.89751661196351}, {"method": "mpc", "lam": 0.19, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -0.9194421768188477, "dr": 0.5244951248168945, "E": 0.5249519348144531, "J": 2.3008946368568823, "t_ctrl": 23.769097269978374, "err": "", "wall_s": 31.856405202765018}, {"method": "mpc", "lam": 0.25, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 0.2803267240524292, "dr": 1.7242640256881714, "E": 0.5227432250976562, "J": 0.7651597261428833, "t_ctrl": 23.746733411215246, "err": "", "wall_s": 31.816624254453927}, {"method": "mpc", "lam": 0.272, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 0.5468966960906982, "dr": 1.9908339977264404, "E": 0.7124671936035156, "J": 0.7627856450922348, "t_ctrl": 23.661041778046638, "err": "", "wall_s": 31.57047169515863}, {"method": "mpc", "lam": 0.36, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.0558733940124512, "dr": 2.4998106956481934, "E": 0.6689300537109375, "J": -0.12680387496948242, "t_ctrl": 23.825255481991917, "err": "", "wall_s": 31.929442435037345}, {"method": "mpc", "lam": 0.65, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.4323451519012451, "dr": 2.8762824535369873, "E": 0.8895301818847656, "J": -0.7480911658360409, "t_ctrl": 23.833842096850276, "err": "", "wall_s": 31.90519810281694}, {"method": "mpc", "lam": 2.72, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.7795515060424805, "dr": 3.2234888076782227, "E": 1.5275421142578125, "J": -1.4987533232745003, "t_ctrl": 24.16405815212056, "err": "", "wall_s": 32.2422276167199}], "n_evals": 9, "wall_s": 287.3641694681719}, {"method": "hardflow", "prior_lam0": 0.2723515344672186, "tol": 0.1671968650817871, "ceiling": 3.343937301635742, "lam_floor_probe_N": 5.0, "lam_floor_target_N": 12.5, "status": "saturated_at_admissible_floor", "dr_plateau_observed": 3.401567220687866, "active_lo": 50.0, "active_hi": 500.0, "fit": {"m": 0.6989700043360187, "k": 4.5, "A": 3.392785453869148, "r2": 0.19770247288983667}, "grid": [50.0, 79.0, 130.0, 200.0, 320.0, 500.0], "grid_for_target_N": [50.0, 79.0, 130.0, 200.0, 320.0, 500.0], "clipped_by_target_floor": [], "points": [{"method": "hardflow", "lam": 5.0, "ok": false, "r_unc": null, "r_ctrl": null, "dr": null, "E": null, "J": null, "t_ctrl": null, "err": "ValueError: lr=2.5 * hardflow_reg=0.4 = 1.0 >= 1: the inner ascent on the deviation penalty is unstable and will diverge to inf/NaN by the final step (alpha -> 1). Reduce e", "wall_s": 1.927833671681583}, {"method": "hardflow", "lam": 50.0, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.9335769414901733, "dr": 3.3775142431259155, "E": 15.75811767578125, "J": -1.7759957647323608, "t_ctrl": 16.14724254468456, "err": "", "wall_s": 24.073984287213534}, {"method": "hardflow", "lam": 79.0, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.8867392539978027, "dr": 3.330676555633545, "E": 1282.1640625, "J": 6.228223166888274, "t_ctrl": 16.083642289042473, "err": "", "wall_s": 24.14521851716563}, {"method": "hardflow", "lam": 130.0, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.9499181509017944, "dr": 3.3938554525375366, "E": 27.532485961914062, "J": -1.8440239741252018, "t_ctrl": 15.987065764609724, "err": "", "wall_s": 24.03766886377707}, {"method": "hardflow", "lam": 200.0, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.9475986957550049, "dr": 3.391535997390747, "E": 26.91387939453125, "J": -1.8803139972686767, "t_ctrl": 15.974093245808035, "err": "", "wall_s": 24.067483074963093}, {"method": "hardflow", "lam": 320.0, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.9553070068359375, "dr": 3.3992443084716797, "E": 21.677749633789062, "J": -1.9214355230331421, "t_ctrl": 15.95643034670502, "err": "", "wall_s": 24.01633687596768}, {"method": "hardflow", "lam": 500.0, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.957629919052124, "dr": 3.401567220687866, "E": 46.28448486328125, "J": -1.9113454341888427, "t_ctrl": 16.131407054141164, "err": "", "wall_s": 24.1912952051498}], "n_evals": 7, "wall_s": 146.56185754621401, "note": "every admissible lambda (>= 5 at N=4, >= 12.5 at N=10) is already on the plateau (dr 3.378 of 3.402); the transition is below HardFlow's lr*reg >= 1 floor. The floor is N*lr/2, so lower --hardflow_lr_inner (e.g. 0.25 moves it to 1.25) or accept that HardFlow only has a saturated regime for this reward."}, {"method": "fmrg", "prior_lam0": 0.5447030689344372, "tol": 0.1671968650817871, "ceiling": 3.343937301635742, "lam_floor_probe_N": 0.0, "lam_floor_target_N": 0.0, "status": "ok", "dr_plateau_observed": 3.2990294694900513, "active_lo": 0.0545, "active_hi": 5.45, "fit": {"m": 0.0053106750332831965, "k": 6.0, "A": 3.558423879590127, "r2": 0.8845577212183653}, "grid": [0.35, 0.77, 1.2, 1.8, 2.8, 5.5], "grid_for_target_N": [0.35, 0.77, 1.2, 1.8, 2.8, 5.5], "clipped_by_target_floor": [], "points": [{"method": "fmrg", "lam": 0.0545, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -1.4306159019470215, "dr": 0.013321399688720703, "E": 0.041097164154052734, "J": 1.8076541051952117, "t_ctrl": 15.329257662408054, "err": "", "wall_s": 23.420971096958965}, {"method": "fmrg", "lam": 0.35, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -1.132619857788086, "dr": 0.31131744384765625, "E": 0.42281341552734375, "J": 1.7366390228271484, "t_ctrl": 15.2891208329238, "err": "", "wall_s": 23.363128469791263}, {"method": "fmrg", "lam": 0.545, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -0.875593900680542, "dr": 0.5683434009552002, "E": 9.165196418762207, "J": 9.284030982113759, "t_ctrl": 15.264888235833496, "err": "", "wall_s": 23.348660340067}, {"method": "fmrg", "lam": 0.77, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": -1.3496661186218262, "dr": 0.09427118301391602, "E": 1.2104730606079102, "J": 2.1356875865490403, "t_ctrl": 15.282769404817373, "err": "", "wall_s": 23.355515914969146}, {"method": "fmrg", "lam": 1.2, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.7052571773529053, "dr": 3.1491944789886475, "E": 6.227082252502441, "J": 0.8893604278564453, "t_ctrl": 15.324933228082955, "err": "", "wall_s": 23.527059884741902}, {"method": "fmrg", "lam": 1.8, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.7674554586410522, "dr": 3.2113927602767944, "E": 2.9621658325195312, "J": -0.9446316162745159, "t_ctrl": 15.28259861515835, "err": "", "wall_s": 23.44791574217379}, {"method": "fmrg", "lam": 2.8, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.8154511451721191, "dr": 3.2593884468078613, "E": 14.40109634399414, "J": 0.7561732019696921, "t_ctrl": 15.274711056612432, "err": "", "wall_s": 23.39067585207522}, {"method": "fmrg", "lam": 5.45, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.855092167854309, "dr": 3.2990294694900513, "E": 11.07352066040039, "J": -0.8391728412120714, "t_ctrl": 15.31968800118193, "err": "", "wall_s": 23.418738376814872}, {"method": "fmrg", "lam": 5.5, "ok": true, "r_unc": -1.4439373016357422, "r_ctrl": 1.8489875793457031, "dr": 3.2929248809814453, "E": 12.30792236328125, "J": -0.730085546320135, "t_ctrl": 15.276490806601942, "err": "", "wall_s": 23.37296033790335}], "n_evals": 9, "wall_s": 210.85514913778752}]}, "pickscore": {"reward": "pickscore", "prompt": "a portrait of a man", "edit_prompt": "a smiling face", "probe": {"r_unc": 19.7695369720459, "grad_norm": 2.590841770172119, "z_norm": 141.35897827148438, "n_latent": 16384}, "ceiling": 7.230463027954102, "probe_N": 4, "target_N": 10, "args": {"reward": "pickscore", "prompt": "a portrait of a man", "edit_prompt": "a smiling face", "methods": ["mpc", "hardflow", "fmrg"], "probe_N": 4, "target_N": 10, "n_grid": 6, "max_evals": 10, "tol": 0.05, "tol_abs": 0.0, "evaluate_grid": true, "seed": 42, "sample_mode": "flow_map2", "height": 256, "width": 256, "mpc_H": 2, "mpc_n_inner": 6, "mpc_lr_inner": 0.01, "endpoint_surrogate": "jump", "hardflow_n_inner": 40, "hardflow_lr_inner": 2.5, "fmrg_n_opt": 3, "reward_dtype": "fp32", "fast": true, "flux_device": "cuda:0", "reward_device": "cuda:0", "quantize": "int8", "model_id": "black-forest-labs/FLUX.1-dev", "lora_path": null, "out_dir": "results/autorange/pickscore"}, "results": [{"method": "mpc", "prior_lam0": 2.7907775423405172, "tol": 0.3615231513977051, "ceiling": 7.230463027954102, "lam_floor_probe_N": 0.0, "lam_floor_target_N": 0.0, "status": "ok", "dr_plateau_observed": 4.971687316894531, "active_lo": 0.279, "active_hi": 2790.0, "fit": {"m": 0.845604203273598, "k": 2.4, "A": 4.926466220893231, "r2": 0.997446862955151}, "grid": [0.67, 2.4, 5.1, 9.7, 20.0, 73.0], "grid_for_target_N": [0.67, 2.4, 5.1, 9.7, 20.0, 73.0], "clipped_by_target_floor": [], "points": [{"method": "mpc", "lam": 0.279, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 19.93307113647461, "dr": 0.16353416442871094, "E": 0.45055389404296875, "J": -19.125626881917317, "t_ctrl": 24.23080542590469, "err": "", "wall_s": 33.82798658683896}, {"method": "mpc", "lam": 0.67, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 20.1942138671875, "dr": 0.42467689514160156, "E": 0.5239791870117188, "J": -19.803184623148905, "t_ctrl": 24.128587388899177, "err": "", "wall_s": 32.224082794971764}, {"method": "mpc", "lam": 2.4, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.030574798583984, "dr": 1.261037826538086, "E": 1.0382118225097656, "J": -20.81428066889445, "t_ctrl": 23.938516727183014, "err": "", "wall_s": 32.493141629733145}, {"method": "mpc", "lam": 2.79, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.158601760864258, "dr": 1.3890647888183594, "E": 1.2009620666503906, "J": -20.943375584045192, "t_ctrl": 23.867095546331257, "err": "", "wall_s": 32.85255281999707}, {"method": "mpc", "lam": 5.1, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.93963050842285, "dr": 2.170093536376953, "E": 2.1142120361328125, "J": -21.73235481860591, "t_ctrl": 23.88135355291888, "err": "", "wall_s": 31.988823594059795}, {"method": "mpc", "lam": 9.7, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 22.560161590576172, "dr": 2.7906246185302734, "E": 3.6215057373046875, "J": -22.373486037106858, "t_ctrl": 23.889554002787918, "err": "", "wall_s": 33.51225257944316}, {"method": "mpc", "lam": 20.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 23.53037452697754, "dr": 3.7608375549316406, "E": 6.66925048828125, "J": -23.36364326477051, "t_ctrl": 23.921180117875338, "err": "", "wall_s": 33.51582640502602}, {"method": "mpc", "lam": 27.9, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 23.76642608642578, "dr": 3.996889114379883, "E": 7.84442138671875, "J": -23.625845057989963, "t_ctrl": 24.87282336410135, "err": "", "wall_s": 34.36766396043822}, {"method": "mpc", "lam": 73.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 24.372228622436523, "dr": 4.602691650390625, "E": 11.6268310546875, "J": -24.29259279329483, "t_ctrl": 23.925208111293614, "err": "", "wall_s": 33.471479387022555}, {"method": "mpc", "lam": 279.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 24.386863708496094, "dr": 4.617326736450195, "E": 14.44195556640625, "J": -24.36098206769608, "t_ctrl": 24.54702437808737, "err": "", "wall_s": 33.95107084326446}, {"method": "mpc", "lam": 2790.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 24.74122428894043, "dr": 4.971687316894531, "E": 16.5650634765625, "J": -24.73825563957187, "t_ctrl": 24.371431436855346, "err": "", "wall_s": 33.881815844681114}], "n_evals": 11, "wall_s": 366.2936168788001}, {"method": "hardflow", "prior_lam0": 2.7907775423405172, "tol": 0.3615231513977051, "ceiling": 7.230463027954102, "lam_floor_probe_N": 5.0, "lam_floor_target_N": 12.5, "status": "ok", "dr_plateau_observed": 9.6458740234375, "active_lo": 50.0, "active_hi": 500.0, "fit": {"m": 1.5739700043360187, "k": 0.7, "A": 13.789568746347662, "r2": 0.8331810752481877}, "grid": [50.0, 79.0, 130.0, 200.0, 320.0, 500.0], "grid_for_target_N": [50.0, 79.0, 130.0, 200.0, 320.0, 500.0], "clipped_by_target_floor": [], "points": [{"method": "hardflow", "lam": 5.0, "ok": false, "r_unc": null, "r_ctrl": null, "dr": null, "E": null, "J": null, "t_ctrl": null, "err": "ValueError: lr=2.5 * hardflow_reg=0.4 = 1.0 >= 1: the inner ascent on the deviation penalty is unstable and will diverge to inf/NaN by the final step (alpha -> 1). Reduce e", "wall_s": 2.2892952249385417}, {"method": "hardflow", "lam": 50.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 27.09261131286621, "dr": 7.3230743408203125, "E": 86.361572265625, "J": -26.228995590209962, "t_ctrl": 16.601510459091514, "err": "", "wall_s": 25.629161950666457}, {"method": "hardflow", "lam": 79.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 26.983983993530273, "dr": 7.214447021484375, "E": 81.2958984375, "J": -26.469452990761287, "t_ctrl": 16.549977142829448, "err": "", "wall_s": 26.05536841414869}, {"method": "hardflow", "lam": 130.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 28.5649356842041, "dr": 8.795398712158203, "E": 306.0322265625, "J": -27.387888658963718, "t_ctrl": 16.55095246108249, "err": "", "wall_s": 25.974427293986082}, {"method": "hardflow", "lam": 200.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 28.20981216430664, "dr": 8.440275192260742, "E": 200.8251953125, "J": -27.70774917602539, "t_ctrl": 16.535521253943443, "err": "", "wall_s": 25.92275275476277}, {"method": "hardflow", "lam": 320.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 28.556400299072266, "dr": 8.786863327026367, "E": 438.642578125, "J": -27.871021270751953, "t_ctrl": 16.51446499908343, "err": "", "wall_s": 25.925985170993954}, {"method": "hardflow", "lam": 500.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 29.4154109954834, "dr": 9.6458740234375, "E": 419.4765625, "J": -28.995934432983397, "t_ctrl": 16.569595102686435, "err": "", "wall_s": 26.18814799003303}], "n_evals": 7, "wall_s": 158.08822721801698}, {"method": "fmrg", "prior_lam0": 5.5815550846810345, "tol": 0.3615231513977051, "ceiling": 7.230463027954102, "lam_floor_probe_N": 0.0, "lam_floor_target_N": 0.0, "status": "ok", "dr_plateau_observed": 4.230781555175781, "active_lo": 0.558, "active_hi": 558.0, "fit": {"m": 0.9133008656042454, "k": 2.9, "A": 4.1347416793044784, "r2": 0.9752851789503922}, "grid": [2.6, 4.4, 5.9, 7.7, 10.0, 17.0], "grid_for_target_N": [2.6, 4.4, 5.9, 7.7, 10.0, 17.0], "clipped_by_target_floor": [], "points": [{"method": "fmrg", "lam": 0.558, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 19.959348678588867, "dr": 0.18981170654296875, "E": 0.059935808181762695, "J": -19.905642757279043, "t_ctrl": 15.28012363286689, "err": "", "wall_s": 24.720837846864015}, {"method": "fmrg", "lam": 2.6, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 20.673370361328125, "dr": 0.9038333892822266, "E": 0.5313987731933594, "J": -20.571178289560173, "t_ctrl": 15.269189422018826, "err": "", "wall_s": 23.159518092870712}, {"method": "fmrg", "lam": 4.4, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.074098587036133, "dr": 1.3045616149902344, "E": 1.1941070556640625, "J": -20.938404603437945, "t_ctrl": 15.262231674045324, "err": "", "wall_s": 23.711422899272293}, {"method": "fmrg", "lam": 5.58, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.304197311401367, "dr": 1.5346603393554688, "E": 2.004547119140625, "J": -21.124578393915648, "t_ctrl": 15.252067700959742, "err": "", "wall_s": 24.642554108053446}, {"method": "fmrg", "lam": 5.9, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.41863441467285, "dr": 1.6490974426269531, "E": 2.764068603515625, "J": -21.184391312680003, "t_ctrl": 15.264036386739463, "err": "", "wall_s": 24.587461130227894}, {"method": "fmrg", "lam": 7.7, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 21.807415008544922, "dr": 2.0378780364990234, "E": 3.7453765869140625, "J": -21.564208736667386, "t_ctrl": 15.25053108530119, "err": "", "wall_s": 24.57928933389485}, {"method": "fmrg", "lam": 10.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 22.125566482543945, "dr": 2.356029510498047, "E": 6.48065185546875, "J": -21.801533889770507, "t_ctrl": 15.25280143506825, "err": "", "wall_s": 24.59597410680726}, {"method": "fmrg", "lam": 17.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 22.557641983032227, "dr": 2.788105010986328, "E": 17.1470947265625, "J": -22.053315667545093, "t_ctrl": 15.257500605657697, "err": "", "wall_s": 24.533750609960407}, {"method": "fmrg", "lam": 55.8, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 24.00031852722168, "dr": 4.230781555175781, "E": 316.3955078125, "J": -21.16523333176917, "t_ctrl": 15.258475225884467, "err": "", "wall_s": 24.643201963976026}, {"method": "fmrg", "lam": 558.0, "ok": true, "r_unc": 19.7695369720459, "r_ctrl": 23.551362991333008, "dr": 3.7818260192871094, "E": 3448.109375, "J": -20.461659250293582, "t_ctrl": 15.261104044038802, "err": "", "wall_s": 24.705709141213447}], "n_evals": 10, "wall_s": 244.08194523397833}]}}, "suite_grid": [0.1, 1, 10, 50, 200, 1000, 3000, 10000]}</script>
+<script id="verify" type="application/json">{"imagereward_mpc_N10": [{"lam": 0.08, "dr": 0.042035579681396484, "E": 0.2775017023086548, "J": 3.2909204065799713, "r_ctrl": -1.556534767150879, "r_unc": -1.5985703468322754, "t": 157.54713997803628, "ok": true, "N": 10, "method": "mpc"}, {"lam": 0.14, "dr": 0.0434422492980957, "E": 0.2902511656284332, "J": 2.5917394033500125, "r_ctrl": -1.5551280975341797, "r_unc": -1.5985703468322754, "t": 159.3860236988403, "ok": true, "N": 10, "method": "mpc"}, {"lam": 0.19, "dr": 0.5111284255981445, "E": 0.2703819274902344, "J": 1.7989733093663265, "r_ctrl": -1.0874419212341309, "r_unc": -1.5985703468322754, "t": 159.49073490081355, "ok": true, "N": 10, "method": "mpc"}, {"lam": 0.26, "dr": 2.126100182533264, "E": 0.3596084713935852, "J": 0.1640249169789828, "r_ctrl": 0.5275298357009888, "r_unc": -1.5985703468322754, "t": 159.40867110481486, "ok": true, "N": 10, "method": "mpc"}, {"lam": 0.35, "dr": 2.8487333059310913, "E": 0.31405067443847656, "J": -0.8015191384724207, "r_ctrl": 1.250162959098816, "r_unc": -1.5985703468322754, "t": 159.42610396957025, "ok": true, "N": 10, "method": "mpc"}, {"lam": 0.62, "dr": 3.042505979537964, "E": 0.37649843096733093, "J": -1.1403078657965506, "r_ctrl": 1.4439356327056885, "r_unc": -1.5985703468322754, "t": 159.3458767379634, "ok": true, "N": 10, "method": "mpc"}, {"lam": 2.0, "dr": 3.327483654022217, "E": 0.4562458097934723, "J": -1.6148518547415733, "r_ctrl": 1.7289133071899414, "r_unc": -1.5985703468322754, "t": 158.95132468873635, "ok": true, "N": 10, "method": "mpc"}]}</script>
+<script>
+const DATA = JSON.parse(document.getElementById("data").textContent);
+const VER = JSON.parse(document.getElementById("verify").textContent);
+const MC = {mpc:"var(--s1)", hardflow:"var(--s2)", fmrg:"var(--s3)"};
+const h = (t,c,x)=>{const e=document.createElement(t); if(c)e.className=c; if(x!=null)e.textContent=x; return e;};
+const g2 = v => (v==null||Number.isNaN(v)) ? "–" : (Math.abs(v)>=100? v.toFixed(0) : Math.abs(v)>=10 ? v.toFixed(1) : Math.abs(v)>=1 ? v.toFixed(2) : v.toPrecision(2));
+function table(host, head, rows, num){const w=h("div","tbl"),t=h("table"),th=h("thead"),tr=h("tr");head.forEach((c,i)=>tr.appendChild(h("th",num.includes(i)?"num":"",c)));th.appendChild(tr);t.appendChild(th);const tb=h("tbody");rows.forEach(r=>{const tr=h("tr");r.forEach((c,i)=>{const td=h("td",num.includes(i)?"num":(i===0?"k":""));if(c instanceof Node)td.appendChild(c);else td.textContent=c;tr.appendChild(td);});tb.appendChild(tr);});t.appendChild(tb);w.appendChild(t);host.appendChild(w);}
+const pill=(t,c)=>h("span","pill "+(c||""),t);
+
+// ---- response-curve chart (log x) ----
+function curveChart(host, r, reward, targetN){
+  const W=440,H=260,m={l:52,r:14,t:16,b:40};
+  const svg=el("svg",{viewBox:`0 0 ${W} ${H}`,role:"img"},host);
+  const pts=r.points.filter(p=>p.ok&&p.dr!=null), bad=r.points.filter(p=>!p.ok);
+  const allL=r.points.map(p=>p.lam).concat(r.grid||[]).concat(r.lam_floor_target_N?[r.lam_floor_target_N]:[]);
+  const xlo=Math.floor(Math.log10(Math.min(...allL)))-0.3, xhi=Math.ceil(Math.log10(Math.max(...allL)))+0.3;
+  const ys=pts.map(p=>p.dr).concat([0,r.ceiling]); let ylo=Math.min(...ys), yhi=Math.max(...ys); const pad=(yhi-ylo)*0.1||1; ylo-=pad; yhi+=pad;
+  const X=v=>m.l+(Math.log10(v)-xlo)/(xhi-xlo)*(W-m.l-m.r), Y=v=>H-m.b-(v-ylo)/(yhi-ylo)*(H-m.t-m.b);
+  niceTicks(ylo,yhi,4).forEach(t=>{el("line",{x1:m.l,x2:W-m.r,y1:Y(t),y2:Y(t),class:"grid-line"},svg);el("text",{x:m.l-6,y:Y(t)+3.5,"text-anchor":"end",class:"chart-text"},svg).textContent=g2(t);});
+  for(let e=Math.ceil(xlo);e<=Math.floor(xhi);e++){const px=X(10**e);el("line",{x1:px,x2:px,y1:H-m.b,y2:H-m.b+4,class:"axis-line"},svg);el("text",{x:px,y:H-m.b+15,"text-anchor":"middle",class:"chart-text"},svg).textContent=(e>=0&&e<=3)?String(10**e):`1e${e}`;}
+  el("line",{x1:m.l,x2:W-m.r,y1:H-m.b,y2:H-m.b,class:"axis-line"},svg);
+  el("text",{x:(m.l+W-m.r)/2,y:H-6,"text-anchor":"middle",class:"chart-text"},svg).textContent="λ";
+  el("text",{x:12,y:m.t+6,class:"chart-text"},svg).textContent="Δr";
+  // ceiling, floor, grid
+  el("line",{x1:m.l,x2:W-m.r,y1:Y(r.ceiling),y2:Y(r.ceiling),stroke:"var(--ink-3)","stroke-width":1,"stroke-dasharray":"4 3"},svg);
+  if(r.lam_floor_target_N) el("line",{x1:X(r.lam_floor_target_N),x2:X(r.lam_floor_target_N),y1:m.t,y2:H-m.b,stroke:"var(--warn)","stroke-width":1.5,"stroke-dasharray":"5 3"},svg);
+  (r.grid||[]).forEach(l=>el("line",{x1:X(l),x2:X(l),y1:H-m.b-8,y2:H-m.b+2,stroke:"var(--good)","stroke-width":2},svg));
+  bad.forEach(p=>el("line",{x1:X(p.lam),x2:X(p.lam),y1:m.t,y2:H-m.b,stroke:"var(--bad)","stroke-width":1,"stroke-dasharray":"2 3",opacity:.7},svg));
+  // fit
+  if(r.fit){let d="";for(let i=0;i<=120;i++){const x=xlo+(xhi-xlo)*i/120;const y=r.fit.A/(1+Math.exp(-r.fit.k*(x-r.fit.m)));d+=(i?"L":"M")+(m.l+(x-xlo)/(xhi-xlo)*(W-m.l-m.r))+","+Y(y);}el("path",{d,stroke:MC[r.method],class:"ser",opacity:.55},svg);}
+  // points, hover
+  pts.forEach((p,i)=>{const c=el("circle",{cx:X(p.lam),cy:Y(p.dr),r:4.5,fill:MC[r.method],class:"dot"},svg);
+    c.addEventListener("pointermove",e=>showTip(e.clientX,e.clientY,`<div><b>λ = ${g2(p.lam)}</b></div><div class="r"><b>${g2(p.dr)}</b><span>Δr</span></div><div class="r"><b>${g2(p.E)}</b><span>energy</span></div><div class="r"><b>${g2(p.J)}</b><span>J</span></div><div class="r"><b>${g2(p.t_ctrl)} s</b><span>t_ctrl</span></div>`));c.addEventListener("pointerleave",hideTip);});
+  return svg;
+}
+
+// ---- render ----
+const curves=document.getElementById("curves");
+Object.entries(DATA.runs).forEach(([reward,d])=>{
+  const h3=h("h3","",`${reward} — r_unc ${g2(d.probe.r_unc)}, ceiling estimate ${g2(d.ceiling)}, ‖∇r‖ ${d.probe.grad_norm.toPrecision(3)}`);curves.appendChild(h3);
+  const g=h("div","grid3");curves.appendChild(g);
+  d.results.forEach(r=>{const f=fig(g,`${r.method}`,r.status==="ok"?`${r.n_evals} evaluations · ${g2(r.wall_s)} s · prior λ₀ = ${g2(r.prior_lam0)}`:`status: ${r.status}`);
+    curveChart(f,r,reward,d.target_N);
+    const okp=r.points.filter(p=>p.ok);const tmean=okp.length?okp.reduce((s,p)=>s+p.t_ctrl,0)/okp.length:null;
+    cap(f,(r.status==="ok"?`active λ ∈ [${g2(r.active_lo)}, ${g2(r.active_hi)}]`+(r.fit?`, logistic R² ${r.fit.r2.toFixed(2)}`:"")+`. `:"")+(tmean!=null?`Mean control loop ${g2(tmean)} s at N=${d.probe_N}.`:"")+(r.clipped_by_target_floor&&r.clipped_by_target_floor.length?` ${r.clipped_by_target_floor.length} grid point(s) fall below HardFlow's floor λ ≥ ${g2(r.lam_floor_target_N)} at N=${d.target_N} and are dropped.`:""));});
+});
+
+// grids table + suite comparison
+const gb=document.getElementById("grids-body");
+{
+  const rows=[];
+  Object.entries(DATA.runs).forEach(([reward,d])=>d.results.forEach(r=>{
+    if(r.status!=="ok"){rows.push([reward,r.method,pill(r.status,"warn"),"","",""]);return;}
+    const inActive=DATA.suite_grid.filter(l=>l>=r.active_lo&&l<=r.active_hi).length;
+    const c=h("span");c.appendChild(pill(`${inActive} / ${DATA.suite_grid.length}`,inActive>=4?"good":inActive>=2?"warn":"bad"));
+    rows.push([reward,r.method,`[${g2(r.active_lo)}, ${g2(r.active_hi)}]`,(r.grid_for_target_N||r.grid).map(g2).join("  "),String(r.n_evals)+" · "+g2(r.wall_s)+" s",c]);
+  }));
+  table(gb,["reward","method","active λ region","recommended grid (target N)","cost (evals · wall)","suite points inside the active region"],rows,[4]);
+  const p=h("p","small");p.innerHTML=`Suite grid for reference: <span class="mono">${DATA.suite_grid.join(", ")}</span>. "Inside the active region" counts how many of those eight would have measured a moving part of the curve for this (reward, method).`;gb.appendChild(p);
+}
+
+// transfer section
+const tb=document.getElementById("transfer-body");
+{
+  const tags=Object.keys(VER);
+  if(!tags.length){tb.appendChild(h("p","small","No target-N verification runs found."));}
+  tags.forEach(tag=>{
+    const rows=VER[tag].filter(v=>v.ok).sort((a,b)=>a.lam-b.lam);
+    if(!rows.length)return;
+    const meth=rows[0].method, N=rows[0].N, reward=tag.split("_")[0];
+    const d=DATA.runs[reward]; const r=d&&d.results.find(x=>x.method===meth);
+    const g=h("div","grid2");tb.appendChild(h("h3","",`${reward} · ${meth} at N=${N} on the recommended grid`));tb.appendChild(g);
+    const f=fig(g,`Δr vs λ — proxy N=${d?d.probe_N:"?"} (search) and target N=${N} (verification)`,"same seed and prompt; the uncontrolled image differs between N values");
+    const W=440,H=250,m={l:52,r:14,t:16,b:40};const svg=el("svg",{viewBox:`0 0 ${W} ${H}`},f);
+    const A=r?r.points.filter(p=>p.ok):[], B=rows;
+    const allL=A.map(p=>p.lam).concat(B.map(p=>p.lam));const xlo=Math.floor(Math.log10(Math.min(...allL)))-.3,xhi=Math.ceil(Math.log10(Math.max(...allL)))+.3;
+    const ys=A.map(p=>p.dr).concat(B.map(p=>p.dr),[0]);let ylo=Math.min(...ys),yhi=Math.max(...ys);const pad=(yhi-ylo)*.1||1;ylo-=pad;yhi+=pad;
+    const X=v=>m.l+(Math.log10(v)-xlo)/(xhi-xlo)*(W-m.l-m.r),Y=v=>H-m.b-(v-ylo)/(yhi-ylo)*(H-m.t-m.b);
+    niceTicks(ylo,yhi,4).forEach(t=>{el("line",{x1:m.l,x2:W-m.r,y1:Y(t),y2:Y(t),class:"grid-line"},svg);el("text",{x:m.l-6,y:Y(t)+3.5,"text-anchor":"end",class:"chart-text"},svg).textContent=g2(t);});
+    for(let e=Math.ceil(xlo);e<=Math.floor(xhi);e++){const px=X(10**e);el("text",{x:px,y:H-m.b+15,"text-anchor":"middle",class:"chart-text"},svg).textContent=(e>=0&&e<=3)?String(10**e):`1e${e}`;}
+    el("line",{x1:m.l,x2:W-m.r,y1:H-m.b,y2:H-m.b,class:"axis-line"},svg);el("text",{x:(m.l+W-m.r)/2,y:H-6,"text-anchor":"middle",class:"chart-text"},svg).textContent="λ";
+    [[A,"var(--ink-3)",`proxy N=${d?d.probe_N:"?"}`],[B,MC[meth],`target N=${N}`]].forEach(([P,col,name])=>{const s=P.slice().sort((a,b)=>a.lam-b.lam);if(s.length>1)el("path",{d:"M"+s.map(p=>X(p.lam)+","+Y(p.dr)).join("L"),stroke:col,class:"ser"},svg);s.forEach(p=>{const c=el("circle",{cx:X(p.lam),cy:Y(p.dr),r:4.5,fill:col,class:"dot"},svg);c.addEventListener("pointermove",e=>showTip(e.clientX,e.clientY,`<div><b>${name}</b> λ = ${g2(p.lam)}</div><div class="r"><b>${g2(p.dr)}</b><span>Δr</span></div><div class="r"><b>${g2(p.E)}</b><span>energy</span></div><div class="r"><b>${g2(p.J)}</b><span>J</span></div>`));c.addEventListener("pointerleave",hideTip);});});
+    legend(f,[{name:`proxy N=${d?d.probe_N:"?"}`,color:"var(--ink-3)"},{name:`target N=${N}`,color:MC[meth]}]);
+    const f2=fig(g,"Verification rows","target N, recommended grid");
+    table(f2,["λ","Δr","energy","J","t_ctrl"],B.map(p=>[g2(p.lam),g2(p.dr),g2(p.E),g2(p.J),g2(p.t)+" s"]),[0,1,2,3,4]);
+  });
+}
+</script>
