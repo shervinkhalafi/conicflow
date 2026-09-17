@@ -82,7 +82,7 @@ been set to lately, see **[HYPERPARAMETERS.md](HYPERPARAMETERS.md)**.
 
 | | control type | knobs | notes |
 |---|---|---|---|
-| **MPC** | `mpc` | `N`, `H`, `n_inner`, `lr_inner`, `lam` | inner loop backprops through the endpoint rollout. Cost `NFE = n_inner·(N(N−1)/2 + H)` — **quadratic in N**, and `H` is nearly free. |
+| **MPC** | `mpc` | `N`, `H`, `n_inner`, `lr_inner`, `lam`, `endpoint_surrogate` | inner loop backprops through the endpoint rollout. Cost `NFE = n_inner·N(N−1)/2` — **quadratic in N**, and `H` is nearly free. The `+ H` this formula used to carry was a wasted `dt=0` rollout, removed 2026-09-16. `endpoint_surrogate=jump` makes the whole term **linear**. |
 | **HardFlow** | `hardflow` | `N`, `n_inner`, `lr_inner` (=lr), `hardflow_reg` | decision variable is the predicted terminal latent; the transformer is never differentiated. **Linear in N**, ~4.3 s/step unconstrained. |
 | **FMRG** | `fmrg` | `N`, `n_inner` (=`n_opt`), `lam` | `z ← z + (dt/n_opt)·lam·∇r(endpoint)`. |
 
@@ -161,12 +161,31 @@ column is only honest under equal N.
 `--reward_device auto` corrupts the reward model with no error. `gpu_lib.sh`'s
 `run_on_gpu` enforces both.
 
-**Locked defaults.** `drift_detach=False`, `constraint_on="endpoint"`,
-`warm_start=True` are asserted in `run_preflight` on every run path. To measure
-what a lock costs, set `FLOWMAPS_UNLOCK=drift_detach` for that one invocation —
-the run prints a `*** LOCK LIFTED ***` banner and is stamped in the `unlocked`
-CSV column. It is an env var and not a sweep flag on purpose, so a lock can
-never come off as a side effect of a grid definition.
+**Locked defaults.** `constraint_on="endpoint"` and `warm_start=True` are
+asserted in `run_preflight` on every run path. To measure what a lock costs, set
+`FLOWMAPS_UNLOCK=constraint_on` for that one invocation — the run prints a
+`*** LOCK LIFTED ***` banner and is stamped in the `unlocked` CSV column. It is
+an env var and not a sweep flag on purpose, so a lock can never come off as a
+side effect of a grid definition.
+
+**`drift_detach` is no longer locked, and now defaults to `True`** (2026-09-16).
+It was locked at `False` on the grounds that `True`'s only benefit was speed and
+that the speed gain was small. Measurement reversed both halves: at
+`N=8, H=4, n_inner=6` with ImageReward it ran **33% faster** *and* produced a
+**better** objective at every λ tested (J −1.096 vs −0.756 at λ=1, about 6
+run-to-run standard deviations; also better at λ=10 and λ=100). A closed
+decision stays closed on its reasoning, not its conclusion, so the axis is open
+again rather than pinned to the opposite value. `FLOWMAPS_UNLOCK=drift_detach`
+is still accepted and is now a no-op. **Rows from before 2026-09-16 used
+`False`** — check the `drift_detach` column before comparing energy or objective
+across that date.
+
+**The reward in the MPC progress bar is off by default** (2026-09-16). It cost a
+no-grad endpoint rollout plus a decode and a reward-model pass every outer step,
+and another decode + reward per inner iteration — about 4% of a run, for a
+display field. Pass `--pbar_rewards` to get it back. Note `show_progress=False`
+alone never suppressed this: `tqdm(disable=True)` still returns a live object,
+so the old `if pbar is not None` guards always fired.
 
 ---
 
@@ -177,7 +196,9 @@ never come off as a side effect of a grid definition.
 | `--reward` | `clip`, `hpsv2`, `pickscore`, `imagereward`, `style`, `lpips`, `none`. `none` = steering comes entirely from constraints. |
 | `--sweep_*` | Cartesian product over all sweep axes, in a fixed order. |
 | `--constraint_types` / `--constraint_args` / `--constraint_thresholds` / `--constraint_directions` | **`mpc` and `hardflow` only** — `fmrg`/`boffi_fmrg` raise. So does `lr_dual=0` with `mu_init=0` (a silent no-op). |
-| `--quantize` | `int8` (default) / `int4` / `nf4` / `none`. See the nf4 warning above. |
+| `--sweep_endpoint_surrogate` | `rollout` (default) or `jump`. **mpc only.** `jump` replaces the inner objective's (N−j−H)-step endpoint rollout with ONE flow-map call at `t_next=0`, making MPC's cost linear in N instead of quadratic. Only the surrogate the optimiser differentiates changes — the applied trajectory, and everything scored from it, are unaffected. Measured at N=8/H=4: −33% wall clock, objective better at λ=1 and inside the noise floor at λ=10/100. Opt-in because it has not been re-checked at the suite's N=10. |
+| `--pbar_rewards` | Off by default. Computes the reward shown in the MPC progress bar; costs ~4% of a run. |
+| `--quantize` | `int8` (default) / `int4` / `nf4` / `none`. See the nf4 warning above. **`int4` cannot be used for MPC or FMRG at all**: `aten::_weight_int4pack_mm` has no backward kernel, so any gradient-based control raises. |
 | `--reward_dtype` | `fp32` default, matching every result on disk. `fp16` halves reward-model memory but changes their values. |
 | `--resume` | Skips configs already in `<out_dir>/summary.csv` with `run_ok=True`, retries failures, appends rather than truncating. |
 | `--continue_on_oom` | Off by default: an OOM aborts rather than marching the rest of a sweep through a contended card. |

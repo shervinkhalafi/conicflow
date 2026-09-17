@@ -116,8 +116,16 @@ conservative to meet the threshold, higher λ overshot and raised energy.
 
 Useful for planning a sweep without running it. All unconstrained, N as stated.
 
-- **MPC**: `NFE = n_inner·(N(N−1)/2 + H)`, ≈1.09–1.16 s/NFE. Reproduces every
+- **MPC**: `NFE = n_inner·N(N−1)/2`, ≈1.09–1.16 s/NFE. Reproduces every
   measured config within 1% (N=10/ni=20: predicted 1133 s vs measured 1137 s).
+  **Updated 2026-09-16**: the formula previously read `n_inner·(N(N−1)/2 + H)`.
+  That `+ H` was not the horizon's cost — it was `endpoint_map` running one
+  `dt=0` transformer forward *and its backward* at every outer step with
+  `j ≥ N−H`, producing `z` bit-for-bit. It has been removed, so subtract
+  `n_inner·H` from any pre-2026-09-16 prediction (8% of the N=10/H=4 suite
+  config, 25% of an N=4/H=2 smoke run).
+  With `endpoint_surrogate=jump` the term becomes **linear**: `NFE = n_inner·N`
+  worth of rollout plus the `H−1` drift forwards per step.
 - **HardFlow**: **linear** in N, ~4.3 s/step unconstrained (~8.3 s/step with two
   constraints). It is *not* quadratic.
 - **FMRG**: ~1.2 s per `N·n_opt` unit.

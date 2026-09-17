@@ -67,15 +67,18 @@ def _grad_checkpointing_enabled(module) -> bool:
 def _pbar_postfix(
     outer: int,
     outer_total: int,
-    reward: float,
+    reward: Optional[float],
     control: float,
     mu: Optional[float] = None,
 ) -> dict:
-    d: dict = {
-        "step": f"{outer}/{outer_total}",
-        "r": f"{reward:.4f}",
-        "|u|": f"{control:.4e}",
-    }
+    # reward=None omits the "r" field entirely (2026-09-16). Computing it costs
+    # a VAE decode + a reward-model forward, and under constraint_on="endpoint"
+    # an extra no-grad endpoint rollout on top -- see `pbar_rewards` on
+    # receding_horizon_flow_control for why that is now off by default.
+    d: dict = {"step": f"{outer}/{outer_total}"}
+    if reward is not None:
+        d["r"] = f"{reward:.4f}"
+    d["|u|"] = f"{control:.4e}"
     if mu is not None:
         d["μ"] = f"{mu:.4e}"
     return d
@@ -254,6 +257,7 @@ def solve_horizon_problem(
     drift_detach: bool = False,
     v_cur: Optional[torch.Tensor] = None,
     pbar: Optional[tqdm] = None,
+    pbar_rewards: bool = False,
     outer_step: Optional[int] = None,
     outer_total: Optional[int] = None,
     low_memory: bool = True,
@@ -319,7 +323,8 @@ def solve_horizon_problem(
                 resid0 = x_traj[0] - x_cur_fixed - dt * v_cur
                 pbar.set_postfix(_pbar_postfix(
                     outer_step or 0, outer_total or 0,
-                    _reward_mean(r, x_traj[-1]), _flat_norm_mean(resid0),
+                    _reward_mean(r, x_traj[-1]) if pbar_rewards else None,
+                    _flat_norm_mean(resid0),
                 ))
             pbar.update(n_iters)
     else:  # adam
@@ -334,7 +339,10 @@ def solve_horizon_problem(
                     resid0 = x_traj[0] - x_cur_fixed - dt * v_cur
                     pbar.set_postfix(_pbar_postfix(
                         outer_step or 0, outer_total or 0,
-                        _reward_mean(r, x_traj[-1]), _flat_norm_mean(resid0),
+                        # One VAE decode + one reward-model forward per inner
+                        # iteration, for a display field. Off unless asked.
+                        _reward_mean(r, x_traj[-1]) if pbar_rewards else None,
+                        _flat_norm_mean(resid0),
                     ))
                 pbar.update(1)
             del loss
@@ -367,6 +375,7 @@ def receding_horizon_flow_control(
     drift_detach: bool = False,
     verbose: bool = False,
     show_progress: bool = True,
+    pbar_rewards: bool = False,
     low_memory: bool = True,
     device: Optional[torch.device] = None,
 ):
@@ -403,7 +412,17 @@ def receding_horizon_flow_control(
                        the gradient.
         verbose:       print per-step diagnostics.
         show_progress: show a tqdm bar of length N * n_iters with outer step,
-                       reward, and control norm.
+                       control norm, and (only when pbar_rewards) reward.
+        pbar_rewards:  compute the reward shown in the progress bar. Default
+                       False because it is NOT free: per outer step it costs a
+                       no-grad endpoint rollout (N-j-1 transformer forwards
+                       under constraint_on="endpoint") plus a decode and a
+                       reward-model pass, and another decode + reward pass per
+                       inner iteration -- ~4% of a run at N=8, for a number
+                       nobody reads inside a sweep. It is a separate flag from
+                       show_progress because tqdm(disable=True) still returns a
+                       live object, so the old `if pbar is not None` guards
+                       never suppressed this work.
         low_memory:    if False, skip per-step gc/empty_cache (faster when VRAM
                        headroom is available; pair with ``--fast true``).
         device:        torch device (defaults to x0.device).
@@ -463,7 +482,7 @@ def receding_horizon_flow_control(
             optimizer=optimizer, n_iters=n_iters, lr=lr,
             x_init=x_init_j, return_full=warmstart,
             drift_detach=drift_detach, v_cur=v_j,
-            pbar=pbar, outer_step=j + 1, outer_total=N,
+            pbar=pbar, pbar_rewards=pbar_rewards, outer_step=j + 1, outer_total=N,
             low_memory=low_memory,
         )
         if warmstart:
@@ -498,13 +517,23 @@ def receding_horizon_flow_control(
 
         if pbar is not None:
             mu_mean_val = mu_t.mean().item() if mu_t is not None else None
-            if constraint_on == "endpoint" and endpoint_map is not None:
-                with torch.no_grad():
-                    x_disp = endpoint_map(t_grid[j + 1].expand(x.shape[0]), x)
-            else:
-                x_disp = x
+            # The displayed reward is not free (2026-09-16). Under
+            # constraint_on="endpoint" it costs a full no-grad endpoint rollout
+            # -- N-j-1 transformer forwards -- plus a decode and a reward-model
+            # pass, every outer step, purely to fill one progress-bar field.
+            # Gated on pbar_rewards and NOT on `pbar is not None`, because
+            # tqdm(disable=True) still returns an object: show_progress=False
+            # alone never suppressed any of this.
+            r_disp = None
+            if pbar_rewards:
+                if constraint_on == "endpoint" and endpoint_map is not None:
+                    with torch.no_grad():
+                        x_disp = endpoint_map(t_grid[j + 1].expand(x.shape[0]), x)
+                else:
+                    x_disp = x
+                r_disp = _reward_mean(r, x_disp)
             pbar.set_postfix(_pbar_postfix(
-                j + 1, N, _reward_mean(r, x_disp), _flat_norm_mean(u_star), mu_mean_val,
+                j + 1, N, r_disp, _flat_norm_mean(u_star), mu_mean_val,
             ))
 
         if verbose:
@@ -537,6 +566,7 @@ def tune_sampler_speed(
     *,
     control_type: Optional[str] = None,
     drift_detach: Optional[bool] = None,
+    constraint_on: Optional[str] = None,
 ):
     """Trade the sampler's memory-saving settings for speed.
 
@@ -546,10 +576,24 @@ def tune_sampler_speed(
     Safety rule for transformer gradient checkpointing:
       ``fast=True`` disables checkpointing ONLY when it is safe to do so, i.e.
       when the inner solve does NOT backprop through the transformer:
-        - drift_detach=True  (MPC): drifts computed under no_grad → safe
-        - control_type="none":      no backward at all → safe
-        - FMRG:                     always backprops through transformer → UNSAFE
-        - drift_detach=False (MPC): same as FMRG → UNSAFE
+        - control_type="none":                   no backward at all → safe
+        - MPC, drift_detach=True AND
+          constraint_on="horizon":               nothing differentiable left
+                                                 in the transformer → safe
+        - MPC, constraint_on="endpoint":         UNSAFE whatever drift_detach
+                                                 says — see below
+        - FMRG:                                  always backprops → UNSAFE
+
+      CORRECTED 2026-09-16.  This rule previously read "drift_detach=True →
+      safe" on its own.  That stopped being true with the 2026-08-26
+      endpoint-gradient fix, which made ``endpoint_map(..., grad=True)`` the
+      SOLE gradient path through the transformer: under
+      constraint_on="endpoint" the reward is scored on the rolled-out endpoint
+      and that rollout is differentiated regardless of drift_detach, which only
+      detaches the *drift* terms.  The stale rule was latent while
+      drift_detach=False was the locked default and nothing could reach it; it
+      became reachable the moment drift_detach=True became the default, so it
+      is fixed here rather than left as a trap.
 
       Disabling checkpointing when the transformer backward is live requires
       storing H-1 full activation graphs simultaneously.  For FLUX (12+ GB
@@ -565,11 +609,15 @@ def tune_sampler_speed(
     # Decide whether disabling transformer checkpointing is memory-safe.
     # Conservative default: keep checkpointing unless we KNOW backward is absent.
     transformer_backward_needed = True
-    if drift_detach is True:
-        transformer_backward_needed = False   # MPC no-grad drifts
-    elif control_type == "none":
+    if control_type == "none":
         transformer_backward_needed = False   # uncontrolled rollout only
-    # fmrg, drift_detach=False, or unknown → keep checkpointing
+    elif drift_detach is True and constraint_on == "horizon":
+        # Drifts are no_grad AND the reward is scored at the raw horizon state,
+        # so no transformer call is left inside the graph. See the corrected
+        # safety rule above for why constraint_on has to be checked too.
+        transformer_backward_needed = False
+    # fmrg, drift_detach=False, constraint_on="endpoint", or unknown → keep
+    # checkpointing
 
     disable_ckpt = fast and not transformer_backward_needed
 
@@ -622,6 +670,7 @@ def make_flux_wrappers(
     guidance_scale: float = 3.5,
     n_mpc_steps: int = 4,
     sample_mode: str = "flow_map2",
+    endpoint_surrogate: str = "rollout",
 ):
     """Build (v_theta, r, endpoint_map) callables for use with receding_horizon_flow_control.
 
@@ -636,12 +685,34 @@ def make_flux_wrappers(
         sample_mode:    "flow_map2" (canonical, t_next = t_cur - dt)  ← default
                         "flow_map1" (shortcut, t_next = 0)
                         "flow_matching" (plain ODE, t_next = t_cur)
+        endpoint_surrogate: how endpoint_map predicts the terminal latent.
+                        "rollout" (default) integrates the remaining steps one
+                        at a time, matching sample_mode.  "jump" takes a single
+                        flow-map call with t_next=0.  See endpoint_map.
 
     Returns:
         v_theta_mpc:   (s: tensor, z: tensor) -> tensor  velocity in MPC convention
         r_image:       (z: tensor) -> (B,)               differentiable reward
         endpoint_map:  (s: tensor, z: tensor) -> tensor  predicted final latent
     """
+    if endpoint_surrogate not in ("rollout", "jump"):
+        # Loud fail: a typo here would silently fall through to the rollout and
+        # the run would look like a successful "jump" measurement.
+        raise ValueError(
+            f"endpoint_surrogate={endpoint_surrogate!r}; expected 'rollout' or 'jump'."
+        )
+    if endpoint_surrogate == "jump" and sample_mode == "flow_matching":
+        # "jump" is a flow-map operation: it asks the model to predict t=0 in one
+        # call, which is exactly what the FlowMap LoRA is trained to do and what
+        # sample_mode="flow_map1" uses. Under plain flow matching the model is a
+        # velocity field with no such one-step semantics, so the call would
+        # return a number that looks fine and means nothing. Raise instead.
+        raise ValueError(
+            "endpoint_surrogate='jump' requires a flow-map sample_mode "
+            "('flow_map1' or 'flow_map2'); got sample_mode='flow_matching', "
+            "where a single t_next=0 call has no one-step interpretation."
+        )
+
     pe  = sampler.cached_prompt_embeds
     ppe = sampler.cached_pooled_prompt_embeds
     dt_flux = 1.0 / n_mpc_steps   # FLUX-time step size
@@ -690,9 +761,57 @@ def make_flux_wrappers(
                   If False (default), the rollout runs under no_grad and the
                   input is detached — suitable for constraint evaluation and
                   dual-ascent updates where no backward is needed.
+
+        Cost, and the two 2026-09-16 changes below.  Since the 2026-08-26
+        endpoint-gradient fix this rollout is the sole gradient path through the
+        transformer, so at grad=True every step here is a forward AND a
+        backward.  Called n_inner times per outer step, it is what makes MPC
+        quadratic in N: the rollout is N-j-H steps long at outer step j.
         """
         t_start = 1.0 - s_mpc.item()
-        n_remain = max(1, round(t_start * n_mpc_steps))
+        n_exact = round(t_start * n_mpc_steps)
+
+        # (a) The window already reaches t=0, so the rollout has no steps to
+        # take.  The previous `max(1, ...)` ran ONE transformer call anyway,
+        # with dt_r == 0 -- i.e. `z - 0*u`, which returns z bit-for-bit -- and
+        # at grad=True backpropagated through it.  That is n_inner*H wasted
+        # gradient-NFEs per run, which is exactly the `+H` term in
+        # README_sweep's cost formula: 8% of the N=10/H=4 suite config, 25% of
+        # an N=4/H=2 smoke run.  Returning z is numerically identical, not an
+        # approximation, so this needs no opt-in.
+        if n_exact == 0:
+            return z if grad else z.detach().clone()
+
+        # (b) "jump": the sampler IS a flow map, so a single call with
+        # t_next=0 predicts the terminal latent directly -- the same thing
+        # sample_mode="flow_map1" does when sampling.  This is used ONLY as the
+        # surrogate the inner optimiser differentiates; the trajectory that is
+        # actually applied and scored is still rolled with the real per-step
+        # dynamics, so it changes what the optimiser sees, not what is
+        # measured.  It makes the rollout O(1) instead of O(N-j-H), i.e. the
+        # whole n_inner*N(N-1)/2 term becomes linear in N.
+        #
+        # Measured 2026-09-16 at N=8, H=4, n_inner=6, ImageReward, seed 42:
+        # -33% wall clock (232 s -> 156 s), objective J better at lam=1
+        # (-0.933 vs -0.823 +- 0.051, i.e. 2.2 sd) and inside the run-to-run
+        # noise floor at lam=10 and lam=100.  Not yet re-checked at N=10, which
+        # is why the default stays "rollout" -- switching it reproduces none of
+        # the results currently on disk.
+        if endpoint_surrogate == "jump":
+            z_run = z if grad else z.detach().clone()
+            ctx = torch.enable_grad() if grad else torch.no_grad()
+            with ctx:
+                u = sampler.predict_vector(
+                    z_run, t_start,
+                    prompt_embeds=pe,
+                    pooled_prompt_embeds=ppe,
+                    guidance_scale=guidance_scale,
+                    t_next=0.0,
+                )
+                z_run = z_run - t_start * u
+            return z_run
+
+        n_remain = n_exact
         ts = torch.linspace(t_start, 0.0, n_remain + 1, device=z.device, dtype=z.dtype)
         z_run = z if grad else z.detach().clone()
         ctx = torch.enable_grad() if grad else torch.no_grad()

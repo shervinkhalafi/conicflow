@@ -436,6 +436,13 @@ def _run_one(
         sampler, fast=fast, verbose=not quiet,
         control_type=cfg.control_type,
         drift_detach=cfg.drift_detach,
+        # Required as of 2026-09-16: tune_sampler_speed's checkpointing rule now
+        # also depends on constraint_on, because endpoint_map(..., grad=True) is
+        # the sole gradient path under constraint_on="endpoint" and runs whatever
+        # drift_detach says. This pipeline defaults to "horizon", which with
+        # drift_detach=True is still the safe-to-disable case -- but only if the
+        # value is actually passed, so pass it.
+        constraint_on=cfg.constraint_on,
     )
 
     # (Re-)encode prompt for the sampler's cached embeddings

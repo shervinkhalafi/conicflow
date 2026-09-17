@@ -142,10 +142,14 @@ MAX_CONSTRAINTS = 4
 # than silently running unconstrained.
 CONSTRAINED_CONTROL_TYPES = frozenset({"mpc", "hardflow"})
 
-# Three settings the plan (260825-task3-plan.md, "Locked decisions -- do not
-# re-litigate") fixes, not merely defaults:
-#   drift_detach=False  -- the ablation is CLOSED ("it's what we know is
-#                           correct" -- Shervin). True's only benefit is speed.
+# Settings the plan (260825-task3-plan.md, "Locked decisions -- do not
+# re-litigate") fixes, not merely defaults.
+#
+# drift_detach WAS one of them (locked at False: "it's what we know is correct"
+# -- Shervin; "True's only benefit is speed"). Lifted 2026-09-16: measurement
+# showed True is both faster and BETTER on the objective, so the rationale no
+# longer holds and the axis is open again. See _RETIRED_LOCKS below.
+#
 #   constraint_on="endpoint" -- resolved the mine-vs-his disagreement in the
 #                           meeting. A WRONG default here once made an entire
 #                           ablation (horizon-mode) structurally
@@ -155,7 +159,23 @@ CONSTRAINED_CONTROL_TYPES = frozenset({"mpc", "hardflow"})
 #   warmstart=True      -- Step 7's dropped third candidate (a non-dynamics-
 #                           exact warm start) was ruled out specifically
 #                           because it conflicts with this.
-_LOCKED_DEFAULTS = {"drift_detach": False, "constraint_on": "endpoint", "warmstart": True}
+_LOCKED_DEFAULTS = {"constraint_on": "endpoint", "warmstart": True}
+
+# Locks that USED to exist and have since been lifted deliberately. Naming one
+# in FLOWMAPS_UNLOCK is accepted and does nothing, instead of raising the way an
+# unrecognised name does -- a launcher written against the old lock set should
+# not fail, it should just stop having anything to lift.
+#
+# drift_detach, lifted 2026-09-16. The lock's recorded rationale (2026-08-25)
+# was "True's only benefit is speed, and the speed gain is small". Both legs
+# were measured and both were wrong: at N=8/H=4/n_inner=6 with ImageReward,
+# drift_detach=True ran 33% faster (157 s vs 236 s) AND produced a BETTER
+# objective at every lambda tested -- J -1.096 vs -0.756 at lam=1, which is
+# ~6 run-to-run standard deviations, plus -0.04 at lam=10 and -0.01 at lam=100.
+# A closed decision stays closed on its reasoning, not its conclusion; the
+# reasoning no longer held, so the axis is open again rather than pinned to the
+# opposite value. See results/effstudy/ for the run data.
+_RETIRED_LOCKS = frozenset({"drift_detach"})
 
 
 def _assert_locked_defaults(cfg, log=print) -> None:
@@ -165,12 +185,14 @@ def _assert_locked_defaults(cfg, log=print) -> None:
 
     RAISES rather than silently running under a divergent config -- the
     standing rule (loud fail only) applied to config, not just data. The CLI
-    still exposes --sweep_drift_detach / --sweep_constraint_on /
-    --sweep_warmstart (their historical purpose, e.g. the now-CLOSED
-    drift_detach ablation), so nothing here removes the ability to SET these
-    fields -- setting them away from the locked values now trips this assert
-    instead of quietly reproducing a run under a config nobody meant to
-    reintroduce.
+    still exposes --sweep_constraint_on / --sweep_warmstart, so nothing here
+    removes the ability to SET these fields -- setting them away from the
+    locked values now trips this assert instead of quietly reproducing a run
+    under a config nobody meant to reintroduce.
+
+    --sweep_drift_detach is no longer one of them: that lock was lifted on
+    2026-09-16 after measurement reversed its rationale, so the axis sweeps
+    freely again. See _RETIRED_LOCKS.
 
     THE ESCAPE HATCH (added 2026-09-08). Unlocking now requires naming the
     field explicitly, per run, via ``FLOWMAPS_UNLOCK=drift_detach`` in the
@@ -229,11 +251,22 @@ def _unlocked_fields() -> frozenset:
     if not raw:
         return frozenset()
     names = {n.strip() for n in raw.split(",") if n.strip()}
+    # A retired lock is accepted and ignored (see _RETIRED_LOCKS): the field is
+    # simply no longer locked, so there is nothing to lift and nothing to warn
+    # the reader about afterwards -- but an old launcher naming it should not
+    # die. Only genuinely unrecognised names still raise.
+    retired = names & _RETIRED_LOCKS
+    if retired:
+        print(f"  [locked-defaults] FLOWMAPS_UNLOCK names {sorted(retired)}, "
+              f"which is no longer a locked default -- ignoring. It is now an "
+              f"ordinary sweepable field.")
+    names -= _RETIRED_LOCKS
     unknown = names - set(_LOCKED_DEFAULTS)
     if unknown:
         raise ValueError(
             f"FLOWMAPS_UNLOCK names {sorted(unknown)}, which are not locked "
-            f"defaults. Locked fields are {sorted(_LOCKED_DEFAULTS)}."
+            f"defaults. Locked fields are {sorted(_LOCKED_DEFAULTS)}; "
+            f"retired (accepted, no-op) are {sorted(_RETIRED_LOCKS)}."
         )
     return frozenset(names)
 
@@ -484,12 +517,32 @@ class RunConfig:
                                       # image_mpc_edited_sung.py's docstring.
                                       # Requires constraints active
                                       # (h + lr_dual>0) when True.
-    drift_detach: bool  = False   # MPC only. LOCKED at False (plan Step 2 /
-                                      # Locked decisions): "just to be safe, to
-                                      # keep it at false... it's what we know is
-                                      # correct" (Shervin). True's only benefit
-                                      # is speed; the ablation is CLOSED, not a
-                                      # sweepable axis -- see _assert_locked_defaults.
+    # MPC only. Default flipped False -> True and the lock LIFTED on 2026-09-16
+    # (see _RETIRED_LOCKS for the full rationale and numbers). True evaluates
+    # the drift for ell>0 under no_grad, dropping the J_v^T term from the
+    # gradient. That is an approximation of the gradient, but the measured
+    # result was both faster (-33%) and BETTER on the objective at every lambda
+    # -- the exact drift term is apparently not what the inner solve needs.
+    #
+    # Two consequences worth knowing:
+    #   - It does NOT remove the transformer backward. Since the 2026-08-26
+    #     endpoint-gradient fix, endpoint_map(..., grad=True) is the sole
+    #     gradient path and runs regardless, which is why tune_sampler_speed
+    #     now also needs constraint_on to decide whether checkpointing can be
+    #     dropped (it was corrected in the same change).
+    #   - Runs before 2026-09-16 used False. Any energy/objective comparison
+    #     across that date must check the drift_detach column, which every row
+    #     carries.
+    drift_detach: bool  = True
+    # How endpoint_map predicts the terminal latent inside the inner objective.
+    # "rollout" (default) integrates the remaining N-j-H steps, which is what
+    # makes MPC quadratic in N. "jump" takes ONE flow-map call with t_next=0 --
+    # the surrogate only; the applied trajectory is unchanged. Measured
+    # 2026-09-16 at N=8/H=4: -33% wall clock, J better at lam=1 (2.2 sd) and
+    # within noise at lam=10/100. Default stays "rollout" because it has not
+    # been re-checked at the suite's N=10 and because switching it reproduces
+    # none of the results currently on disk. See image_mpc.make_flux_wrappers.
+    endpoint_surrogate: str = "rollout"
     constraint_on: str  = "endpoint"  # MPC only; "horizon" evaluates reward and
                                       # constraint at raw x_H, "endpoint" at the
                                       # flow-map-predicted terminal latent.
@@ -1733,7 +1786,8 @@ def run_preflight(
     which caller invokes them, so there is no real case where skipping is
     correct, only cases where a caller forgets to call the underlying guard
     at all):
-      - _assert_locked_defaults  (drift_detach / constraint_on / warmstart)
+      - _assert_locked_defaults  (constraint_on / warmstart; drift_detach was
+        lifted 2026-09-16 -- see _RETIRED_LOCKS)
       - _validate_constraint_cfg (D5 mpc-only / D4 silent-no-op / D3
         threshold-count / MAX_CONSTRAINTS)
       - _validate_dual_options_cfg (n_alt / skip_first_primal_step: MPC-only,
@@ -2110,6 +2164,7 @@ def _run_one(
     reward_dtype: torch.dtype = torch.float32,
     probe_h_repeat: int = 0,
     probe_hardflow_duals: bool = False,
+    pbar_rewards: bool = False,
 ) -> dict:
     """Execute a single config and return a metrics dict.
 
@@ -2184,6 +2239,14 @@ def _run_one(
         sampler, fast=fast, verbose=not quiet,
         control_type=cfg.control_type,
         drift_detach=cfg.drift_detach,
+        # 2026-09-16: drift_detach alone no longer implies "no transformer
+        # backward" -- endpoint_map(..., grad=True) is the sole gradient path
+        # under constraint_on="endpoint" and runs either way. Passing
+        # constraint_on lets tune_sampler_speed keep gradient checkpointing on
+        # in exactly the case that needs it; without this, --fast true plus the
+        # new drift_detach=True default would drop checkpointing while the
+        # backward is live, which OOMs FLUX at H >= 2.
+        constraint_on=cfg.constraint_on,
     )
 
     # (Re-)encode prompt for the sampler's cached embeddings
@@ -2375,6 +2438,7 @@ def _run_one(
             guidance_scale=cfg.guidance_scale,
             n_mpc_steps=cfg.N,
             sample_mode=cfg.sample_mode,
+            endpoint_surrogate=cfg.endpoint_surrogate,
         )
 
         log(f"  {cfg.control_type} run...")
@@ -2401,6 +2465,10 @@ def _run_one(
                 constraint_on=cfg.constraint_on,
                 endpoint_map=endpoint_map,
                 verbose=not quiet,
+                # The bar itself is nearly free; the reward it displays is not
+                # (see pbar_rewards' docstring). Off unless --pbar_rewards.
+                show_progress=not quiet,
+                pbar_rewards=pbar_rewards,
                 low_memory=low_memory,
                 device=device,
                 return_dual_h=True,
@@ -2905,6 +2973,7 @@ def _run_one(
         skip_first_primal_step = cfg.skip_first_primal_step,
         drift_detach  = cfg.drift_detach,
         constraint_on = cfg.constraint_on,
+        endpoint_surrogate = cfg.endpoint_surrogate,
         # Only the locks that were BOTH lifted and actually diverge from the
         # locked value -- an unlock that changed nothing is not worth labelling
         # a row with, and would make the column useless for filtering.
@@ -3417,7 +3486,7 @@ CSV_KEYS = [
     "tag", "reward", "seed", "prompt", "edit_prompt",
     "N", "H", "control_type", "lam", "n_inner", "lr_inner",
     "sample_mode", "warmstart", "n_alt", "skip_first_primal_step",
-    "drift_detach", "constraint_on",
+    "drift_detach", "constraint_on", "endpoint_surrogate",
     # Which locked defaults this run lifted via FLOWMAPS_UNLOCK (2026-09-08).
     # Blank for the overwhelming majority of rows. Recorded so a run made under
     # a lifted lock is never indistinguishable afterwards from one made under
@@ -3473,7 +3542,7 @@ CSV_KEYS = [
 _RESUME_KEY_FIELDS = [
     "prompt", "edit_prompt", "N", "H", "control_type", "lam", "n_inner",
     "lr_inner", "sample_mode", "warmstart", "n_alt", "skip_first_primal_step",
-    "drift_detach", "constraint_on",
+    "drift_detach", "constraint_on", "endpoint_surrogate",
     "boffi_use_adam",
     "hardflow_rho", "hardflow_rho_mult", "hardflow_dual_every",
     "hardflow_margin", "hardflow_activation", "hardflow_reg",
@@ -3660,6 +3729,11 @@ def _build_configs_from_args(args) -> List[RunConfig]:
         "hardflow_rho", "hardflow_rho_mult", "hardflow_dual_every",
         "hardflow_margin", "hardflow_activation", "hardflow_reg",
         "hardflow_endpoint_mode",
+        # endpoint_surrogate (2026-09-16) is APPENDED for the same reason the
+        # hardflow axes were: the cartesian product order is positionally
+        # load-bearing for tools that recover a missing CSV column from a
+        # directory name by index.
+        "endpoint_surrogate",
     ]
     for f in sweep_fields:
         val = getattr(args, f"sweep_{f}", None)
@@ -3900,6 +3974,14 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                         help="Device for reward model. "
                              "'auto' uses a second GPU if available, else CPU.")
     parser.add_argument("--quiet",     action="store_true")
+    parser.add_argument("--pbar_rewards", action="store_true",
+                        help="Compute the reward shown in the MPC progress bar. "
+                             "OFF by default (2026-09-16): it costs a no-grad "
+                             "endpoint rollout plus a decode and a reward-model "
+                             "pass every outer step, and another decode + reward "
+                             "per inner iteration -- about 4%% of a run at N=8 "
+                             "for a display field. The bar itself still shows "
+                             "step, control norm and mu.")
     parser.add_argument("--configs",   default=None,
                         help="Comma-separated indices into SWEEP_CONFIGS "
                              "(ignored when any --sweep_* flag is given)")
@@ -3959,6 +4041,20 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "OVERRIDES the derivation and is never "
                              "recomputed: pass 0.0 to reproduce runs from "
                              "before 2026-09-09, which had no effort penalty.")
+    parser.add_argument("--sweep_endpoint_surrogate", nargs="+",
+                        choices=["rollout", "jump"], metavar="MODE",
+                        help="mpc only. How endpoint_map predicts the terminal "
+                             "latent INSIDE the inner objective. 'rollout' "
+                             "(default) integrates the remaining N-j-H steps -- "
+                             "this is the n_inner*N(N-1)/2 term that makes MPC "
+                             "quadratic in N. 'jump' takes one flow-map call "
+                             "with t_next=0 instead, making it linear. Only the "
+                             "surrogate the optimizer differentiates changes; "
+                             "the applied trajectory and everything scored from "
+                             "it are unaffected. Measured at N=8/H=4: -33%% wall "
+                             "clock, objective better at lam=1 and within the "
+                             "noise floor at lam=10/100. Not yet re-checked at "
+                             "N=10, hence opt-in.")
     parser.add_argument("--sweep_hardflow_endpoint_mode", nargs="+",
                         choices=["flow_map1", "flow_matching", "mpc_rollout"],
                         metavar="MODE",
@@ -4340,6 +4436,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                     reward_dtype=_REWARD_DTYPES[args.reward_dtype],
                     probe_h_repeat=args.probe_h_repeat,
                     probe_hardflow_duals=args.probe_hardflow_duals,
+                    pbar_rewards=args.pbar_rewards,
                 )
             except Exception as e:
                 # 2026-08-21 (Phase A2e): a config that raises is no longer

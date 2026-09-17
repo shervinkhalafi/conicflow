@@ -104,15 +104,18 @@ def _grad_checkpointing_enabled(module) -> bool:
 def _pbar_postfix(
     outer: int,
     outer_total: int,
-    reward: float,
+    reward: Optional[float],
     control: float,
     mu: Optional[float] = None,
 ) -> dict:
-    d: dict = {
-        "step": f"{outer}/{outer_total}",
-        "r": f"{reward:.4f}",
-        "|u|": f"{control:.4e}",
-    }
+    # reward=None omits the "r" field (2026-09-16). Producing that number costs
+    # a VAE decode + a reward-model forward, and under constraint_on="endpoint"
+    # a no-grad endpoint rollout on top -- see `pbar_rewards` on
+    # receding_horizon_flow_control for why it is now off by default.
+    d: dict = {"step": f"{outer}/{outer_total}"}
+    if reward is not None:
+        d["r"] = f"{reward:.4f}"
+    d["|u|"] = f"{control:.4e}"
     if mu is not None:
         d["μ"] = f"{mu:.4e}"
     return d
@@ -313,6 +316,7 @@ def solve_horizon_problem(
     drift_detach: bool = False,
     v_cur: Optional[torch.Tensor] = None,
     pbar: Optional[tqdm] = None,
+    pbar_rewards: bool = False,
     outer_step: Optional[int] = None,
     outer_total: Optional[int] = None,
     low_memory: bool = True,
@@ -378,7 +382,8 @@ def solve_horizon_problem(
                 resid0 = x_traj[0] - x_cur_fixed - dt * v_cur
                 pbar.set_postfix(_pbar_postfix(
                     outer_step or 0, outer_total or 0,
-                    _reward_mean(r, x_traj[-1]), _flat_norm_mean(resid0),
+                    _reward_mean(r, x_traj[-1]) if pbar_rewards else None,
+                    _flat_norm_mean(resid0),
                 ))
             pbar.update(n_iters)
     else:  # adam
@@ -393,7 +398,10 @@ def solve_horizon_problem(
                     resid0 = x_traj[0] - x_cur_fixed - dt * v_cur
                     pbar.set_postfix(_pbar_postfix(
                         outer_step or 0, outer_total or 0,
-                        _reward_mean(r, x_traj[-1]), _flat_norm_mean(resid0),
+                        # A VAE decode + a reward-model forward per inner
+                        # iteration, for a display field. Off unless asked.
+                        _reward_mean(r, x_traj[-1]) if pbar_rewards else None,
+                        _flat_norm_mean(resid0),
                     ))
                 pbar.update(1)
             del loss
@@ -428,6 +436,7 @@ def receding_horizon_flow_control(
     drift_detach: bool = False,
     verbose: bool = False,
     show_progress: bool = True,
+    pbar_rewards: bool = False,
     low_memory: bool = True,
     device: Optional[torch.device] = None,
     return_dual_h: bool = False,
@@ -525,7 +534,18 @@ def receding_horizon_flow_control(
                        the gradient.
         verbose:       print per-step diagnostics.
         show_progress: show a tqdm bar of length N * n_iters with outer step,
-                       reward, and control norm.
+                       control norm, and (only when pbar_rewards) reward.
+        pbar_rewards:  compute the reward displayed in the progress bar.
+                       Default False because it is NOT free: per outer step a
+                       no-grad endpoint rollout (N-j-1 transformer forwards
+                       under constraint_on="endpoint") plus a decode and a
+                       reward-model pass, and another decode + reward pass per
+                       inner iteration -- ~4% of a run at N=8, for a field
+                       nobody reads inside a sweep. Separate from
+                       show_progress because tqdm(disable=True) still returns a
+                       live object, so the `if pbar is not None` guards never
+                       suppressed this work (measured 2026-09-16: 232 s with
+                       show_progress True and False alike).
         low_memory:    if False, skip per-step gc/empty_cache (faster when VRAM
                        headroom is available; pair with ``--fast true``).
         device:        torch device (defaults to x0.device).
@@ -643,7 +663,7 @@ def receding_horizon_flow_control(
                 optimizer=optimizer, n_iters=n_iters, lr=lr,
                 x_init=x_init_j, return_full=need_full,
                 drift_detach=drift_detach, v_cur=v_j,
-                pbar=pbar, outer_step=j + 1, outer_total=N,
+                pbar=pbar, pbar_rewards=pbar_rewards, outer_step=j + 1, outer_total=N,
                 low_memory=low_memory,
             )
             if need_full:
@@ -730,13 +750,21 @@ def receding_horizon_flow_control(
 
         if pbar is not None:
             mu_mean_val = mu_t.mean().item() if mu_t is not None else None
-            if constraint_on == "endpoint" and endpoint_map is not None:
-                with torch.no_grad():
-                    x_disp = endpoint_map(t_grid[j + 1].expand(x.shape[0]), x)
-            else:
-                x_disp = x
+            # Not free (2026-09-16): under constraint_on="endpoint" this is a
+            # full no-grad endpoint rollout -- N-j-1 transformer forwards --
+            # plus a decode and a reward-model pass, every outer step, to fill
+            # one progress-bar field. Gated on pbar_rewards, NOT on
+            # `pbar is not None`, because tqdm(disable=True) is still an object.
+            r_disp = None
+            if pbar_rewards:
+                if constraint_on == "endpoint" and endpoint_map is not None:
+                    with torch.no_grad():
+                        x_disp = endpoint_map(t_grid[j + 1].expand(x.shape[0]), x)
+                else:
+                    x_disp = x
+                r_disp = _reward_mean(r, x_disp)
             pbar.set_postfix(_pbar_postfix(
-                j + 1, N, _reward_mean(r, x_disp), _flat_norm_mean(u_star), mu_mean_val,
+                j + 1, N, r_disp, _flat_norm_mean(u_star), mu_mean_val,
             ))
 
         if verbose:
