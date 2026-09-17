@@ -1,5 +1,8 @@
 # Python
 __pycache__/
+# uv virtualenv. uv.lock is NOT ignored: it is the whole point -- committing it
+# is what makes `uv sync` produce the same environment on every machine.
+.venv/
 *.py[cod]
 *.egg-info/
 .eggs/

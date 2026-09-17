@@ -80,6 +80,40 @@ dependencies:
       #   above pins. In practice both torch and jax load the newer cuDNN fine
       #   (verified with conv2d fwd/bwd on GPU + jax.devices() detecting all GPUs),
       #   so this is left unpinned rather than forcing a downgrade.
+      #
+      #   *** THE NOTE ABOVE NO LONGER DESCRIBES THIS ENV (measured 2026-09-17). ***
+      #   The `flowmaps` env as it actually exists has nvidia-cudnn-cu12 9.1.0.70 --
+      #   torch's pin, NOT the newer one -- and its JAX is consequently BROKEN:
+      #
+      #       >>> import jax.numpy as jnp; jnp.ones((256, 256))
+      #       E cuda_dnn.cc:523] Loaded runtime CuDNN library: 9.1.0 but source was
+      #       compiled with: 9.8.0. CuDNN library needs to have matching major
+      #       version and equal or higher minor version.
+      #
+      #   It fails on array creation, so nothing JAX-side runs at all:
+      #   flow-maps/py/launchers/learn.py cannot work in this env today.
+      #
+      #   WHY THE NOTE WENT STALE. pip has no resolver, so whichever of torch and
+      #   jax[cuda12] is installed last wins the cuDNN slot. The verification above
+      #   was presumably done when jax had just been installed; any later `pip
+      #   install torch` (a reinstall, a repair step, an `--upgrade` touching it)
+      #   silently pins cuDNN back to 9.1.0.70 and takes JAX down with it, with no
+      #   error until something actually calls into JAX. Nothing in this file can
+      #   prevent that -- the two requirements are genuinely unsatisfiable together:
+      #       torch 2.5.1  requires nvidia-cudnn-cu12 == 9.1.0.70
+      #       jax  >= 0.6  is built against cuDNN 9.8
+      #
+      #   HOW IT WAS FOUND, AND THE FIX. `uv lock` refuses the combination outright
+      #   rather than installing one over the other, which is how the breakage
+      #   surfaced. The uv setup therefore keeps them in SEPARATE environments:
+      #   pyproject.toml / uv.lock hold the torch sweep stack (no jax, no TF), and
+      #   requirements-flowmaps-training.txt holds the JAX/Flax/TF training stack
+      #   for its own venv. See scripts/uv_postinstall.sh.
+      #
+      #   If you keep using this conda env for JAX training, install jax[cuda12]
+      #   LAST and re-check `jax.numpy.ones((8,8))` afterwards -- `jax.devices()`
+      #   alone passes even when the runtime is broken, which is part of why this
+      #   went unnoticed.
       # tensorflow / tensorflow-datasets / ml_collections: transitive imports pulled
       #   in by flow-maps/py/common/datasets.py (sample_two_moons)
       # seaborn / wandb: used by flow-maps/py/common/logging.py during training
