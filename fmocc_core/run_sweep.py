@@ -678,6 +678,21 @@ class RunConfig:
     # evaluates the endpoint once per OUTER step, not per inner step; it takes
     # NFE from 2N to N + N(N+1)/2, so ~115 s/run rather than ~90 s.
     hardflow_endpoint_mode: str = "flow_map1"
+    # (2026-09-17) Lift HardFlow's admissible floor. hardflow_image raises when
+    # lr*reg >= 1 because its explicit fixed-step inner ascent stops contracting
+    # (error evolves as e <- e*(1 - 2*lr*reg*alpha_t^2)). With reg = N/(2*lam)
+    # that is a floor lam >= N*lr/2 -- 12.5 at N=10 with the authors' lr=2.5 --
+    # which for ImageReward sits ABOVE HardFlow's entire transition, so every
+    # admissible lam is a plateau point and the method can never be compared to
+    # MPC at a shared lam in the regularised regime (results/autorange/).
+    # When set, any run with lr_inner*reg >= 1 uses lr = hardflow_lr_alpha/reg
+    # instead, i.e. the product lr*reg is pinned at hardflow_lr_alpha < 1. That
+    # is not a hack around the guard: the inner loop's contraction factor
+    # becomes 1 - 2*hardflow_lr_alpha*alpha_t^2, uniform in lam, so convergence
+    # no longer depends on where the run sits on the grid (0.5 is dead-beat at
+    # the final step). None = off: the guard raises exactly as before. The
+    # EFFECTIVE lr is recorded per row in `hardflow_lr_eff`.
+    hardflow_lr_alpha: Optional[float] = None
     # style reward only (reward_model=="style") -- one or more reference image
     # paths; Gram matrices are averaged across references when >1 (style
     # mixing). Neither the FMRG paper nor MPGD specify multi-reference
@@ -1923,9 +1938,17 @@ def _log_hardflow_reg_equivalence(cfg: RunConfig, *, log: Callable = print) -> N
     # spent ~90s loading. Deriving reg makes this reachable from a low lam,
     # which is why it is worth predicting now and was not before.
     if cfg.lr_inner * cfg.hardflow_reg >= 1.0:
-        log(f"  !! lr_inner={cfg.lr_inner:g} * reg={cfg.hardflow_reg:g} = "
-            f"{cfg.lr_inner * cfg.hardflow_reg:g} >= 1 -- hardflow_image WILL "
-            f"raise. The floor is lam >= N*lr/2 = {cfg.N * cfg.lr_inner / 2.0:g}.")
+        if cfg.hardflow_lr_alpha is not None:
+            log(f"  lr_inner={cfg.lr_inner:g} * reg={cfg.hardflow_reg:g} = "
+                f"{cfg.lr_inner * cfg.hardflow_reg:g} >= 1 -- below the floor "
+                f"lam >= N*lr/2 = {cfg.N * cfg.lr_inner / 2.0:g}; hardflow_lr_alpha="
+                f"{cfg.hardflow_lr_alpha:g} will set lr = "
+                f"{cfg.hardflow_lr_alpha / cfg.hardflow_reg:.4g} for this run.")
+        else:
+            log(f"  !! lr_inner={cfg.lr_inner:g} * reg={cfg.hardflow_reg:g} = "
+                f"{cfg.lr_inner * cfg.hardflow_reg:g} >= 1 -- hardflow_image WILL "
+                f"raise. The floor is lam >= N*lr/2 = {cfg.N * cfg.lr_inner / 2.0:g}. "
+                f"Pass --hardflow_lr_alpha to lift it.")
 
 
 def _build_constraint_fn(
@@ -2443,6 +2466,7 @@ def _run_one(
 
         log(f"  {cfg.control_type} run...")
         t0 = time.perf_counter()
+        hardflow_lr_eff = ""          # filled on the hardflow path; blank elsewhere
 
         if cfg.control_type == "mpc":
             z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = receding_horizon_flow_control(
@@ -2474,6 +2498,16 @@ def _run_one(
                 return_dual_h=True,
             )
         elif cfg.control_type == "hardflow":
+            # Effective inner lr: see RunConfig.hardflow_lr_alpha. Below the
+            # lr*reg >= 1 floor the configured lr is used unchanged, so rows
+            # above the floor are bit-for-bit what they were before this flag.
+            hardflow_lr_eff = cfg.lr_inner
+            if (cfg.hardflow_lr_alpha is not None and cfg.hardflow_reg
+                    and cfg.lr_inner * cfg.hardflow_reg >= 1.0):
+                hardflow_lr_eff = cfg.hardflow_lr_alpha / cfg.hardflow_reg
+                log(f"  hardflow: lr_inner={cfg.lr_inner:g} * reg={cfg.hardflow_reg:g} "
+                    f">= 1 -> using lr={hardflow_lr_eff:.4g} (= hardflow_lr_alpha "
+                    f"{cfg.hardflow_lr_alpha:g} / reg)")
             # HardFlow (Li, Alim & Azizan, TPAMI 2026), ported in
             # image_mpc_edited_sung.hardflow_image. Same return contract as
             # receding_horizon_flow_control, so mu_final/mu_hist feed the
@@ -2486,7 +2520,7 @@ def _run_one(
                 sampler, r_image, z0,
                 N=cfg.N,
                 n_inner=cfg.n_inner,
-                lr=cfg.lr_inner,
+                lr=hardflow_lr_eff,
                 h=h_fn,
                 mu_init=cfg.mu_init,
                 lr_dual=cfg.lr_dual if cfg.lr_dual > 0.0 else None,
@@ -2993,6 +3027,8 @@ def _run_one(
         hardflow_activation   = cfg.hardflow_activation,
         hardflow_reg          = cfg.hardflow_reg,
         hardflow_endpoint_mode = cfg.hardflow_endpoint_mode,
+        hardflow_lr_alpha     = "" if cfg.hardflow_lr_alpha is None else cfg.hardflow_lr_alpha,
+        hardflow_lr_eff       = hardflow_lr_eff,
         lpips_net     = cfg.lpips_net,
         r_unc         = r_unc_final,
         r_ctrl        = r_ctrl_final,
@@ -3513,6 +3549,8 @@ CSV_KEYS = [
     "hardflow_rho", "hardflow_rho_mult", "hardflow_dual_every",
     "hardflow_margin", "hardflow_activation", "hardflow_reg",
     "hardflow_endpoint_mode",
+    # (2026-09-17) the floor-lifting alpha and the lr the run ACTUALLY used.
+    "hardflow_lr_alpha", "hardflow_lr_eff",
     "lpips_net", "r_unc", "r_ctrl",
     "r_ctrl_independent", "delta_r",
     "ctrl_energy", "ctrl_norm_mean", "ctrl_norm_max", "objective", "time_unc_s", "time_ctrl_s",
@@ -3546,7 +3584,7 @@ _RESUME_KEY_FIELDS = [
     "boffi_use_adam",
     "hardflow_rho", "hardflow_rho_mult", "hardflow_dual_every",
     "hardflow_margin", "hardflow_activation", "hardflow_reg",
-    "hardflow_endpoint_mode",
+    "hardflow_endpoint_mode", "hardflow_lr_alpha",
     "seed", "lr_dual", "mu_init", "lpips_net",
 ]
 
@@ -4167,6 +4205,13 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "Setting BOTH this and --mu_init to 0 with constraints "
                              "requested raises: the constraint term would be identically "
                              "zero, a silent no-op.")
+    parser.add_argument("--hardflow_lr_alpha", type=float, default=None,
+                        help="hardflow only. Lift the lr*reg >= 1 admissible floor: any "
+                             "run whose configured lr_inner * reg would reach 1 uses "
+                             "lr = ALPHA/reg instead (0 < ALPHA < 1; 0.5 is dead-beat at "
+                             "the final step). Runs above the floor are unchanged. The "
+                             "lr actually used is written to the hardflow_lr_eff column. "
+                             "Off by default: the guard raises as before.")
     parser.add_argument("--mu_init", type=float, default=0.0,
                         help="Initial value for all Lagrange multipliers (default 0.0). "
                              "See --lr_dual for the both-zero guard.")
@@ -4284,6 +4329,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
             cfg.constraint_thresholds = []
         cfg.lr_dual = args.lr_dual
         cfg.mu_init = args.mu_init
+        cfg.hardflow_lr_alpha = args.hardflow_lr_alpha
         # 2026-09-16: hardflow_reg now derives from N and lam unless supplied.
         # Done HERE because this loop is the one place both config sources --
         # the CLI cartesian product and SWEEP_CONFIGS -- funnel through, and it

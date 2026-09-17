@@ -67,6 +67,7 @@ import run_sweep as rs                                   # noqa: E402
 from reward_ranges import REWARD_OBSERVED_RANGE           # noqa: E402
 
 LAM_ABS_MIN, LAM_ABS_MAX = 1e-4, 1e7    # search never leaves this (log-)box
+SPIKE_DECADES = 3.0                     # energy spike threshold; see mark_suspects
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -164,7 +165,8 @@ def make_cfg(method: str, a, lam: float) -> rs.RunConfig:
                            endpoint_surrogate=a.endpoint_surrogate, **common)
     elif method == "hardflow":
         cfg = rs.RunConfig(control_type="hardflow", H=2, n_inner=a.hardflow_n_inner,
-                           lr_inner=a.hardflow_lr_inner, **common)
+                           lr_inner=a.hardflow_lr_inner, hardflow_lr_alpha=a.hardflow_lr_alpha,
+                           **common)
     elif method == "fmrg":
         cfg = rs.RunConfig(control_type="fmrg", n_inner=a.fmrg_n_opt, **common)
     else:
@@ -194,6 +196,7 @@ class Evaluator:
                        dr=float("nan"), E=float("nan"), J=float("nan"), t_ctrl=float("nan"),
                        err=f"{type(e).__name__}: {str(e)[:160]}")
             torch.cuda.empty_cache()
+        row["suspect"] = False      # set later by mark_suspects; keeps the CSV column stable
         row["wall_s"] = time.perf_counter() - t0
         self.rows.append(row)
         flag = "" if row["ok"] else f"   FAILED: {row['err'][:70]}"
@@ -205,8 +208,51 @@ class Evaluator:
 # ═════════════════════════════════════════════════════════════════════════════
 # The search
 # ═════════════════════════════════════════════════════════════════════════════
-def _valid(points: Dict[float, dict]) -> List[dict]:
-    return sorted((p for p in points.values() if p["ok"] and math.isfinite(p["dr"])), key=lambda p: p["lam"])
+def _valid(points: Dict[float, dict], include_suspect: bool = False) -> List[dict]:
+    return sorted((p for p in points.values()
+                   if p["ok"] and math.isfinite(p["dr"]) and (include_suspect or not p.get("suspect"))),
+                  key=lambda p: p["lam"])
+
+
+def mark_suspects(points: Dict[float, dict], spike_decades: float = SPIKE_DECADES) -> List[dict]:
+    """Flag control-energy SPIKES in place, and return the surviving points.
+
+    WHY (2026-09-17). HardFlow's explicit fixed-step inner ascent can diverge at
+    a single lambda and still return a finite number: on ImageReward at lam=27
+    it produced ctrl_energy = 1.15e18 between neighbours at 2.9 and 11.8, with
+    delta_r falling to -0.83. _run_one's guards only catch non-finite values, so
+    that point survives into the curve, where it (a) trips the `falling` and
+    `energy_waste` stopping tests and can truncate the bracket, and (b) drags
+    the logistic fit, the active region and therefore the grid with it. One
+    unstable solve is not a feature of the response curve.
+
+    A SPIKE, not a threshold. Energy legitimately grows by many decades across a
+    sweep -- FMRG's top is ~1e3 above its bottom and is real -- so a point is
+    only suspect when it stands above BOTH of its lambda-neighbours by
+    `spike_decades`, i.e. the curve comes back down afterwards. That is what
+    separates one bad solve from the genuine overshoot regime, where energy goes
+    up and STAYS up (FMRG on CLIP past lam~3500: energy 1e9 with delta_r
+    falling, which is a real finding and must not be filtered away).
+
+    Endpoints are never flagged: with no point beyond it there is no evidence
+    the energy came back down. A spike that is still the last point therefore
+    stays visible to the stopping tests until bracketing or refinement puts a
+    point above it.
+
+    Suspect points stay in `points`, in evaluations.csv and in the plots -- they
+    are marked, not deleted, so a run that hit an instability is never silently
+    prettier than it was.
+    """
+    vp = _valid(points, include_suspect=True)
+    for p in vp:
+        p["suspect"] = False
+    if len(vp) < 3:
+        return vp
+    le = [math.log10(max(p["E"], 1e-300)) if math.isfinite(p["E"]) else float("inf") for p in vp]
+    for i in range(1, len(vp) - 1):
+        if le[i] - max(le[i - 1], le[i + 1]) > spike_decades:
+            vp[i]["suspect"] = True
+    return [p for p in vp if not p["suspect"]]
 
 
 def _saturated(vp: List[dict], ceiling: float, tol: float) -> bool:
@@ -238,7 +284,8 @@ def _inactive(vp: List[dict], tol: float) -> bool:
 
 
 def bracket(method: str, ev: Evaluator, lam0: float, ceiling: float, tol: float,
-            lam_min_adm: float, max_evals: int) -> Dict[float, dict]:
+            lam_min_adm: float, max_evals: int,
+            spike_decades: float = SPIKE_DECADES) -> Dict[float, dict]:
     points: Dict[float, dict] = {}
     n = 0
 
@@ -249,6 +296,9 @@ def bracket(method: str, ev: Evaluator, lam0: float, ceiling: float, tol: float,
             return points[lam]
         n += 1
         points[lam] = ev(method, lam)
+        # Re-flag after every evaluation so the stopping tests below never see a
+        # spike -- a spurious `falling` would cut the bracket short.
+        mark_suspects(points, spike_decades)
         return points[lam]
 
     lam0 = max(lam0, lam_min_adm)
@@ -301,6 +351,46 @@ def quantile_grid(fit, n_grid: int, lo: float, hi: float) -> List[float]:
     return sorted({float(f"{l:.2g}") for l in lams})
 
 
+def shared_grid(results: List[dict], n_max: int, min_ratio: float) -> dict:
+    """One lambda grid for all methods, so runs can be compared at the SAME lambda.
+
+    WHY THIS IS A LEGITIMATE COMPARISON. MPC's per-step linearised problem
+    min ||resid||^2/(2 lam dt) - <grad r, resid> has the closed form
+    resid* = lam*dt*grad r; FMRG's update, n_opt steps of (dt/n_opt)*lam*grad r,
+    is exactly that per step; HardFlow's reg = N/(2 lam) is matched per step by
+    the derivation in RunConfig. So at a shared lam all three are solving the
+    same first-order problem, and the CSV's `objective` column
+    (E/(2 lam) - r_ctrl) scores each of them against it. Where they differ is
+    feedback: MPC re-solves, FMRG is open-loop and overshoots at high lam.
+
+    CONSTRUCTION. Take the union of every method's quantile grid (each already
+    spans 8-92% of that method's own rise), merge neighbours closer than
+    `min_ratio`, then if more than n_max points remain drop, one at a time, the
+    point whose removal least widens the largest log-gap. This keeps every
+    method's transition resolved rather than spreading points log-uniformly over
+    a union region one method may not use.
+    """
+    pts = sorted({float(f"{l:.2g}") for r in results if r.get("status") != "insufficient" for l in r.get("grid", [])})
+    merged: List[float] = []
+    for l in pts:
+        if merged and l / merged[-1] < min_ratio:
+            merged[-1] = float(f"{math.sqrt(merged[-1] * l):.2g}")     # replace the pair by their log-midpoint
+        else:
+            merged.append(l)
+    while len(merged) > n_max:
+        gaps = [math.log10(b / a_) for a_, b in zip(merged, merged[1:])]
+        # removing interior point i merges gaps i-1 and i; pick the smallest merged gap
+        cand = min(range(1, len(merged) - 1), key=lambda i: gaps[i - 1] + gaps[i])
+        merged.pop(cand)
+    coverage = {}
+    for r in results:
+        if r.get("status") == "insufficient":
+            continue
+        inside = [l for l in merged if r["active_lo"] <= l <= r["active_hi"]]
+        coverage[r["method"]] = dict(n_inside=len(inside), active=[r["active_lo"], r["active_hi"]])
+    return dict(grid=merged, coverage=coverage)
+
+
 def loguniform_grid(n_grid: int, lo: float, hi: float) -> List[float]:
     return sorted({float(f"{10 ** x:.2g}") for x in np.linspace(math.log10(lo), math.log10(hi), n_grid)})
 
@@ -312,7 +402,10 @@ def autorange(method: str, ev: Evaluator, a, pr: dict, ceiling: float, lam_floor
     print(f"\n== {method}: prior lam0={lam0:.3g}  ceiling(dr_max)={ceiling:.3f}  tol={tol:.3f}"
           f"{f'  admissible floor lam>={lam_floor_probe:.3g} (probe N), >={lam_floor_target:.3g} (target N)' if lam_floor_probe else ''}")
     t0 = time.perf_counter()
-    pts = bracket(method, ev, lam0, ceiling, tol, lam_floor_probe, a.max_evals)
+    pts = bracket(method, ev, lam0, ceiling, tol, lam_floor_probe, a.max_evals, a.spike_decades)
+    # Final pass over the whole set: a point that was the last one during
+    # bracketing (and so unflaggable) may now have a neighbour above it.
+    mark_suspects(pts, a.spike_decades)
     vp = _valid(pts)
     out = dict(method=method, prior_lam0=lam0, tol=tol, ceiling=ceiling,
                lam_floor_probe_N=lam_floor_probe, lam_floor_target_N=lam_floor_target)
@@ -343,12 +436,19 @@ def autorange(method: str, ev: Evaluator, a, pr: dict, ceiling: float, lam_floor
         for lam in grid:
             if float(f"{lam:.3g}") not in pts and len(pts) < a.max_evals + a.n_grid:
                 pts[float(f"{lam:.3g}")] = ev(method, lam)
+        mark_suspects(pts, a.spike_decades)
         vp = _valid(pts)
         fit = fit_logistic(vp, ceiling) or fit
     # HardFlow: the target-N floor may cut the grid; report rather than silently shift
     clipped = [l for l in grid if l < lam_floor_target] if lam_floor_target else []
     grid_target = [l for l in grid if l >= lam_floor_target] if lam_floor_target else grid
-    out.update(status="saturated_at_admissible_floor" if floor_saturated else "ok",
+    suspects = sorted(p["lam"] for p in pts.values() if p.get("suspect"))
+    if suspects:
+        print(f"    [suspect] energy spikes at lam {', '.join(f'{l:g}' for l in suspects)} "
+              f"(>{a.spike_decades:g} decades above both neighbours) -- excluded from the fit, "
+              f"the active region and the grid; still in evaluations.csv")
+    out.update(suspect_lams=suspects,
+               status="saturated_at_admissible_floor" if floor_saturated else "ok",
                dr_plateau_observed=dr_top, active_lo=lo, active_hi=hi, fit=fit, grid=grid,
                grid_for_target_N=grid_target, clipped_by_target_floor=clipped,
                points=sorted(pts.values(), key=lambda p: p["lam"]),
@@ -402,6 +502,11 @@ def main():
     p.add_argument("--max_evals", type=int, default=10, help="bracketing budget per method (refinement adds n_grid)")
     p.add_argument("--tol", type=float, default=0.05, help="flatness tolerance as a fraction of the reward ceiling")
     p.add_argument("--tol_abs", type=float, default=0.0, help="absolute floor for the tolerance")
+    p.add_argument("--spike_decades", type=float, default=SPIKE_DECADES,
+                   help="a point whose control energy stands this many decades above BOTH its "
+                        "lambda-neighbours is a diverged solve, not curve shape: it is marked "
+                        "suspect and excluded from the fit, the active region and the grid "
+                        "(still recorded). 0 disables.")
     p.add_argument("--evaluate_grid", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sample_mode", default="flow_map2")
@@ -411,6 +516,12 @@ def main():
     p.add_argument("--endpoint_surrogate", default="jump", choices=["rollout", "jump"],
                    help="MPC surrogate for range finding; jump is ~3x cheaper and the transition matches")
     p.add_argument("--hardflow_n_inner", type=int, default=40); p.add_argument("--hardflow_lr_inner", type=float, default=2.5)
+    p.add_argument("--hardflow_lr_alpha", type=float, default=None,
+                   help="lift HardFlow's lr*reg >= 1 floor: below it lr = ALPHA/reg (see run_sweep.py). "
+                        "Without this HardFlow's transition is unreachable for high-gradient rewards.")
+    p.add_argument("--n_grid_shared", type=int, default=8, help="points in the shared (all-method) grid")
+    p.add_argument("--shared_min_ratio", type=float, default=1.4,
+                   help="neighbouring shared-grid points closer than this ratio are merged")
     p.add_argument("--fmrg_n_opt", type=int, default=3)
     p.add_argument("--reward_dtype", default="fp32", choices=list(rs._REWARD_DTYPES))
     p.add_argument("--fast", type=lambda x: x.lower() != "false", default=True)
@@ -444,8 +555,11 @@ def main():
     ev = Evaluator(sampler, device, reward_device, dtype, a)
     results = []
     for m in a.methods:
-        fl_probe = hardflow_floor(a.probe_N, a.hardflow_lr_inner) if m == "hardflow" else 0.0
-        fl_target = hardflow_floor(a.target_N, a.hardflow_lr_inner) if m == "hardflow" else 0.0
+        # With --hardflow_lr_alpha the lr*reg >= 1 floor is lifted (run_sweep pins
+        # lr*reg at alpha below it), so there is no admissible boundary to report.
+        lifted = m == "hardflow" and a.hardflow_lr_alpha is not None
+        fl_probe = hardflow_floor(a.probe_N, a.hardflow_lr_inner) if (m == "hardflow" and not lifted) else 0.0
+        fl_target = hardflow_floor(a.target_N, a.hardflow_lr_inner) if (m == "hardflow" and not lifted) else 0.0
         results.append(autorange(m, ev, a, pr, ceiling, fl_probe, fl_target))
 
     # ── outputs ───────────────────────────────────────────────────────────
@@ -464,9 +578,21 @@ def main():
         note = (f"   # {len(r['clipped_by_target_floor'])} point(s) below HardFlow floor lam>={r['lam_floor_target_N']:g} at N={a.target_N} dropped"
                 if r["clipped_by_target_floor"] else "")
         lines.append(f"{r['method']:8} --sweep_lam {g}{note}")
+        if r.get("suspect_lams"):
+            lines.append(f"{'':8} # EXCLUDED energy spikes at lam "
+                         f"{' '.join(f'{l:g}' for l in r['suspect_lams'])} (diverged solves)")
         lines.append(f"{'':8} # active region lam in [{r['active_lo']:g}, {r['active_hi']:g}], "
                      f"{r['n_evals']} evals, {r['wall_s']:.0f}s"
                      + (f", logistic R2={r['fit']['r2']:.2f}" if r.get('fit') else ""))
+    sh = shared_grid(results, a.n_grid_shared, a.shared_min_ratio)
+    summary["shared"] = sh
+    lines.append("")
+    lines.append(f"shared   --sweep_lam {' '.join(f'{l:g}' for l in sh['grid'])}")
+    for m, c in sh["coverage"].items():
+        flag = "" if c["n_inside"] >= 3 else "   # UNDER-RESOLVED: raise --n_grid_shared"
+        lines.append(f"{'':8} # {m}: {c['n_inside']} of {len(sh['grid'])} shared points inside its active "
+                     f"region [{c['active'][0]:g}, {c['active'][1]:g}]{flag}")
+    (out / "autorange.json").write_text(json.dumps(summary, indent=1, default=float))
     (out / "grids.txt").write_text("\n".join(lines) + "\n")
     print("\n" + "\n".join(lines))
     try:

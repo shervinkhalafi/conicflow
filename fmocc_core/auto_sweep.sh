@@ -11,6 +11,14 @@
 # Environment overrides (all optional):
 #   TARGET_N=10  PROBE_N=4  N_GRID=6  SEEDS="42"  MPC_H=2  MPC_NI=12
 #   HF_NI=40 HF_LR=2.5  FMRG_NOPT=3  AUTORANGE_EXTRA="..."
+#   SHARED_GRID=1   run every method on ONE grid (the `shared` line of grids.txt)
+#                   so objectives can be compared between methods at the same lam.
+#                   At a shared lam all three solve the same first-order problem
+#                   (see lambda_autorange.shared_grid); per-method grids resolve
+#                   each method's own transition better but are not comparable.
+#   HF_ALPHA=0.5    lift HardFlow's lr*reg >= 1 floor (lr = HF_ALPHA/reg below it,
+#                   passed to both the range finder and the hardflow sweep).
+#                   Without it HardFlow cannot reach the shared grid's low end.
 #
 # The card is pinned with CUDA_VISIBLE_DEVICES and both --*_device are cuda:0
 # in-process (never pass cuda:1 to run_sweep.py: ImageReward misbehaves there).
@@ -18,6 +26,8 @@ set -u
 GPU="$1"; REWARD="$2"; PROMPT="$3"; EDIT="$4"; shift 4
 TARGET_N="${TARGET_N:-10}"; PROBE_N="${PROBE_N:-4}"; N_GRID="${N_GRID:-6}"; SEEDS="${SEEDS:-42}"
 MPC_H="${MPC_H:-2}"; MPC_NI="${MPC_NI:-12}"; HF_NI="${HF_NI:-40}"; HF_LR="${HF_LR:-2.5}"; FMRG_NOPT="${FMRG_NOPT:-3}"
+SHARED_GRID="${SHARED_GRID:-0}"; HF_ALPHA="${HF_ALPHA:-}"
+HF_ALPHA_ARGS=(); [ -n "$HF_ALPHA" ] && HF_ALPHA_ARGS=(--hardflow_lr_alpha "$HF_ALPHA")
 cd "$(dirname "$0")" || exit 3
 SLUG="$(printf '%s__%s' "$PROMPT" "$EDIT" | tr -c 'A-Za-z0-9' '_' | cut -c1-60)"
 OUT="results/auto/$REWARD/$SLUG"; mkdir -p "$OUT"
@@ -27,15 +37,26 @@ echo "[auto_sweep] step 1/2: lambda range finding ($REWARD, proxy N=$PROBE_N -> 
 python lambda_autorange.py --reward "$REWARD" --prompt "$PROMPT" --edit_prompt "$EDIT" \
     --methods mpc hardflow fmrg --probe_N "$PROBE_N" --target_N "$TARGET_N" --n_grid "$N_GRID" \
     --flux_device cuda:0 --reward_device cuda:0 --out_dir "$OUT/autorange" ${AUTORANGE_EXTRA:-} \
+    ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"} \
     || { echo "[auto_sweep] range finding FAILED"; exit 1; }
 
-echo "[auto_sweep] step 2/2: sweeps at N=$TARGET_N"
+echo "[auto_sweep] step 2/2: sweeps at N=$TARGET_N (SHARED_GRID=$SHARED_GRID)"
+if [ "$SHARED_GRID" = "1" ]; then
+    SHARED="$(awk '$1=="shared" && $2=="--sweep_lam" {$1="";$2="";print}' "$OUT/autorange/grids.txt")"
+    [ -n "$SHARED" ] || { echo "[auto_sweep] no shared grid in grids.txt"; exit 1; }
+    echo "[auto_sweep]   shared grid: $SHARED"
+    grep '^ *# ' "$OUT/autorange/grids.txt" | tail -3 | sed 's/^/[auto_sweep]   /'
+    # one line per method, all on the shared grid
+    METHOD_LINES="$(printf 'mpc --sweep_lam %s\nhardflow --sweep_lam %s\nfmrg --sweep_lam %s\n' "$SHARED" "$SHARED" "$SHARED")"
+else
+    METHOD_LINES="$(grep -E '^(mpc|hardflow|fmrg) +--sweep_lam' "$OUT/autorange/grids.txt")"
+fi
 while read -r method flag grid; do
     [ "$flag" = "--sweep_lam" ] || continue
     grid="${grid%%#*}"                      # strip the trailing '# ...' note
     case "$method" in
         mpc)      extra=(--sweep_H "$MPC_H" --sweep_n_inner "$MPC_NI" --sweep_lr_inner 1e-2) ;;
-        hardflow) extra=(--sweep_H 2 --sweep_n_inner "$HF_NI" --sweep_lr_inner "$HF_LR") ;;
+        hardflow) extra=(--sweep_H 2 --sweep_n_inner "$HF_NI" --sweep_lr_inner "$HF_LR" ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"}) ;;
         fmrg)     extra=(--sweep_n_inner "$FMRG_NOPT") ;;
         *)        continue ;;
     esac
@@ -47,5 +68,5 @@ while read -r method flag grid; do
             --out_dir "$OUT/${method}_seed${seed}" --resume "$@" \
             || echo "[auto_sweep]   $method seed=$seed exited non-zero (rows with run_ok=False are in its summary.csv)"
     done
-done < "$OUT/autorange/grids.txt"
+done <<< "$METHOD_LINES"
 echo "[auto_sweep] done -> $OUT"
