@@ -33,10 +33,15 @@ of the two.
 Runs are grouped by (reward, prompt, edit_prompt, N) first -- comparing across
 those is comparing different problems.
 
+Each diagnostic has its OWN flag (--diag_winrates, --diag_pareto, ...) rather
+than one enum, so adding another is a single row in the DIAGS table below: the
+standalone CLI flag, run_sweep.py's flag and auto_sweep.sh's env var are all
+derived from it.
+
 Usage:
-  python sweep_diagnostics.py --runs results/my_sweep/            # both
-  python sweep_diagnostics.py --runs 'results/auto/*/*/' --what winrates
-  python sweep_diagnostics.py --runs results/x/ --what pareto --out_dir figs/
+  python sweep_diagnostics.py --runs results/my_sweep/ --all
+  python sweep_diagnostics.py --runs 'results/auto/*/*/' --diag_winrates
+  python sweep_diagnostics.py --runs results/x/ --diag_pareto --out_dir figs/
 """
 import argparse
 import csv
@@ -199,9 +204,57 @@ def plot_pareto(runs: List[dict], out_dir: str, dpi: int = 130, log=print) -> Li
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-def run_diagnostics(run_dirs: List[str], what: str = "both", out_dir: Optional[str] = None,
+def _run_winrates(runs: List[dict], out_dir: str, dpi: int, log) -> dict:
+    wr = win_rates(runs)
+    print_win_rates(wr, log=log)
+    p = write_win_rates_csv(wr, os.path.join(out_dir, "winrates.csv"))
+    if p:
+        log(f"    -> {p}")
+    return wr
+
+
+def _run_pareto(runs: List[dict], out_dir: str, dpi: int, log) -> dict:
+    log("\n  PARETO reward vs control energy")
+    return {"figures": plot_pareto(runs, out_dir, dpi=dpi, log=log)}
+
+
+# One entry per diagnostic. Adding another means adding a row HERE and nothing
+# else: the standalone CLI flag, run_sweep.py's flag and auto_sweep.sh's env var
+# are all derived from this table, so they cannot drift apart or be forgotten.
+DIAGS: Dict[str, dict] = {
+    "winrates": dict(
+        fn=_run_winrates,
+        help="For every (lambda, seed) combo in which all three methods ran, which reached the "
+             "lowest objective J = energy/(2*lambda) - r_ctrl, plus MPC vs FMRG / HardFlow / "
+             "both. Writes winrates.csv. REQUIRES a shared lambda grid across the methods -- J "
+             "is only comparable at equal lambda -- otherwise it reports zero combos and why."),
+    "pareto": dict(
+        fn=_run_pareto,
+        help="Reward vs control energy scatter, per-method non-dominated frontiers, globally "
+             "non-dominated points ringed. No shared-lambda requirement."),
+}
+
+
+def add_diag_args(parser, group_title: str = "Diagnostics") -> None:
+    """Register one --diag_<name> flag per entry in DIAGS, on any parser."""
+    g = parser.add_argument_group(group_title)
+    for name, spec in DIAGS.items():
+        g.add_argument(f"--diag_{name}", action="store_true", help=spec["help"])
+
+
+def selected_diags(args) -> List[str]:
+    """Which --diag_* flags are set, in DIAGS order."""
+    return [n for n in DIAGS if getattr(args, f"diag_{n}", False)]
+
+
+def run_diagnostics(run_dirs: List[str], which: List[str], out_dir: Optional[str] = None,
                     dpi: int = 130, log=print) -> dict:
-    """Entry point used both by __main__ and by run_sweep.py's --post_diagnostics."""
+    """Entry point for the CLI, run_sweep.py and auto_sweep.sh alike."""
+    unknown = [w for w in which if w not in DIAGS]
+    if unknown:
+        raise ValueError(f"unknown diagnostic(s) {unknown}; known: {sorted(DIAGS)}")
+    if not which:
+        return {}
     runs = load_sweeps(run_dirs)
     if not runs:
         log("  diagnostics: no run_ok rows of mpc/hardflow/fmrg found.")
@@ -209,18 +262,10 @@ def run_diagnostics(run_dirs: List[str], what: str = "both", out_dir: Optional[s
     out_dir = out_dir or (run_dirs[0] if os.path.isdir(run_dirs[0]) else ".")
     os.makedirs(out_dir, exist_ok=True)
     methods_seen = sorted({r["method"] for r in runs})
-    log(f"\n  diagnostics: {len(runs)} run(s), methods present: {methods_seen}")
+    log(f"\n  diagnostics {which}: {len(runs)} run(s), methods present: {methods_seen}")
     res: dict = {"n_runs": len(runs), "methods": methods_seen}
-    if what in ("winrates", "both"):
-        wr = win_rates(runs)
-        print_win_rates(wr, log=log)
-        p = write_win_rates_csv(wr, os.path.join(out_dir, "winrates.csv"))
-        if p:
-            log(f"    -> {p}")
-        res["winrates"] = wr
-    if what in ("pareto", "both"):
-        log("\n  PARETO reward vs control energy")
-        res["pareto_figs"] = plot_pareto(runs, out_dir, dpi=dpi, log=log)
+    for name in which:
+        res[name] = DIAGS[name]["fn"](runs, out_dir, dpi, log)
     return res
 
 
@@ -229,12 +274,17 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--runs", nargs="+", required=True, metavar="DIR",
                     help="sweep dirs or globs containing summary.csv")
-    ap.add_argument("--what", default="both", choices=["winrates", "pareto", "both"])
+    add_diag_args(ap)
+    ap.add_argument("--all", action="store_true", help="run every diagnostic in DIAGS")
     ap.add_argument("--out_dir", default=None,
-                    help="where winrates.csv and the pareto PNGs go (default: the first --runs dir)")
+                    help="where outputs go (default: the first --runs dir)")
     ap.add_argument("--dpi", type=int, default=130)
     a = ap.parse_args()
-    run_diagnostics(a.runs, what=a.what, out_dir=a.out_dir, dpi=a.dpi)
+    which = list(DIAGS) if a.all else selected_diags(a)
+    if not which:
+        ap.error("pick at least one diagnostic: "
+                 + ", ".join(f"--diag_{n}" for n in DIAGS) + ", or --all")
+    run_diagnostics(a.runs, which, out_dir=a.out_dir, dpi=a.dpi)
 
 
 if __name__ == "__main__":

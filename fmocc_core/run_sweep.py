@@ -4012,16 +4012,16 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                         help="Device for reward model. "
                              "'auto' uses a second GPU if available, else CPU.")
     parser.add_argument("--quiet",     action="store_true")
-    parser.add_argument("--post_diagnostics", default="none",
-                        choices=["none", "winrates", "pareto", "both"],
-                        help="After the sweep, run sweep_diagnostics.py over THIS out_dir. "
-                             "'winrates': for every (lambda, seed) combo in which all three "
-                             "methods ran, which reached the lowest objective, plus MPC vs FMRG "
-                             "/ HardFlow / both. Needs one sweep containing all three methods on "
-                             "a SHARED lambda grid -- the objective is only comparable at equal "
-                             "lambda -- otherwise it reports zero combos and says why. "
-                             "'pareto': reward vs control energy scatter, which has no such "
-                             "requirement. Default none; a failure here never fails the sweep.")
+    # Diagnostics flags come from sweep_diagnostics.DIAGS, so adding a
+    # diagnostic there gives run_sweep.py its --diag_<name> flag for free and
+    # the two cannot drift. Imported inside a try: diagnostics are an optional
+    # convenience, and a missing/broken sweep_diagnostics.py must not stop a
+    # sweep from being launched at all.
+    try:
+        from sweep_diagnostics import add_diag_args as _add_diag_args
+        _add_diag_args(parser, group_title="Post-sweep diagnostics (opt-in, run over --out_dir)")
+    except Exception as _e:
+        print(f"  note: diagnostics flags unavailable ({type(_e).__name__}: {_e})")
     parser.add_argument("--pbar_rewards", action="store_true",
                         help="Compute the reward shown in the MPC progress bar. "
                              "OFF by default (2026-09-16): it costs a no-grad "
@@ -4642,19 +4642,32 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     print(f"\n{n_rows}/{len(configs)} runs completed. Results saved to {out_dir}/")
     print(f"CSV summary: {csv_path}")
 
-    # Post-sweep diagnostics. Wrapped: these are a convenience on top of a sweep
-    # that has already been written to disk, so a bug or a missing matplotlib
-    # here must never turn a completed sweep into a failed one -- the exit code
-    # below still reflects the RUNS, not the analysis.
-    if args.post_diagnostics != "none" and n_rows:
+    # Post-sweep diagnostics. Wrapped on purpose: these are analysis on top of a
+    # sweep that is already written to disk, so a bug here must never turn a
+    # completed sweep into a failed one. The exit code below reflects the RUNS.
+    #
+    # Note this only sees THIS out_dir. A cross-method diagnostic therefore needs
+    # a single invocation that ran every method (one --sweep_control_type with
+    # all three, on a shared lambda grid); auto_sweep.sh, which gives each method
+    # its own out_dir, runs the same diagnostics itself once every method is done.
+    try:
+        from sweep_diagnostics import selected_diags as _selected_diags
+        _which = _selected_diags(args)
+    except Exception:
+        _which = []
+    # `n_rows or _n_existing`, not just n_rows: with --resume on an already
+    # complete sweep nothing new runs, and that is precisely when re-running the
+    # diagnostics over the existing CSV is useful.
+    if _which and (n_rows or _n_existing):
         try:
             from sweep_diagnostics import run_diagnostics
-            print(f"\n{'='*60}\nPOST-SWEEP DIAGNOSTICS ({args.post_diagnostics})")
-            run_diagnostics([str(out_dir)], what=args.post_diagnostics, out_dir=str(out_dir))
+            print(f"\n{'='*60}\nPOST-SWEEP DIAGNOSTICS: {', '.join(_which)}")
+            run_diagnostics([str(out_dir)], _which, out_dir=str(out_dir))
         except Exception as e:
             import traceback; traceback.print_exc()
+            flags = " ".join(f"--diag_{w}" for w in _which)
             print(f"  !! diagnostics failed ({type(e).__name__}: {e}) -- the sweep itself is fine, "
-                  f"re-run them with: python sweep_diagnostics.py --runs {out_dir}")
+                  f"re-run them with: python sweep_diagnostics.py --runs {out_dir} {flags}")
 
     if n_failed or n_not_run:
         sys.exit(1)
