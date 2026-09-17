@@ -11,6 +11,9 @@
 # Environment overrides (all optional):
 #   TARGET_N=10  PROBE_N=4  N_GRID=6  SEEDS="42"  MPC_H=2  MPC_NI=12
 #   HF_NI=40 HF_LR=2.5  FMRG_NOPT=3  AUTORANGE_EXTRA="..."
+#   Per-method knobs take LISTS: MPC_NI="12 24" sweeps MPC at both inner counts
+#   (cartesian with the lambda grid, in the same out_dir). The diagnostics and
+#   compare_methods.py treat each setting as its own config of that method.
 #   SHARED_GRID=1   run every method on ONE grid (the `shared` line of grids.txt)
 #                   so objectives can be compared between methods at the same lam.
 #                   At a shared lam all three solve the same first-order problem
@@ -65,10 +68,13 @@ fi
 while read -r method flag grid; do
     [ "$flag" = "--sweep_lam" ] || continue
     grid="${grid%%#*}"                      # strip the trailing '# ...' note
+    # Unquoted on purpose: each knob may be a space-separated list, and
+    # run_sweep.py's --sweep_* flags take several values.
+    # shellcheck disable=SC2206
     case "$method" in
-        mpc)      extra=(--sweep_H "$MPC_H" --sweep_n_inner "$MPC_NI" --sweep_lr_inner 1e-2) ;;
-        hardflow) extra=(--sweep_H 2 --sweep_n_inner "$HF_NI" --sweep_lr_inner "$HF_LR" ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"}) ;;
-        fmrg)     extra=(--sweep_n_inner "$FMRG_NOPT") ;;
+        mpc)      extra=(--sweep_H $MPC_H --sweep_n_inner $MPC_NI --sweep_lr_inner 1e-2) ;;
+        hardflow) extra=(--sweep_H 2 --sweep_n_inner $HF_NI --sweep_lr_inner $HF_LR ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"}) ;;
+        fmrg)     extra=(--sweep_n_inner $FMRG_NOPT) ;;
         *)        continue ;;
     esac
     for seed in $SEEDS; do

@@ -62,6 +62,69 @@ import matplotlib.pyplot as plt
 METHODS = ["mpc", "hardflow", "fmrg"]
 PRETTY = {"mpc": "MPC", "hardflow": "HardFlow", "fmrg": "FMRG"}
 
+# ═════════════════════════════════════════════════════════════════════════════
+# What a "config" is. A method may be swept at several hyperparameter settings
+# (MPC at n_inner=12 and 24, say). Every tool here must then treat those as
+# distinct arms of the same method, so the identity is defined ONCE, from the
+# CSV columns that describe the method's own knobs -- everything except lambda,
+# seed and the problem fields (reward, prompt, N). Any variation the sweep
+# records therefore becomes its own config without anyone listing it here.
+# ═════════════════════════════════════════════════════════════════════════════
+_COMMON_CFG = ["sample_mode", "lr_dual", "mu_init", "constraint_names"]
+CONFIG_FIELDS = {
+    "mpc": ["H", "n_inner", "lr_inner", "endpoint_surrogate", "drift_detach", "warmstart",
+            "constraint_on", "n_alt", "skip_first_primal_step"] + _COMMON_CFG,
+    "hardflow": ["n_inner", "lr_inner", "hardflow_lr_alpha", "hardflow_endpoint_mode", "hardflow_rho",
+                 "hardflow_rho_mult", "hardflow_dual_every", "hardflow_margin", "hardflow_activation"] + _COMMON_CFG,
+    "fmrg": ["n_inner"] + _COMMON_CFG,
+}
+_SHORT = {"n_inner": "ni", "lr_inner": "lr", "hardflow_lr_alpha": "\u03b1", "endpoint_surrogate": "surr",
+          "drift_detach": "dd", "warmstart": "ws", "constraint_on": "con", "hardflow_endpoint_mode": "ep",
+          "hardflow_rho": "rho", "hardflow_rho_mult": "rhox", "hardflow_dual_every": "dual_k",
+          "hardflow_margin": "margin", "hardflow_activation": "act", "sample_mode": "mode",
+          "skip_first_primal_step": "skip1", "constraint_names": "cons"}
+
+
+def _norm(v) -> str:
+    """CSV cells are strings; '0.01' and '1e-2' must be the same config."""
+    if v is None:
+        return ""
+    v = str(v).strip()
+    try:
+        f = float(v)
+        return repr(int(f)) if f == int(f) and abs(f) < 1e12 else repr(round(f, 12))
+    except ValueError:
+        return v
+
+
+def config_key(run: dict) -> tuple:
+    return tuple((f, _norm(run.get("raw", {}).get(f, ""))) for f in CONFIG_FIELDS[run["method"]])
+
+
+def label_configs(runs: List[dict]) -> Dict[str, List[tuple]]:
+    """Attach run['cfg'] (full identity) and run['cfg_label'] (only the fields
+    that VARY among this method's runs in the pool, so labels stay short: a
+    method with one config gets an empty label, two n_inner settings get
+    'ni=12' / 'ni=24'). Returns {method: [cfg keys present]}."""
+    by_m: Dict[str, List[dict]] = {}
+    for r in runs:
+        r["cfg"] = config_key(r)
+        by_m.setdefault(r["method"], []).append(r)
+    present: Dict[str, List[tuple]] = {}
+    for m, rs in by_m.items():
+        keys = sorted({r["cfg"] for r in rs})
+        present[m] = keys
+        varying = [f for f in CONFIG_FIELDS[m] if len({dict(k)[f] for k in keys}) > 1]
+        for r in rs:
+            d = dict(r["cfg"])
+            r["cfg_label"] = ",".join(f"{_SHORT.get(f, f)}={d[f]}" for f in varying)
+    return present
+
+
+def cfg_name(run: dict) -> str:
+    """'MPC ni=24' or just 'MPC' when the method has a single config."""
+    return PRETTY[run["method"]] + (f" {run['cfg_label']}" if run.get("cfg_label") else "")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Loading
@@ -97,7 +160,8 @@ def load_sweeps(patterns: List[str]) -> List[dict]:
                     edit_prompt=r.get("edit_prompt", ""), N=r.get("N", ""), seed=r.get("seed", ""),
                     img_ctrl=os.path.join(base, f"{tag}__img_ctrl.png") if tag else "",
                     img_unc=os.path.join(base, f"{tag}__img_unc.png") if tag else "",
-                    src=base, tag=tag))
+                    src=base, tag=tag, raw=dict(r)))
+    label_configs(runs)
     return runs
 
 
@@ -117,7 +181,8 @@ def load_autorange(paths: List[str]) -> List[dict]:
                         dr=pt["dr"], E=pt["E"], J=pt["J"], reward=d["reward"], prompt=d["prompt"],
                         edit_prompt=d.get("edit_prompt") or d["prompt"], N=str(d["probe_N"]),
                         seed=str(d["args"]["seed"]), img_ctrl="", img_unc="",
-                        src=os.path.dirname(f), tag=""))
+                        src=os.path.dirname(f), tag="", raw={}))
+    label_configs(runs)
     return runs
 
 
@@ -183,6 +248,51 @@ def select_rows(runs: List[dict], key: str, num_rows: int) -> List[dict]:
     return rows
 
 
+def select_configs(runs: List[dict], log=print) -> List[dict]:
+    """Represent each method by its best config, then compare those.
+
+    When a method was swept at several configs, the figure should show that
+    method at its strongest, not at whichever config happened to match best.
+    Per method: among its (lambda, seed) combos where two or more of its own
+    configs ran, count which config had the lowest objective most often; the
+    most frequent winner represents the method. Ties break on mean J over the
+    shared combos. A method whose configs never share a combo (different lambda
+    grids) falls back to the lowest mean J over all its runs, and says so.
+    A method with one config is trivially represented by it.
+    """
+    keep: List[dict] = []
+    for m in METHODS:
+        rs = [r for r in runs if r["method"] == m]
+        cfgs = sorted({r["cfg"] for r in rs})
+        if len(cfgs) <= 1:
+            keep += rs
+            continue
+        by_combo: Dict[tuple, List[dict]] = {}
+        for r in rs:
+            by_combo.setdefault((r["lam"], r["seed"]), []).append(r)
+        wins = {c: 0 for c in cfgs}; shared = 0; meanJ = {c: [] for c in cfgs}
+        for combo, cand in by_combo.items():
+            if len({r["cfg"] for r in cand}) < 2:
+                continue
+            shared += 1
+            best = min(cand, key=lambda r: r["J"])
+            wins[best["cfg"]] += 1
+            for r in cand:
+                meanJ[r["cfg"]].append(r["J"])
+        if shared:
+            chosen = max(cfgs, key=lambda c: (wins[c], -(sum(meanJ[c]) / len(meanJ[c]) if meanJ[c] else 0.0)))
+            how = f"won {wins[chosen]}/{shared} shared (lambda, seed) combos"
+        else:
+            allJ = {c: [r["J"] for r in rs if r["cfg"] == c] for c in cfgs}
+            chosen = min(cfgs, key=lambda c: sum(allJ[c]) / len(allJ[c]))
+            how = "no combo shared between its configs -- chose the lowest mean J instead"
+        lab = {r["cfg"]: r["cfg_label"] for r in rs}
+        log(f"  {PRETTY[m]:9} {len(cfgs)} configs [{', '.join(lab[c] for c in cfgs)}] -> "
+            f"using {lab[chosen]}  ({how})")
+        keep += [r for r in rs if r["cfg"] == chosen]
+    return keep
+
+
 def group_key(r: dict) -> tuple:
     return (r["reward"], r["prompt"], r["edit_prompt"], r["N"], r["seed"])
 
@@ -206,8 +316,9 @@ def draw(sels: List[dict], gkey: tuple, match: str, out_path: str, dpi: int = 13
                    unc["r_unc"] if unc else picks["mpc"]["r_unc"], None, "")]
         for m in METHODS:
             pk = picks[m]
-            panels.append((PRETTY[m], pk["img_ctrl"], pk["E"], pk["r_ctrl"], pk["lam"],
-                           pk.get("n_inner", "")))
+            extra = ",".join(t for t in pk.get("cfg_label", "").split(",") if t and not t.startswith("ni="))
+            ni = pk.get("n_inner", "") + (f" {extra}" if extra else "")
+            panels.append((PRETTY[m], pk["img_ctrl"], pk["E"], pk["r_ctrl"], pk["lam"], ni))
         for col, (title, img, E, r, lam, ni) in enumerate(panels):
             ax = axes[row][col]
             if img and os.path.isfile(img):
@@ -250,6 +361,11 @@ def main():
                     help="lambda_autorange autorange.json -- metrics only, no images; use with --dry-run")
     ap.add_argument("--match", default="reward", choices=["reward", "energy", "both"],
                     help="reward: closest achieved r_ctrl. energy: closest ctrl_energy.")
+    ap.add_argument("--configs", default="best", choices=["best", "all"],
+                    help="when a method was swept at several configs: 'best' (default) represents it "
+                         "by the config that reached the lowest objective most often across its own "
+                         "(lambda, seed) combos, then matches with that one; 'all' pools every config "
+                         "into the candidate set.")
     ap.add_argument("--num_rows", type=int, default=1, metavar="N",
                     help="how many comparison rows to stack in the figure. Each row reuses none "
                          "of the previous rows' runs: the chosen triple is removed from the pool "
@@ -284,6 +400,9 @@ def main():
         if len(runcs) > 1:
             print(f"  SKIP {gkey}: r_unc disagrees across runs {sorted(runcs)} -- not one problem")
             continue
+        if a.configs == "best" and any(len({r["cfg"] for r in grp if r["method"] == m}) > 1 for m in METHODS):
+            print(f"\n  config selection for {gkey[0]} N={gkey[3]} seed={gkey[4]}:")
+            grp = select_configs(grp)
         for mode in modes:
             key = "r_ctrl" if mode == "reward" else "E"
             sels = select_rows(grp, key, a.num_rows)

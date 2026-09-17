@@ -54,27 +54,35 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from compare_methods import METHODS, PRETTY, load_sweeps, load_autorange  # noqa: E402
+from compare_methods import METHODS, PRETTY, load_sweeps, load_autorange, cfg_name  # noqa: E402
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Win rates
 # ═════════════════════════════════════════════════════════════════════════════
 def combos(runs: List[dict]) -> Dict[tuple, Dict[str, dict]]:
-    """(reward, prompt, edit, N, lam, seed) -> {method: best run at that key}.
+    """(reward, prompt, edit, N, lam, seed) -> {method: that method's BEST run there}.
 
-    If a sweep repeated a (method, lam, seed) -- a re-run, or two out_dirs
-    globbed together -- the BEST (lowest J) is kept, so a duplicate cannot
-    inflate a method's win rate by giving it two chances at the same combo.
+    A method may have several configs at one combo (MPC at n_inner=12 and 24,
+    say). Each method is represented by its lowest-J config at that combo --
+    "best config per method per combo" -- and the chosen config is recorded on
+    the run (`n_cands`, and the row's cfg_<method> column) rather than hidden.
+    That is a max over a method's configs, so a method given more configs gets
+    more draws; print_win_rates says so whenever the candidate counts differ.
     """
     out: Dict[tuple, Dict[str, dict]] = defaultdict(dict)
+    cands: Dict[tuple, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for r in runs:
         if not math.isfinite(r["J"]):
             continue
         key = (r["reward"], r["prompt"], r["edit_prompt"], r["N"], r["lam"], r["seed"])
+        cands[key][r["method"]] += 1
         prev = out[key].get(r["method"])
         if prev is None or r["J"] < prev["J"]:
             out[key][r["method"]] = r
+    for key, bym in out.items():
+        for m, r in bym.items():
+            r["n_cands"] = cands[key][m]
     return out
 
 
@@ -88,8 +96,14 @@ def win_rates(runs: List[dict]) -> dict:
     n = len(full)
     res = dict(n_combos=n, n_partial=partial,
                lowest={m: 0 for m in METHODS},
-               mpc_beats={"fmrg": 0, "hardflow": 0, "both": 0}, rows=[])
+               mpc_beats={"fmrg": 0, "hardflow": 0, "both": 0}, rows=[],
+               # per method: which config represented it, and how often
+               cfg_wins={m: defaultdict(int) for m in METHODS},
+               cands={m: set() for m in METHODS})
     for key, bym in sorted(full.items()):
+        for m in METHODS:
+            res["cfg_wins"][m][cfg_name(bym[m])] += 1
+            res["cands"][m].add(bym[m].get("n_cands", 1))
         best = min(METHODS, key=lambda m: bym[m]["J"])
         res["lowest"][best] += 1
         bf = bym["mpc"]["J"] < bym["fmrg"]["J"]
@@ -100,6 +114,7 @@ def win_rates(runs: List[dict]) -> dict:
         res["rows"].append(dict(
             reward=key[0], prompt=key[1], edit_prompt=key[2], N=key[3], lam=key[4], seed=key[5],
             winner=best, mpc_beats_fmrg=bf, mpc_beats_hardflow=bh, mpc_beats_both=bf and bh,
+            **{f"cfg_{m}": bym[m].get("cfg_label", "") for m in METHODS},
             **{f"J_{m}": bym[m]["J"] for m in METHODS},
             **{f"r_ctrl_{m}": bym[m]["r_ctrl"] for m in METHODS},
             **{f"energy_{m}": bym[m]["E"] for m in METHODS}))
@@ -125,6 +140,19 @@ def print_win_rates(res: dict, log=print) -> None:
     log(f"      MPC beats FMRG      {pct(res['mpc_beats']['fmrg'])}")
     log(f"      MPC beats HardFlow  {pct(res['mpc_beats']['hardflow'])}")
     log(f"      MPC beats both      {pct(res['mpc_beats']['both'])}")
+    # Gate on how many configs a method HAD, not on how many of them ever won:
+    # one config sweeping every combo is precisely when the unequal-draws note
+    # below is worth reading.
+    nc = {m: max(res["cands"][m]) for m in METHODS}
+    multi = {m: w for m, w in res["cfg_wins"].items() if nc[m] > 1}
+    if multi:
+        log("    best config per method per combo (a method with several configs is its lowest-J one at each combo)")
+        for m, w in multi.items():
+            log(f"      {PRETTY[m]:9} " + ", ".join(f"{k.split(' ', 1)[1] if ' ' in k else k}: {v}/{n}"
+                                                 for k, v in sorted(w.items(), key=lambda kv: -kv[1])))
+        if len(set(nc.values())) > 1:
+            log(f"      NOTE: candidate configs per combo differ -- {', '.join(f'{PRETTY[m]} {c}' for m, c in nc.items())}. "
+                f"Best-of is a max over a method's configs, so a method with more configs gets more draws.")
 
 
 def write_win_rates_csv(res: dict, path: str) -> Optional[str]:
@@ -151,6 +179,21 @@ def pareto_front(points: List[dict]) -> List[dict]:
     return sorted(front, key=lambda p: p["E"])
 
 
+def _shades(base_hex: str, k: int) -> List[str]:
+    """k shades of one hue, base colour first then progressively lighter (toward
+    white), so several configs of one method stay visibly one method while the
+    three methods keep their distinct hues."""
+    from matplotlib.colors import to_rgb, to_hex
+    r, g, b = to_rgb(base_hex)
+    if k <= 1:
+        return [base_hex]
+    out = []
+    for i in range(k):
+        t = 0.5 * i / (k - 1)                       # 0 = base, up to 50% toward white
+        out.append(to_hex((r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t)))
+    return out
+
+
 def plot_pareto(runs: List[dict], out_dir: str, dpi: int = 130, log=print) -> List[str]:
     import matplotlib
     matplotlib.use("Agg")
@@ -167,16 +210,20 @@ def plot_pareto(runs: List[dict], out_dir: str, dpi: int = 130, log=print) -> Li
         fig, ax = plt.subplots(figsize=(7.2, 5.2))
         glob_front = {id(p) for p in pareto_front(grp)}
         for m in METHODS:
-            pts = [p for p in grp if p["method"] == m]
-            if not pts:
+            mruns = [p for p in grp if p["method"] == m]
+            if not mruns:
                 continue
-            ax.scatter([p["E"] for p in pts], [p["r_ctrl"] for p in pts], s=46, marker=MK[m],
-                       facecolor=COL[m], edgecolor="white", linewidth=.8, zorder=3,
-                       label=f"{PRETTY[m]} ({len(pts)})")
-            f = pareto_front(pts)
-            if len(f) > 1:
-                ax.plot([p["E"] for p in f], [p["r_ctrl"] for p in f], "-",
-                        color=COL[m], lw=1.6, alpha=.55, zorder=2)
+            cfgs = sorted({p["cfg"] for p in mruns})
+            shades = _shades(COL[m], len(cfgs))
+            for cfg, col in zip(cfgs, shades):
+                pts = [p for p in mruns if p["cfg"] == cfg]
+                ax.scatter([p["E"] for p in pts], [p["r_ctrl"] for p in pts], s=46, marker=MK[m],
+                           facecolor=col, edgecolor="white", linewidth=.8, zorder=3,
+                           label=f"{cfg_name(pts[0])} ({len(pts)})")
+                f = pareto_front(pts)
+                if len(f) > 1:
+                    ax.plot([p["E"] for p in f], [p["r_ctrl"] for p in f], "-",
+                            color=col, lw=1.6, alpha=.6, zorder=2)
         gf = [p for p in grp if id(p) in glob_front]
         if gf:
             ax.scatter([p["E"] for p in gf], [p["r_ctrl"] for p in gf], s=190,
@@ -189,10 +236,10 @@ def plot_pareto(runs: List[dict], out_dir: str, dpi: int = 130, log=print) -> Li
         ax.set_xscale("log")
         ax.set_xlabel(r"control energy  $\Sigma\|u\|^2\Delta t$   (lower is better)")
         ax.set_ylabel("achieved reward  $r_{ctrl}$   (higher is better)")
-        ax.set_title(f'{reward}   ·   "{prompt}" → "{edit}"   ·   N={N}\n'
+        ax.set_title(f'{reward}   \u00b7   "{prompt}" \u2192 "{edit}"   \u00b7   N={N}\n'
                      "up and to the left is better", fontsize=10.5)
         ax.grid(alpha=.25, lw=.6)
-        ax.legend(fontsize=8.5, loc="lower right")
+        ax.legend(fontsize=8, loc="lower right")
         fig.tight_layout()
         p = "".join(c if c.isalnum() else "_" for c in f"{prompt}__{edit}")[:48]
         path = os.path.join(out_dir, f"pareto__{reward}__{p}__N{N}.png")
