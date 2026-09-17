@@ -19,6 +19,13 @@
 #   HF_ALPHA=0.5    lift HardFlow's lr*reg >= 1 floor (lr = HF_ALPHA/reg below it,
 #                   passed to both the range finder and the hardflow sweep).
 #                   Without it HardFlow cannot reach the shared grid's low end.
+#   DIAGNOSTICS=both  after ALL methods have run, compare them across every
+#                   out_dir at once: none | winrates | pareto | both.
+#                   Run here rather than per-sweep because each method writes its
+#                   own out_dir, so no single run_sweep.py invocation ever sees
+#                   all three -- the cross-method comparison only exists at the
+#                   end. winrates additionally needs SHARED_GRID=1, since the
+#                   objective is only comparable at equal lambda.
 #
 # The card is pinned with CUDA_VISIBLE_DEVICES and both --*_device are cuda:0
 # in-process (never pass cuda:1 to run_sweep.py: ImageReward misbehaves there).
@@ -27,6 +34,7 @@ GPU="$1"; REWARD="$2"; PROMPT="$3"; EDIT="$4"; shift 4
 TARGET_N="${TARGET_N:-10}"; PROBE_N="${PROBE_N:-4}"; N_GRID="${N_GRID:-6}"; SEEDS="${SEEDS:-42}"
 MPC_H="${MPC_H:-2}"; MPC_NI="${MPC_NI:-12}"; HF_NI="${HF_NI:-40}"; HF_LR="${HF_LR:-2.5}"; FMRG_NOPT="${FMRG_NOPT:-3}"
 SHARED_GRID="${SHARED_GRID:-0}"; HF_ALPHA="${HF_ALPHA:-}"
+DIAGNOSTICS="${DIAGNOSTICS:-none}"
 HF_ALPHA_ARGS=(); [ -n "$HF_ALPHA" ] && HF_ALPHA_ARGS=(--hardflow_lr_alpha "$HF_ALPHA")
 cd "$(dirname "$0")" || exit 3
 SLUG="$(printf '%s__%s' "$PROMPT" "$EDIT" | tr -c 'A-Za-z0-9' '_' | cut -c1-60)"
@@ -69,4 +77,14 @@ while read -r method flag grid; do
             || echo "[auto_sweep]   $method seed=$seed exited non-zero (rows with run_ok=False are in its summary.csv)"
     done
 done <<< "$METHOD_LINES"
+if [ "$DIAGNOSTICS" != "none" ]; then
+    echo "[auto_sweep] diagnostics ($DIAGNOSTICS) across every method's out_dir"
+    if [ "$DIAGNOSTICS" != "pareto" ] && [ "$SHARED_GRID" != "1" ]; then
+        echo "[auto_sweep]   NOTE: SHARED_GRID=1 is not set, so the methods ran on per-method"
+        echo "[auto_sweep]   lambda grids and no (lambda, seed) combo will contain all three."
+        echo "[auto_sweep]   Win rates will report zero combos; the pareto plot is unaffected."
+    fi
+    python sweep_diagnostics.py --runs "$OUT"/*_seed*/ --what "$DIAGNOSTICS" --out_dir "$OUT/diagnostics" \
+        || echo "[auto_sweep]   diagnostics failed; the sweeps themselves are complete"
+fi
 echo "[auto_sweep] done -> $OUT"

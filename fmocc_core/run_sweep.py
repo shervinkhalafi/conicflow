@@ -4012,6 +4012,16 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                         help="Device for reward model. "
                              "'auto' uses a second GPU if available, else CPU.")
     parser.add_argument("--quiet",     action="store_true")
+    parser.add_argument("--post_diagnostics", default="none",
+                        choices=["none", "winrates", "pareto", "both"],
+                        help="After the sweep, run sweep_diagnostics.py over THIS out_dir. "
+                             "'winrates': for every (lambda, seed) combo in which all three "
+                             "methods ran, which reached the lowest objective, plus MPC vs FMRG "
+                             "/ HardFlow / both. Needs one sweep containing all three methods on "
+                             "a SHARED lambda grid -- the objective is only comparable at equal "
+                             "lambda -- otherwise it reports zero combos and says why. "
+                             "'pareto': reward vs control energy scatter, which has no such "
+                             "requirement. Default none; a failure here never fails the sweep.")
     parser.add_argument("--pbar_rewards", action="store_true",
                         help="Compute the reward shown in the MPC progress bar. "
                              "OFF by default (2026-09-16): it costs a no-grad "
@@ -4631,6 +4641,20 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
               f"stopped early. Re-launch with --resume to finish them.")
     print(f"\n{n_rows}/{len(configs)} runs completed. Results saved to {out_dir}/")
     print(f"CSV summary: {csv_path}")
+
+    # Post-sweep diagnostics. Wrapped: these are a convenience on top of a sweep
+    # that has already been written to disk, so a bug or a missing matplotlib
+    # here must never turn a completed sweep into a failed one -- the exit code
+    # below still reflects the RUNS, not the analysis.
+    if args.post_diagnostics != "none" and n_rows:
+        try:
+            from sweep_diagnostics import run_diagnostics
+            print(f"\n{'='*60}\nPOST-SWEEP DIAGNOSTICS ({args.post_diagnostics})")
+            run_diagnostics([str(out_dir)], what=args.post_diagnostics, out_dir=str(out_dir))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"  !! diagnostics failed ({type(e).__name__}: {e}) -- the sweep itself is fine, "
+                  f"re-run them with: python sweep_diagnostics.py --runs {out_dir}")
 
     if n_failed or n_not_run:
         sys.exit(1)
