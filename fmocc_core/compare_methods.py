@@ -73,7 +73,8 @@ PRETTY = {"mpc": "MPC", "hardflow": "HardFlow", "fmrg": "FMRG"}
 _COMMON_CFG = ["sample_mode", "lr_dual", "mu_init", "constraint_names"]
 CONFIG_FIELDS = {
     "mpc": ["H", "n_inner", "lr_inner", "endpoint_surrogate", "drift_detach", "warmstart",
-            "constraint_on", "n_alt", "skip_first_primal_step"] + _COMMON_CFG,
+            "constraint_on", "n_alt", "skip_first_primal_step",
+            "dual_adaptive"] + _COMMON_CFG,
     "hardflow": ["n_inner", "lr_inner", "hardflow_lr_alpha", "hardflow_endpoint_mode", "hardflow_rho",
                  "hardflow_rho_mult", "hardflow_dual_every", "hardflow_margin", "hardflow_activation"] + _COMMON_CFG,
     "fmrg": ["n_inner"] + _COMMON_CFG,
@@ -82,7 +83,8 @@ _SHORT = {"n_inner": "ni", "lr_inner": "lr", "hardflow_lr_alpha": "\u03b1", "end
           "drift_detach": "dd", "warmstart": "ws", "constraint_on": "con", "hardflow_endpoint_mode": "ep",
           "hardflow_rho": "rho", "hardflow_rho_mult": "rhox", "hardflow_dual_every": "dual_k",
           "hardflow_margin": "margin", "hardflow_activation": "act", "sample_mode": "mode",
-          "skip_first_primal_step": "skip1", "constraint_names": "cons"}
+          "skip_first_primal_step": "skip1", "constraint_names": "cons",
+          "dual_adaptive": "adapt"}
 
 
 def _norm(v) -> str:
