@@ -4552,6 +4552,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                     "n_inner": cfg.n_inner, "lr_inner": cfg.lr_inner, "sample_mode": cfg.sample_mode,
                     "warmstart": cfg.warmstart, "n_alt": cfg.n_alt,
                     "skip_first_primal_step": cfg.skip_first_primal_step,
+                    "dual_adaptive": cfg.dual_adaptive,
                     "drift_detach": cfg.drift_detach,
                     "constraint_on": cfg.constraint_on,
                     "n_constraints": len(cfg.constraint_prompts),
