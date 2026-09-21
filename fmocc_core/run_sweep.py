@@ -567,6 +567,11 @@ class RunConfig:
     constraint_specs: List["ConstraintSpec"] = field(default_factory=list)
     lr_dual:  float = 0.0   # dual-ascent step size (0 = frozen multipliers)
     mu_init:  float = 0.0   # initial value for all Lagrange multipliers
+    # MPC only. Normalize the dual step (and the Lagrangian's constraint term)
+    # per constraint by a running RMS scale, so constraints whose typical
+    # violation is small are not starved of dual pressure under a shared
+    # lr_dual. See receding_horizon_flow_control's dual_adaptive docstring.
+    dual_adaptive: bool = False
     # boffi_fmrg only -- passed through to FluxFlowMapSampler.sample_reward_guided
     # (upstream's vendored FMRG-J implementation). Left at upstream's "off" defaults
     # so the paired comparison is a minimal single-particle run, not upstream's full
@@ -1730,6 +1735,8 @@ def _validate_dual_options_cfg(cfg, n_constraints: int) -> None:
         dual_opts_set.append(f"n_alt={cfg.n_alt}")
     if cfg.skip_first_primal_step:
         dual_opts_set.append("skip_first_primal_step=True")
+    if cfg.dual_adaptive:
+        dual_opts_set.append("dual_adaptive=True")
     if not dual_opts_set:
         return
 
@@ -2482,6 +2489,7 @@ def _run_one(
                 warmstart=cfg.warmstart,
                 n_alt=cfg.n_alt,
                 skip_first_primal_step=cfg.skip_first_primal_step,
+                dual_adaptive=cfg.dual_adaptive,
                 drift_detach=cfg.drift_detach,
                 h=h_fn,
                 mu_init=cfg.mu_init,
@@ -3005,6 +3013,7 @@ def _run_one(
         warmstart     = cfg.warmstart,
         n_alt         = cfg.n_alt,
         skip_first_primal_step = cfg.skip_first_primal_step,
+        dual_adaptive = cfg.dual_adaptive,
         drift_detach  = cfg.drift_detach,
         constraint_on = cfg.constraint_on,
         endpoint_surrogate = cfg.endpoint_surrogate,
@@ -3563,6 +3572,10 @@ CSV_KEYS = [
     # "how many of last night's failures were contention?" a one-line query.
     # `error_msg` is the truncated, newline-stripped message.
     "error_type", "error_msg",
+    # dual_adaptive (2026-09-20) is APPENDED, not inserted: --resume appends
+    # rows under the header already on disk, so inserting a column mid-list
+    # silently shifts every column after it in the appended rows.
+    "dual_adaptive",
 ]
 
 
@@ -3586,6 +3599,7 @@ _RESUME_KEY_FIELDS = [
     "hardflow_margin", "hardflow_activation", "hardflow_reg",
     "hardflow_endpoint_mode", "hardflow_lr_alpha",
     "seed", "lr_dual", "mu_init", "lpips_net",
+    "dual_adaptive",
 ]
 
 # Sweep axes that do NOT round-trip through the CSV. If a resumed sweep varies
@@ -3657,10 +3671,19 @@ def _resume_key_from_cfg(cfg, reward_model: str) -> tuple:
     return tuple(parts)
 
 
+# Fields added to _RESUME_KEY_FIELDS after rows were already written: a CSV
+# predating the column has no value for it, so reading it as "" would never
+# match a config carrying the field's default. Map missing -> the default.
+_RESUME_FIELD_DEFAULTS = {"dual_adaptive": False}
+
+
 def _resume_key_from_row(row: dict) -> tuple:
     parts = [("reward", _resume_norm(row.get("reward", "")))]
     for f in _RESUME_KEY_FIELDS:
-        parts.append((f, _resume_norm(row.get(f, ""))))
+        raw = row.get(f, None)
+        if raw is None or raw == "":
+            raw = _RESUME_FIELD_DEFAULTS.get(f, "")
+        parts.append((f, _resume_norm(raw)))
     parts.append(("constraint_names", str(row.get("constraint_names", "")).strip()))
     for i in range(MAX_CONSTRAINTS):
         parts.append((f"thr_{i}", _resume_norm(row.get(f"thr_{i}", ""))))
@@ -3772,6 +3795,8 @@ def _build_configs_from_args(args) -> List[RunConfig]:
         # load-bearing for tools that recover a missing CSV column from a
         # directory name by index.
         "endpoint_surrogate",
+        # dual_adaptive (2026-09-20) APPENDED for the same reason.
+        "dual_adaptive",
     ]
     for f in sweep_fields:
         val = getattr(args, f"sweep_{f}", None)
@@ -4123,6 +4148,16 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "behavior. >1 requires constraints active (h + lr_dual>0) "
                              "-- see receding_horizon_flow_control's n_alt docstring "
                              "in image_mpc_edited_sung.py.")
+    parser.add_argument("--sweep_dual_adaptive", nargs="+",
+                        type=lambda x: x.lower() != "false", metavar="BOOL",
+                        help="MPC only. Normalize the projected dual step per "
+                             "constraint by a running RMS scale, and use the same "
+                             "normalized constraint in the Lagrangian. Equalizes "
+                             "dual pressure across constraints whose typical "
+                             "violation magnitudes differ, and makes the objective "
+                             "invariant to rescaling any h_c. Requires constraints "
+                             "active (h + lr_dual>0), same as the other dual "
+                             "options. Default False = plain dual ascent.")
     parser.add_argument("--sweep_skip_first_primal_step", nargs="+",
                         type=lambda x: x.lower() != "false", metavar="BOOL",
                         help="MPC only. Plan Step 7 option (b): one dual-ascent "
@@ -4517,6 +4552,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                     "n_inner": cfg.n_inner, "lr_inner": cfg.lr_inner, "sample_mode": cfg.sample_mode,
                     "warmstart": cfg.warmstart, "n_alt": cfg.n_alt,
                     "skip_first_primal_step": cfg.skip_first_primal_step,
+                    "dual_adaptive": cfg.dual_adaptive,
                     "drift_detach": cfg.drift_detach,
                     "constraint_on": cfg.constraint_on,
                     "n_constraints": len(cfg.constraint_prompts),
