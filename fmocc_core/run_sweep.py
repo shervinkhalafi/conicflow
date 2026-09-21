@@ -567,6 +567,15 @@ class RunConfig:
     constraint_specs: List["ConstraintSpec"] = field(default_factory=list)
     lr_dual:  float = 0.0   # dual-ascent step size (0 = frozen multipliers)
     mu_init:  float = 0.0   # initial value for all Lagrange multipliers
+    # Adaptive (RMSProp-normalised) dual ascent -- Shervin's lowdim heuristic,
+    # ported to the image path 2026-09-21. Normalises each constraint by a
+    # running sqrt(EMA of h_c^2) so two constraints whose violations live on
+    # different scales get comparable dual pressure; without it the larger-|h|
+    # one dominates and the other is effectively ignored. Same feasible set
+    # either way (s_c > 0), so this changes the dual geometry, not the problem.
+    # mpc only -- hardflow's dual is a separate mechanism and is untouched.
+    dual_adaptive: bool = False
+    dual_beta:     float = 0.9   # EMA decay for the second-moment estimate
     # boffi_fmrg only -- passed through to FluxFlowMapSampler.sample_reward_guided
     # (upstream's vendored FMRG-J implementation). Left at upstream's "off" defaults
     # so the paired comparison is a minimal single-particle run, not upstream's full
@@ -1773,6 +1782,47 @@ def _validate_dual_options_cfg(cfg, n_constraints: int) -> None:
         )
 
 
+def _validate_dual_adaptive(cfg: "RunConfig", n_constraints: int) -> None:
+    """dual_adaptive's domain checks, hoisted so they fire before FLUX loads.
+
+    Added 2026-09-21 with the port. The in-function guards in
+    receding_horizon_flow_control say the same thing, but they only fire after
+    the sampler is built -- a wasted model load per bad config in a sweep.
+    """
+    if not cfg.dual_adaptive:
+        return
+    if cfg.control_type != "mpc":
+        raise ValueError(
+            f"--dual_adaptive is mpc-only, got control_type="
+            f"{cfg.control_type!r}. hardflow reaches feasibility by projection "
+            f"with its own separate multiplier recursion, which this does not "
+            f"touch; silently accepting the flag there would stamp "
+            f"dual_adaptive=True on a row where it had no effect."
+        )
+    if not (n_constraints > 0 and cfg.lr_dual > 0.0):
+        raise ValueError(
+            f"--dual_adaptive requested but the dual update is not active "
+            f"(n_constraints={n_constraints}, lr_dual={cfg.lr_dual}). The "
+            f"option only rescales the dual step, so with no dual step it is "
+            f"a silent no-op -- and the row would still be stamped "
+            f"dual_adaptive=True, making it indistinguishable from a real one."
+        )
+    if not (0.0 < cfg.dual_beta < 1.0):
+        raise ValueError(
+            f"--dual_beta must lie in (0, 1), got {cfg.dual_beta}. The bias "
+            f"correction divides by (1 - dual_beta**t)."
+        )
+    if n_constraints < 2:
+        # Not an error: Shervin's point is that the heuristic is *meaningful*
+        # only with several constraints, not that one constraint breaks it.
+        print(
+            f"  NOTE: --dual_adaptive with n_constraints={n_constraints}. The "
+            f"normaliser is well-defined but does nothing useful -- with a "
+            f"single constraint there is no cross-constraint scale mismatch "
+            f"to correct, and h/s <= 0 drives the same trajectory as h <= 0."
+        )
+
+
 def run_preflight(
     cfg: RunConfig,
     *,
@@ -1810,6 +1860,9 @@ def run_preflight(
         guards that also live inside receding_horizon_flow_control, so a bad
         Step 5/7 sweep fails before the FLUX load rather than minutes into
         each config; see that function's docstring for why both exist)
+      - _validate_dual_adaptive (dual_adaptive / dual_beta: MPC-only, no-op
+        without an active dual update, beta in (0,1); same early-failure
+        rationale as the line above. Added 2026-09-21 with the port.)
 
     Opt-in, via an explicit parameter rather than an implicit omission at the
     call site (per instruction: "if some check genuinely doesn't apply... make
@@ -1829,6 +1882,7 @@ def run_preflight(
     _assert_locked_defaults(cfg, log=log)
     n_constraints = _validate_constraint_cfg(cfg)
     _validate_dual_options_cfg(cfg, n_constraints)
+    _validate_dual_adaptive(cfg, n_constraints)
     if check_boffi_rng:
         _assert_boffi_rng_reachability_closed(cfg, latent)
     # Deliberately NOT routed through `log`: every sweep launcher passes
@@ -2376,7 +2430,9 @@ def _run_one(
         log(f"  constraint: {n_constraints} constraint(s)  "
             f"{[(s.reward_type, s.arg, s.direction, s.threshold, s.normalize) for s in _constraint_specs]}  "
             f"lr_dual={cfg.lr_dual}  mu_init={cfg.mu_init}  "
-            f"constraint_on={cfg.constraint_on}")
+            f"dual_adaptive={cfg.dual_adaptive}"
+            + (f" (beta={cfg.dual_beta})" if cfg.dual_adaptive else "")
+            + f"  constraint_on={cfg.constraint_on}")
 
     def eval_r(z):
         with torch.no_grad():
@@ -2486,6 +2542,8 @@ def _run_one(
                 h=h_fn,
                 mu_init=cfg.mu_init,
                 lr_dual=cfg.lr_dual,
+                dual_adaptive=cfg.dual_adaptive,
+                dual_beta=cfg.dual_beta,
                 constraint_on=cfg.constraint_on,
                 endpoint_map=endpoint_map,
                 verbose=not quiet,
@@ -3018,6 +3076,8 @@ def _run_one(
         constraint_names = ",".join(_constraint_names(cfg)),
         lr_dual       = cfg.lr_dual,
         mu_init       = cfg.mu_init,
+        dual_adaptive = cfg.dual_adaptive,
+        dual_beta     = cfg.dual_beta if cfg.dual_adaptive else "",
         **constraint_cells,
         boffi_use_adam = cfg.boffi_use_adam,
         hardflow_rho          = cfg.hardflow_rho,
@@ -3532,6 +3592,10 @@ CSV_KEYS = [
     # so an absent measurement is distinguishable from a real zero.
     "peak_alloc_flux_gb", "peak_reserved_flux_gb", "peak_alloc_reward_gb",
     "n_constraints", "constraint_names", "lr_dual", "mu_init",
+    # Stamped on every row so a plain-MPC row and an adaptive-dual row are never
+    # confused after the fact -- mu_i is in NORMALISED units when this is True,
+    # while h_i / viol_i stay raw. Added 2026-09-21 with the port.
+    "dual_adaptive", "dual_beta",
     *[f"thr_{i}"  for i in range(MAX_CONSTRAINTS)],
     *[f"h_{i}"    for i in range(MAX_CONSTRAINTS)],
     *[f"mu_{i}"   for i in range(MAX_CONSTRAINTS)],
@@ -4225,6 +4289,21 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     parser.add_argument("--mu_init", type=float, default=0.0,
                         help="Initial value for all Lagrange multipliers (default 0.0). "
                              "See --lr_dual for the both-zero guard.")
+    parser.add_argument("--dual_adaptive", action="store_true",
+                        help="mpc only. RMSProp-normalise the dual ascent: divide each "
+                             "constraint by a running sqrt(EMA of h_c^2) before the mu "
+                             "step AND inside the Lagrangian. With several constraints "
+                             "on different scales this stops the largest-|h| one from "
+                             "monopolising the dual pressure while the others are "
+                             "ignored. Same feasible set (the scale is positive), so it "
+                             "changes the dual geometry, not the problem. Requires "
+                             "constraints and --lr_dual > 0 -- raises otherwise, since a "
+                             "row flagged adaptive that was in fact plain would be "
+                             "indistinguishable afterwards. Ported from Shervin's "
+                             "lowdim/controllers.py, where it helped materially.")
+    parser.add_argument("--dual_beta", type=float, default=0.9,
+                        help="EMA decay for --dual_adaptive's second-moment estimate "
+                             "(default 0.9, matching lowdim). Must lie in (0, 1).")
     parser.add_argument("--sweep_boffi_use_adam", nargs="+", type=lambda x: x.lower() != "false",
                         metavar="BOOL",
                         help="boffi_fmrg only. True (default) = upstream's Adam branch "
@@ -4339,6 +4418,8 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
             cfg.constraint_thresholds = []
         cfg.lr_dual = args.lr_dual
         cfg.mu_init = args.mu_init
+        cfg.dual_adaptive = args.dual_adaptive
+        cfg.dual_beta = args.dual_beta
         cfg.hardflow_lr_alpha = args.hardflow_lr_alpha
         # 2026-09-16: hardflow_reg now derives from N and lam unless supplied.
         # Done HERE because this loop is the one place both config sources --
@@ -4522,6 +4603,8 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                     "n_constraints": len(cfg.constraint_prompts),
                     "constraint_names": ",".join(_constraint_names(cfg)),
                     "lr_dual": cfg.lr_dual, "mu_init": cfg.mu_init,
+                    "dual_adaptive": cfg.dual_adaptive,
+                    "dual_beta": cfg.dual_beta if cfg.dual_adaptive else "",
                     # thr_i is known even on a failed run; h_i / mu_i are not and
                     # stay "" -- never 0 or NaN, which would read as measured.
                     **{f"thr_{i}": (cfg.constraint_thresholds[i]

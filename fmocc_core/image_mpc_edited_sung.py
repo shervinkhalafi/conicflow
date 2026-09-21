@@ -215,6 +215,7 @@ def _horizon_objective(
     t_horizon: Optional[torch.Tensor],
     v_cur: Optional[torch.Tensor] = None,
     drift_detach: bool = False,
+    h_scale: Optional[torch.Tensor] = None,   # (C,) per-constraint normaliser
 ) -> torch.Tensor:
     """Lagrangian path-space objective, summed over the batch (scalar).
 
@@ -230,6 +231,12 @@ def _horizon_objective(
                       locally constant.  Drops the J_v^T term from the gradient
                       (an approximation) but removes every transformer backward
                       pass, leaving only the reward path to differentiate.
+        h_scale:      (C,) positive per-constraint normaliser.  When given, the
+                      Lagrangian uses h_c / s_c in place of h_c.  Ported
+                      2026-09-21 (sungcho) from lowdim/controllers.py's
+                      dual_adaptive, which is Shervin's implementation -- see
+                      receding_horizon_flow_control's dual_adaptive docstring
+                      for why this leaves the feasible set unchanged.
     """
     H = x_traj.shape[0]
     x_full = torch.cat([x_cur.unsqueeze(0), x_traj], dim=0)  # (H+1, B, *)
@@ -290,6 +297,14 @@ def _horizon_objective(
         hx = h(z_h)
         if hx.dim() == 1:
             hx = hx.unsqueeze(-1)
+        if h_scale is not None:
+            # Work with the normalised constraint h_c / s_c throughout, so the
+            # whole Lagrangian -- and hence the trajectory -- is invariant to a
+            # per-constraint rescaling h_c -> k_c * h_c. Matches the lowdim
+            # reference exactly: it MUST be applied here as well as in the dual
+            # step, not only in the dual step, or mu is measured in one set of
+            # units and spent in another.
+            hx = hx / h_scale
         obj = obj + (mu.detach() * hx).sum(dim=-1)
 
     return obj.sum()
@@ -320,6 +335,7 @@ def solve_horizon_problem(
     outer_step: Optional[int] = None,
     outer_total: Optional[int] = None,
     low_memory: bool = True,
+    h_scale: Optional[torch.Tensor] = None,
 ):
     """Solve the finite-horizon path-space problem.
 
@@ -362,7 +378,7 @@ def solve_horizon_problem(
         t0_idx=t0_idx, dt=dt, lam=lam, mu=mu, t_grid=t_grid,
         constraint_on=constraint_on, endpoint_map=endpoint_map,
         t_horizon=t_horizon,
-        v_cur=v_cur, drift_detach=drift_detach,
+        v_cur=v_cur, drift_detach=drift_detach, h_scale=h_scale,
     )
 
     if optimizer.lower() == "lbfgs":
@@ -427,6 +443,9 @@ def receding_horizon_flow_control(
     constraint_on: str = "horizon",
     endpoint_map: Optional[Callable] = None,
     lr_dual: float = 0.0,
+    dual_adaptive: bool = False,
+    dual_beta: float = 0.9,
+    dual_eps: float = 1e-8,
     n_alt: int = 1,
     skip_first_primal_step: bool = False,
     optimizer: str = "lbfgs",
@@ -458,6 +477,40 @@ def receding_horizon_flow_control(
         endpoint_map:  Callable(t_batch, x) -> (B, *).  Required when
                        constraint_on="endpoint".
         lr_dual:       projected dual-ascent step size (>= 0).
+        dual_adaptive: RMSProp-normalise the projected dual-ascent step and the
+                       Lagrangian's constraint term by a running per-constraint
+                       scale s_c. Ported 2026-09-21 (sungcho) from
+                       lowdim/controllers.py, where it is Shervin's own
+                       implementation and where it helped materially; this is a
+                       transcription to the image path, NOT an independent
+                       design. Kept bit-for-bit faithful to the lowdim version
+                       (same EMA, same bias correction, same eps placement) so
+                       that a disagreement between the two settings is a fact
+                       about dimension, not about two different heuristics.
+
+                       WHY. With C constraints whose violations live on very
+                       different scales, plain dual ascent
+                       mu <- max(0, mu + lr_dual * h) moves every multiplier by
+                       the same lr_dual. The large-|h| constraint's mu climbs
+                       fast and dominates the primal; the small-|h| one's mu
+                       barely moves, so that constraint is effectively ignored
+                       and its violation never comes down. Replacing h_c by
+                       h_c / s_c puts the violations on a common scale before
+                       the step.
+
+                       WHY IT IS LEGITIMATE. s_c > 0, so {h_c <= 0} and
+                       {h_c / s_c <= 0} are the SAME feasible set -- the
+                       problem is unchanged, only the dual geometry is. What
+                       is reported in summary.csv (h_i, viol_i) stays in raw,
+                       unnormalised units; only mu_i is in normalised units, so
+                       mu is no longer comparable across dual_adaptive on/off.
+
+                       Default False, which reproduces the previous behaviour
+                       exactly: _h_scale() returns None, the objective takes
+                       the h_scale=None branch, and _dual_update falls through
+                       to the original one-liner.
+        dual_beta:     EMA decay for the dual second-moment estimate.
+        dual_eps:      numerical floor in the normalised dual step.
         n_alt:         number of primal-solve <-> dual-update alternations
                        PER FIXED WINDOW, before the window shifts (plan Step
                        5). Added in this derived copy; NOT present in
@@ -578,6 +631,21 @@ def receding_horizon_flow_control(
             f"no active dual step there is nothing for it to do. Not a "
             f"case to silently allow."
         )
+    if dual_adaptive and not (h is not None and lr_dual > 0.0):
+        raise ValueError(
+            f"dual_adaptive=True requires both h is not None and lr_dual > 0.0 "
+            f"(got h={'set' if h is not None else None}, lr_dual={lr_dual}). "
+            f"The option only rescales the projected dual-ascent step; with no "
+            f"active dual step it silently does nothing, and a run flagged "
+            f"'adaptive' in the CSV that was in fact plain would be "
+            f"indistinguishable after the fact. Not a case to silently allow."
+        )
+    if dual_adaptive and not (0.0 < dual_beta < 1.0):
+        raise ValueError(
+            f"dual_beta must lie in (0, 1), got {dual_beta}. The bias "
+            f"correction divides by (1 - dual_beta**t), which is 0 at "
+            f"dual_beta=1 and makes the EMA degenerate at 0."
+        )
     if device is None:
         device = x0.device
     x0 = x0.to(device)
@@ -598,6 +666,37 @@ def receding_horizon_flow_control(
         mu_t = torch.full(
             (x0.shape[0], C), float(mu_init), dtype=x0.dtype, device=device
         )
+
+    # Running per-constraint scale s_c for dual_adaptive (ported from
+    # lowdim/controllers.py 2026-09-21). The objective and the dual step both
+    # use h_c / s_c, so the whole Lagrangian -- and hence the trajectory -- is
+    # invariant to h_c -> k_c * h_c.
+    _dual_state = {"v": None, "t": 0}
+
+    def _h_scale() -> Optional[torch.Tensor]:
+        """Current (C,) normaliser, or None before the first observation."""
+        if not dual_adaptive or _dual_state["v"] is None:
+            return None
+        v_hat = _dual_state["v"] / (1.0 - dual_beta ** _dual_state["t"])
+        return v_hat.sqrt() + dual_eps
+
+    def _dual_update(mu: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
+        """Projected dual ascent, on the scale-normalised constraint if enabled.
+
+        dual_adaptive=False returns exactly the expression this function
+        replaced, so the default path is unchanged.
+        """
+        if not dual_adaptive:
+            return (mu + lr_dual * hx).clamp_min(0.0)
+        # Update the per-constraint scale from this step's observations first,
+        # so the very first update is already normalised rather than taking one
+        # full unnormalised step before the EMA exists.
+        v_obs = hx.pow(2).mean(dim=0)                     # (C,)
+        if _dual_state["v"] is None:
+            _dual_state["v"] = torch.zeros_like(v_obs)
+        _dual_state["t"] += 1
+        _dual_state["v"] = dual_beta * _dual_state["v"] + (1.0 - dual_beta) * v_obs
+        return (mu + lr_dual * hx / _h_scale()).clamp_min(0.0)
 
     # Plan Step 7, option (b): one projected dual-ascent update BEFORE the
     # outer loop starts, using h at the UNCONTROLLED rollout's predicted
@@ -622,7 +721,7 @@ def receding_horizon_flow_control(
             hx0 = h(z0_h)
             if hx0.dim() == 1:
                 hx0 = hx0.unsqueeze(-1)
-            mu_t = (mu_t + lr_dual * hx0).clamp_min(0.0)
+            mu_t = _dual_update(mu_t, hx0)
         del x_bar_0, xH_uncontrolled, z0_h, hx0
 
     prev_window = None   # previous window's optimized states (warmstart only)
@@ -664,7 +763,7 @@ def receding_horizon_flow_control(
                 x_init=x_init_j, return_full=need_full,
                 drift_detach=drift_detach, v_cur=v_j,
                 pbar=pbar, pbar_rewards=pbar_rewards, outer_step=j + 1, outer_total=N,
-                low_memory=low_memory,
+                low_memory=low_memory, h_scale=_h_scale(),
             )
             if need_full:
                 x1_star, xH_star, x_full_j = solved
@@ -715,8 +814,12 @@ def receding_horizon_flow_control(
                             )
                     h_prev_for_assert = hx.clone()
 
-                    mu_t = (mu_t + lr_dual * hx).clamp_min(0.0)
+                    mu_t = _dual_update(mu_t, hx)
                     # The EXACT h the dual consumed at this outer step. Recorded
+                    # in RAW units even under dual_adaptive -- h_i/viol_i in
+                    # summary.csv stay directly comparable across the three
+                    # arms, which is the whole point of the comparison. Only
+                    # mu_i changes units.
                     # because run_sweep.py otherwise has to reconstruct it from
                     # the realized state, which is a DIFFERENT quantity: the dual
                     # reads h at the optimizer's horizon endpoint (H_j steps
