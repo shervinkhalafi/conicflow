@@ -210,6 +210,12 @@ touch a GPU.
 | `sweep_diagnostics.py` | **win rates** — per (λ, seed) combo, which method reached the lowest objective, plus MPC-beats-FMRG/HardFlow/both — and a **Pareto** reward-vs-energy scatter with per-method frontiers and the globally non-dominated points ringed. One flag per diagnostic (`--diag_winrates`, `--diag_pareto`, `--all`), derived from a registry so a new diagnostic needs no change in its callers. |
 | `compare_methods.py` | figures of four images in a row — uncontrolled, MPC, HardFlow, FMRG — at a **matched operating point**: `--match reward` holds achieved reward as equal as the grid allows and lets energy differ, `--match energy` does the reverse, `both` writes both. Each panel carries its λ and config; energy and reward go underneath. `--num_rows N` removes the runs already used and repeats the match, so one figure can show several operating points. |
 
+`compare_constrained.py` is the opposite shape: it *runs* the comparison rather
+than reading one, so it needs a GPU. Given a prompt, edit prompt, λ and
+constraint threshold it runs MPC and HardFlow in turn and writes an
+uncontrolled | MPC | HardFlow figure with each panel's score, feasibility,
+energy and wall clock. See **[COMPARE_CONSTRAINED.md](COMPARE_CONSTRAINED.md)**.
+
 The same `--diag_*` flags are accepted by `run_sweep.py` (run after the sweep)
 and by `auto_sweep.sh` via `DIAG=` (run once all three methods are done, since
 each writes its own `out_dir` and no single `run_sweep.py` invocation ever sees
