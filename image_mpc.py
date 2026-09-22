@@ -670,7 +670,9 @@ def make_flux_wrappers(
     guidance_scale: float = 3.5,
     n_mpc_steps: int = 4,
     sample_mode: str = "flow_map2",
-    endpoint_surrogate: str = "rollout",
+    # Default flipped rollout -> jump 2026-09-22; see the "jump" branch in
+    # endpoint_map below for the measurement and for what it costs.
+    endpoint_surrogate: str = "jump",
 ):
     """Build (v_theta, r, endpoint_map) callables for use with receding_horizon_flow_control.
 
@@ -794,9 +796,17 @@ def make_flux_wrappers(
         # Measured 2026-09-16 at N=8, H=4, n_inner=6, ImageReward, seed 42:
         # -33% wall clock (232 s -> 156 s), objective J better at lam=1
         # (-0.933 vs -0.823 +- 0.051, i.e. 2.2 sd) and inside the run-to-run
-        # noise floor at lam=10 and lam=100.  Not yet re-checked at N=10, which
-        # is why the default stays "rollout" -- switching it reproduces none of
-        # the results currently on disk.
+        # noise floor at lam=10 and lam=100.  Still not re-checked at N=10.
+        #
+        # This became the DEFAULT on 2026-09-22.  It reproduces none of the
+        # results written before that date, which is the price: those rows ran
+        # "rollout", so wall clock and the optimiser's objective are not
+        # comparable across the change.  The endpoint_surrogate CSV column
+        # records which one every row used -- check it before pooling.  The
+        # reason for flipping is that the default was already split:
+        # lambda_autorange.py and compare_constrained.py defaulted to "jump"
+        # while run_sweep.py defaulted to "rollout", so auto_sweep.sh derived
+        # its lambda grids under one surrogate and swept under the other.
         if endpoint_surrogate == "jump":
             z_run = z if grad else z.detach().clone()
             ctx = torch.enable_grad() if grad else torch.no_grad()

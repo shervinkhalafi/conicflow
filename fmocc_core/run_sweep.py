@@ -535,14 +535,24 @@ class RunConfig:
     #     carries.
     drift_detach: bool  = True
     # How endpoint_map predicts the terminal latent inside the inner objective.
-    # "rollout" (default) integrates the remaining N-j-H steps, which is what
-    # makes MPC quadratic in N. "jump" takes ONE flow-map call with t_next=0 --
-    # the surrogate only; the applied trajectory is unchanged. Measured
-    # 2026-09-16 at N=8/H=4: -33% wall clock, J better at lam=1 (2.2 sd) and
-    # within noise at lam=10/100. Default stays "rollout" because it has not
-    # been re-checked at the suite's N=10 and because switching it reproduces
-    # none of the results currently on disk. See image_mpc.make_flux_wrappers.
-    endpoint_surrogate: str = "rollout"
+    # "rollout" integrates the remaining N-j-H steps, which is what makes MPC
+    # quadratic in N. "jump" takes ONE flow-map call with t_next=0 -- the
+    # surrogate only; the applied trajectory is unchanged. Measured 2026-09-16
+    # at N=8/H=4: -33% wall clock, J better at lam=1 (2.2 sd) and within noise
+    # at lam=10/100. See image_mpc.make_flux_wrappers.
+    #
+    # DEFAULT FLIPPED to "jump" 2026-09-22. It had been "rollout" on the
+    # grounds that jump was unverified at the suite's N=10 and that switching
+    # reproduces none of the results on disk. Both still hold, and the second
+    # one is the cost of this change: rows written before 2026-09-22 used
+    # "rollout" and are NOT comparable on wall clock or on the optimiser's
+    # objective -- check the endpoint_surrogate CSV column before pooling
+    # across that date. What tipped it is that the default was already
+    # inconsistent: lambda_autorange.py and compare_constrained.py both
+    # defaulted to "jump", so auto_sweep.sh derived every lambda grid under
+    # jump and then swept under rollout. One surrogate for both is worth more
+    # than continuity with a mixed-surrogate past.
+    endpoint_surrogate: str = "jump"
     constraint_on: str  = "endpoint"  # MPC only; "horizon" evaluates reward and
                                       # constraint at raw x_H, "endpoint" at the
                                       # flow-map-predicted terminal latent.
@@ -4118,16 +4128,20 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                         choices=["rollout", "jump"], metavar="MODE",
                         help="mpc only. How endpoint_map predicts the terminal "
                              "latent INSIDE the inner objective. 'rollout' "
-                             "(default) integrates the remaining N-j-H steps -- "
-                             "this is the n_inner*N(N-1)/2 term that makes MPC "
-                             "quadratic in N. 'jump' takes one flow-map call "
-                             "with t_next=0 instead, making it linear. Only the "
-                             "surrogate the optimizer differentiates changes; "
-                             "the applied trajectory and everything scored from "
-                             "it are unaffected. Measured at N=8/H=4: -33%% wall "
+                             "integrates the remaining N-j-H steps -- this is "
+                             "the n_inner*N(N-1)/2 term that makes MPC "
+                             "quadratic in N. 'jump' (DEFAULT since 2026-09-22) "
+                             "takes one flow-map call with t_next=0 instead, "
+                             "making it linear. Only the surrogate the "
+                             "optimizer differentiates changes; the applied "
+                             "trajectory and everything scored from it are "
+                             "unaffected. Measured at N=8/H=4: -33%% wall "
                              "clock, objective better at lam=1 and within the "
-                             "noise floor at lam=10/100. Not yet re-checked at "
-                             "N=10, hence opt-in.")
+                             "noise floor at lam=10/100. Still not re-checked "
+                             "at N=10. Rows written before 2026-09-22 used "
+                             "'rollout' -- check the endpoint_surrogate CSV "
+                             "column before comparing wall clock or objective "
+                             "across that date.")
     parser.add_argument("--sweep_hardflow_endpoint_mode", nargs="+",
                         choices=["flow_map1", "flow_matching", "mpc_rollout"],
                         metavar="MODE",
