@@ -373,6 +373,15 @@ def main():
                          "of the previous rows' runs: the chosen triple is removed from the pool "
                          "and the match is repeated. Stops early if the remaining runs no longer "
                          "cover all three methods.")
+    ap.add_argument("--min_dr", type=float, default=None, metavar="X",
+                    help="drop runs whose reward gain over uncontrolled (r_ctrl - r_unc) is "
+                         "below X before matching. select_rows takes the TIGHTEST match first, "
+                         "and the tightest matches sit at the low-lambda end where no method has "
+                         "moved the image yet -- so the default figure fills up with rows that "
+                         "are visually identical to the uncontrolled column. Pruning the dead "
+                         "zone first makes the rows land where the methods actually separate. "
+                         "Purely a selection filter: nothing is recomputed and every run stays "
+                         "in summary.csv.")
     ap.add_argument("--out_dir", default=".")
     ap.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run",
                     help="print the chosen triples, draw nothing")
@@ -405,6 +414,20 @@ def main():
         if a.configs == "best" and any(len({r["cfg"] for r in grp if r["method"] == m}) > 1 for m in METHODS):
             print(f"\n  config selection for {gkey[0]} N={gkey[3]} seed={gkey[4]}:")
             grp = select_configs(grp)
+        # Applied after config selection so a method is still represented by its
+        # best config, and per group so the threshold is read against this
+        # cell's own r_unc. Loud if it empties a method out: a silently
+        # three-method-short group would look identical to a failed sweep.
+        if a.min_dr is not None:
+            kept = [r for r in grp if r["r_ctrl"] - r["r_unc"] >= a.min_dr]
+            left = {r["method"] for r in kept}
+            if len(left) < len(METHODS):
+                print(f"  SKIP {gkey}: --min_dr {a.min_dr} leaves only {sorted(left)} "
+                      f"(of {len(grp)} runs, {len(kept)} pass)")
+                continue
+            print(f"  --min_dr {a.min_dr}: {len(kept)}/{len(grp)} runs kept for {gkey[0]} "
+                  f"seed={gkey[4]}")
+            grp = kept
         for mode in modes:
             key = "r_ctrl" if mode == "reward" else "E"
             sels = select_rows(grp, key, a.num_rows)
