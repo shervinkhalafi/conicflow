@@ -10,6 +10,8 @@
 #
 # Environment overrides (all optional):
 #   TARGET_N=10  PROBE_N=4  N_GRID=6  SEEDS="42"  MPC_H=2  MPC_NI=12
+#   AUTO_ROOT=results/auto        root of the output tree (see below)
+#   REDO_AUTORANGE=1              re-probe even if grids.txt already exists
 #   HF_NI=40 HF_LR=2.5  FMRG_NOPT=3  AUTORANGE_EXTRA="..."
 #   Per-method knobs take LISTS: MPC_NI="12 24" sweeps MPC at both inner counts
 #   (cartesian with the lambda grid, in the same out_dir). The diagnostics and
@@ -44,15 +46,32 @@ DIAG="${DIAG:-}"
 HF_ALPHA_ARGS=(); [ -n "$HF_ALPHA" ] && HF_ALPHA_ARGS=(--hardflow_lr_alpha "$HF_ALPHA")
 cd "$(dirname "$0")" || exit 3
 SLUG="$(printf '%s__%s' "$PROMPT" "$EDIT" | tr -c 'A-Za-z0-9' '_' | cut -c1-60)"
-OUT="results/auto/$REWARD/$SLUG"; mkdir -p "$OUT"
+# AUTO_ROOT (2026-09-22) so a sweep can be kept in its own tree instead of
+# landing in results/auto/ with everything else. paper_figures.py already takes
+# the root as a parameter (collect_paper_figures(auto=...)), so a sibling tree
+# with the same <reward>/<slug>/<method>_seed<N>/ layout is read by every
+# downstream tool without further change. Default is unchanged.
+OUT="${AUTO_ROOT:-results/auto}/$REWARD/$SLUG"; mkdir -p "$OUT"
 export CUDA_VISIBLE_DEVICES="$GPU"
 
+# Reuse an existing grids.txt (2026-09-22). Range finding costs ~14 min and
+# depends only on (reward, prompt, edit_prompt) -- never on the seed. The loop
+# below is method-outer/seed-inner, so a run killed partway leaves some seeds
+# with MPC but no HardFlow, which is exactly the comparison the cell exists to
+# make. Calling this script once per seed instead makes every cutoff land on a
+# seed boundary, but that re-ran range finding per seed. Caching it makes the
+# per-seed call cheap, so the safe ordering is also the affordable one.
+# REDO_AUTORANGE=1 forces a fresh probe.
+if [ -s "$OUT/autorange/grids.txt" ] && [ "${REDO_AUTORANGE:-0}" != "1" ]; then
+    echo "[auto_sweep] step 1/2: reusing cached grid ($OUT/autorange/grids.txt)"
+else
 echo "[auto_sweep] step 1/2: lambda range finding ($REWARD, proxy N=$PROBE_N -> target N=$TARGET_N)"
 python lambda_autorange.py --reward "$REWARD" --prompt "$PROMPT" --edit_prompt "$EDIT" \
     --methods mpc hardflow fmrg --probe_N "$PROBE_N" --target_N "$TARGET_N" --n_grid "$N_GRID" \
     --flux_device cuda:0 --reward_device cuda:0 --out_dir "$OUT/autorange" ${AUTORANGE_EXTRA:-} \
     ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"} \
     || { echo "[auto_sweep] range finding FAILED"; exit 1; }
+fi
 
 echo "[auto_sweep] step 2/2: sweeps at N=$TARGET_N (SHARED_GRID=$SHARED_GRID)"
 if [ "$SHARED_GRID" = "1" ]; then
