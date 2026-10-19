@@ -3,7 +3,7 @@
 **Shervin Khalafi\*, Kasra Fallah\*, Sung Cho, Dongsheng Ding, James Anderson, Alejandro Ribeiro**
 <sub>\* equal contribution</sub>
 
-[[Paper]](https://arxiv.org/abs/XXXX.XXXXX) <!-- TODO: arXiv ID -->
+[[Paper]](https://arxiv.org/abs/2610.14307)
 
 ConicFlow steers a pretrained flow matching model at inference time by solving
 an optimal control problem: stay close to the pretrained trajectory, increase a
@@ -141,6 +141,9 @@ an `uncontrolled | ConicFlow | HardFlow` comparison figure.
 
 ## Reproducing the paper
 
+Figure and table numbers below refer to
+[arXiv:2610.14307v1](https://arxiv.org/abs/2610.14307v1).
+
 Every experiment has a launcher that runs the paper's exact configurations on
 the frozen λ grids in `image/data/grids/`, and analysis scripts that turn the
 results into the paper's tables and figures. Launchers take the GPU index as
@@ -150,14 +153,17 @@ stopped, and accept `--dry_run` to print their commands.
 | Paper | Run | Cost | Analysis (`image/analysis/`) |
 |---|---|---|---|
 | Fig. 1 (two moons) | [`lowdim/reproduce_fig1.sh`](lowdim/README.md) | CPU, ~3 h (or seconds, from the shipped sweep CSVs) | `lowdim/make_fig1.py` |
-| Table 1, Fig. 2 (left), appendix frontiers, appendix rows u05–u10 | [`image/scripts/unconstrained/run_table1.sh`](image/scripts/unconstrained/README.md) | ~26 GPU-h | `table1_breakdown.py`, `fig2_pareto.py`, `fig2_image_rows.py` |
-| Fig. 2 (right) rows 2–3, appendix rows u01–u04 | [`image/scripts/ablation/run_ablation.sh`](image/scripts/ablation/README.md) `--arms core --tags "ed1 ed2 ed3 ed4" --seeds "317 1289"` | ~5 GPU-h | `fig2_image_rows.py` |
-| Fig. 3, appendix constrained grids | [`image/scripts/constrained/run_suite.sh`](image/scripts/constrained/README.md) (`suite`, then `triple`) | ~12 GPU-h | `../src/plot_constrained_suite.py`, `constrained_image_rows.py`, `constrained_appendix_grids.py` |
-| Appendix ablations: horizon, matched wall clock, evaluation point | [`image/scripts/ablation/run_ablation.sh`](image/scripts/ablation/README.md) | ~130 GPU-h in total | `abl_figs.py` |
+| Table 1, Fig. 2 (left), Fig. 4, Table 6 (per-problem breakdown), Fig. 5 rows u05–u10 | [`image/scripts/unconstrained/run_table1.sh`](image/scripts/unconstrained/README.md) | ~26 GPU-h | `table1_breakdown.py`, `fig2_pareto.py`, `fig2_image_rows.py` |
+| Fig. 2 (right) rows 2–3, Fig. 5 rows u01–u04 | [`image/scripts/ablation/run_ablation.sh`](image/scripts/ablation/README.md) `--arms core --tags "ed1 ed2 ed3 ed4" --seeds "317 1289"` (also part of `--preset arxiv_v1`) | ~5 GPU-h | `fig2_image_rows.py` |
+| Fig. 3, Figs. 6–8 | [`image/scripts/constrained/run_suite.sh`](image/scripts/constrained/README.md) (`suite`, then `triple`) | ~12 GPU-h | `../src/plot_constrained_suite.py`, `constrained_image_rows.py`, `constrained_appendix_grids.py` |
+| Appendix D, Tables 7–9: planning horizon, matched wall clock, evaluation point | [`image/scripts/ablation/run_ablation.sh`](image/scripts/ablation/README.md) `--preset arxiv_v1` | ~20 GPU-h | `abl_tables_arxiv_v1.py` |
 
 GPU-hours are on one RTX A5000 per process, model loads included. The README
 in each directory gives the design, the exact settings, and partial-run options
-(e.g. one reward, one horizon, or a subset of seeds).
+(e.g. one reward, one horizon, or a subset of seeds). `image/scripts/ablation/`
+also contains an extended version of the ablations (8 edits × 4–6 seeds,
+~130 GPU-h, `abl_figs.py`), prepared for a later revision of the paper; it is
+not part of arXiv v1.
 
 ```bash
 cd lowdim
@@ -168,22 +174,23 @@ cd ../image/scripts
 bash unconstrained/run_table1.sh 0           # Table 1 / Fig. 2 (left)
 bash constrained/run_suite.sh 1              # Fig. 3 (8 instances x 2 seeds x 5 thresholds)
 bash constrained/run_suite.sh 1 triple       # the three-constraint instance
-bash ablation/run_ablation.sh 0              # appendix ablations (or --arms core for Fig. 2 right)
+bash ablation/run_ablation.sh 0 --preset arxiv_v1   # Appendix D (includes Fig. 2 right rows 2-3)
 
 cd ../analysis
 python table1_breakdown.py
 python fig2_pareto.py
 python fig2_image_rows.py
+python ../src/plot_constrained_suite.py --root ../src/results/constrained_suite \
+    --paper_style --out ../figures/con_main_plot.png
 python constrained_image_rows.py
 python constrained_appendix_grids.py
-python abl_figs.py --out figs/ablation
+python abl_tables_arxiv_v1.py
 ```
 
 **What to expect.** The analysis scripts were checked against the paper's own
 runs. On that data they reproduce Table 1, the per-problem breakdown, Figure 3's
-medians and feasibility counts, and the ablation tables, with one exception:
-four bootstrap-interval endpoints in the ablation tables differ by 0.01
-because of cell ordering. The image figures come out byte-identical to the
+medians and feasibility counts, and every number in Tables 7–9 except one
+wall-clock time (123 s against the paper's 124 s). The image figures come out byte-identical to the
 originals, and so do Figure 1's two frontier panels when drawn from the
 shipped CSVs. A fresh run reproduces the results
 statistically rather than digit for digit:
@@ -263,7 +270,7 @@ CSV row. The evaluation-point ablation is the only experiment that does this.
 @article{khalafi2026conicflow,
   title   = {ConicFlow: Constrained Inference-time Optimal Control for Flow Matching Models},
   author  = {Khalafi, Shervin and Fallah, Kasra and Cho, Sung and Ding, Dongsheng and Anderson, James and Ribeiro, Alejandro},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  journal = {arXiv preprint arXiv:2610.14307},
   year    = {2026}
 }
 ```
