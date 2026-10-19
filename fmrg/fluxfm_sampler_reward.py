@@ -1,6 +1,9 @@
 """
 FLUX FlowMap sampler for reward-guided generation.
 
+MODIFIED from github.com/jrrhuang/fmrg (upstream be485ba) for ConicFlow; the
+changes are listed in fmrg/MODIFICATIONS.md.
+
 Uses the reward ensemble: HPSv2 + ImageReward + PickScore + CLIP.
 """
 
@@ -349,17 +352,15 @@ class FluxFlowMapSampler:
             gc.collect()
 
         if self.quantize_mode in ("int8", "int4"):
-            # 2026-09-05 (sungcho): this used to be a bulk
+            # Local change (see MODIFICATIONS.md): this used to be a bulk
             # `transformer.to(device)` followed by `_quantize_transformer()`.
             # That put the FULL bf16 transformer (11.90 B params ~= 23.8 GB) on
             # the card before compressing it to 12.26 GB, for a MEASURED
             # transient peak of 24.21 GB on a 24,564 MiB A5000 -- 4 GB ABOVE the
-            # peak of the MPC run that follows. So the binding memory
+            # peak of the controlled run that follows. So the binding memory
             # requirement for a whole sweep was set by model LOAD, not by the
-            # run, and any co-tenant holding ~1 GB killed us during `.to(cuda)`
-            # -- before run_sweep.py's try/except or even its summary.csv
-            # existed, leaving an empty results dir that every aggregator
-            # silently skips. See results/20260904_224351_lpr2c.log:55.
+            # run, and any co-tenant holding ~1 GB killed the process during
+            # `.to(cuda)`, before the sweep driver had written anything.
             #
             # Streaming caps the in-flight bf16 chunk at one transformer block
             # (340 M params ~= 0.68 GB), so the peak becomes
@@ -369,7 +370,7 @@ class FluxFlowMapSampler:
             # weight-only quantization is per-tensor/per-channel and purely
             # local, so quantizing block A before block B has been moved cannot
             # change block A's weights. Verified against a stored uncontrolled
-            # trajectory (see 260905-memory-optimization.md).
+            # trajectory over all 4268 quantized tensors.
             self._stream_move_and_quantize()
         else:
             print("Moving transformer to GPU...")
@@ -399,7 +400,7 @@ class FluxFlowMapSampler:
     def _stream_move_and_quantize(self):
         """Move the transformer to GPU one block at a time, quantizing as we go.
 
-        Added 2026-09-05 (sungcho) to remove the 24.21 GB load-time transient --
+        Local change (see MODIFICATIONS.md) that removes the 24.21 GB load-time transient --
         see the comment at the call site in _load_model for the full rationale.
 
         Peak GPU memory is "everything quantized so far + the single largest

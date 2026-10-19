@@ -1,4 +1,6 @@
 #!/bin/bash
+# MODIFIED from github.com/jrrhuang/fmrg (upstream be485ba): installs into an
+# existing conda env instead of creating fmrg_env. See fmrg/MODIFICATIONS.md.
 set -e
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}" )" &> /dev/null && pwd )"
