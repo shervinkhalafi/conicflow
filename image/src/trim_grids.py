@@ -11,10 +11,10 @@ Writes the original to ``grids_raw.txt`` and the trimmed grid to ``grids.txt``
 WHY THIS EXISTS (2026-09-23)
 ---------------------------
 ``--high_stop break`` walks lambda up until the IMAGE breaks or the reward
-collapses.  MPC does neither: it is the energy-regularised arm, so its curve
+collapses.  ConicFlow does neither: it is the energy-regularised arm, so its curve
 goes *flat* rather than destructive, and the walk runs to the lambda box.  On
 the first real GPU run of break mode (pickscore / "A Japanese garden at dawn",
-seed 811, probe N=4) MPC measured
+seed 811, probe N=4) ConicFlow measured
 
     lam   7.98  16    79.8  252   6300  1.3e5  3.5e5  2.5e6
     dr    8.99  9.05  9.57  9.52  9.25  9.01   10.58  9.25
@@ -22,18 +22,18 @@ seed 811, probe N=4) MPC measured
 -- flat from lam~8 to 2.5e6 -- and the logistic fit, having no upper anchor,
 reported the active region as [0.8, 2.52e6].  The emitted grid was
 
-    mpc --sweep_lam 0.8 16 320 6300 130000 350000 940000 2.5e+06
+    conicflow --sweep_lam 0.8 16 320 6300 130000 350000 940000 2.5e+06
 
-i.e. five of eight points re-measuring one plateau point, at 239 s per MPC run.
-That is ~20 of the ~41 MPC minutes per cell, on every cell where MPC does not
+i.e. five of eight points re-measuring one plateau point, at 239 s per ConicFlow run.
+That is ~20 of the ~41 ConicFlow minutes per cell, on every cell where ConicFlow does not
 break.  ``docs/lambda_autorange.md`` SS11.4 named this as the one thing a live
 run would tell us that the dry runs could not; this is the answer.
 
 WHAT IT DOES NOT DO
 -------------------
 It does not restore the ``near_ceiling`` stop.  That stop capped on a *constant*
--- ``REWARD_OBSERVED_RANGE``'s pickscore max of 27.0, which MPC exceeds -- and
-capping on it is what hid the 5.6x of MPC headroom that
+-- ``REWARD_OBSERVED_RANGE``'s pickscore max of 27.0, which ConicFlow exceeds -- and
+capping on it is what hid the 5.6x of ConicFlow headroom that
 ``results/lam_headroom_20260923`` found on the greenhouse cell (grid top lam=1,
 true peak lam=320, delta_r 3.77 -> 21.12).  This trims on the measured curve
 only, so a cell whose curve is still climbing at the top of its grid is left
@@ -62,9 +62,9 @@ Per method, over its ok-and-unbroken probe points sorted by lambda:
    and every point lands where the curve is moving.
 
 The ``shared`` line is trimmed at the largest per-method ``lam_top``, since it
-has to span every method's active region.  (Tonight's enhancement cells run
-SHARED_GRID=0 and do not read it; editing cells reuse grids cached on 09-22 and
-are not re-range-found, so this path is for completeness.)
+has to span every method's active region.  (It is only written on a FRESH
+probe; a cached grids.txt was already trimmed when it was written, and the
+ablations re-use Experiment 1's cached grids rather than re-range-finding.)
 """
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ import re
 import statistics as st
 import sys
 
-METHODS = ("mpc", "hardflow", "fmrg")
+METHODS = ("conicflow", "hardflow", "fmrg")
 
 
 def _f(x):

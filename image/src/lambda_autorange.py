@@ -5,12 +5,12 @@ given (reward, prompt, edit_prompt), so a big unattended sweep does not need
 its lambda range hand-tuned for every reward/prompt combination.
 
 WHY THIS EXISTS (2026-09-16). `lam` means a different thing in each method --
-a Lagrange weight the optimiser solves against (MPC), the same quantity via
+a Lagrange weight the optimiser solves against (ConicFlow), the same quantity via
 reg = N/(2*lam) (HardFlow), and an open-loop gain on the reward gradient
 (FMRG) -- and its useful range also moves with the reward's scale (switching
 LPIPS -> ImageReward de-regularises by ~200x at fixed lam). A fixed grid such
 as {0.1 .. 10000} therefore spends most of its points where nothing happens:
-for ImageReward, MPC is already 79% saturated at lam=1 and fully saturated by
+for ImageReward, ConicFlow is already 79% saturated at lam=1 and fully saturated by
 lam=10, so 6 of the 8 suite points are on the ceiling.
 
 WHAT IT DOES. For each method it measures the response curve delta_r(lam) --
@@ -36,7 +36,7 @@ energy keeps climbing past it. `--high_stop break` instead walks up until the
 IMAGE breaks (pixel-side statistics against the uncontrolled sample, see the
 PERMISSIVE HIGH END block), records the plateau onset as `lam_knee` on the way
 past, and extends the grid above it. Use it when the sweep wants the aggressive
-end of the frontier; measured on pickscore, MPC at lam=280 gives delta_r=13.0 on
+end of the frontier; measured on pickscore, ConicFlow at lam=280 gives delta_r=13.0 on
 a clean image while the default grid for that cell topped out at lam=21.
 
 It runs in ONE process -- FLUX loads once, the reward model loads once per
@@ -44,14 +44,14 @@ It runs in ONE process -- FLUX loads once, the reward model loads once per
 guard in that path (locked defaults, plausibility ranges, non-finite checks)
 still applies. Range-finding uses a cheap proxy N (default 4); the recommended
 grid is for the sweep you then run at --target_N. The transition in lam is
-approximately N-invariant for MPC (lam is per-step normalised via dt) but
+approximately N-invariant for ConicFlow (lam is per-step normalised via dt) but
 HardFlow's admissible floor lam >= N*lr/2 is not, so the floor is reported for
 the target N, not the proxy.
 
 Usage:
   python lambda_autorange.py --reward imagereward \\
       --prompt "a portrait of a man" --edit_prompt "a smiling face" \\
-      --methods mpc hardflow fmrg --probe_N 4 --target_N 10 --n_grid 6 \\
+      --methods conicflow hardflow fmrg --probe_N 4 --target_N 10 --n_grid 6 \\
       --flux_device cuda:0 --reward_device cuda:0 --out_dir results/autorange/imagereward
 
 Outputs in --out_dir: autorange.json (everything, machine-readable),
@@ -79,8 +79,8 @@ LAM_ABS_MIN, LAM_ABS_MAX = 1e-4, 1e7    # search never leaves this (log-)box
 SPIKE_DECADES = 3.0                     # energy spike threshold; see mark_suspects
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PERMISSIVE HIGH END (2026-09-23, Shervin's request: "I want lambda to keep
-# increasing until the images break -- I want less conservative edits").
+# PERMISSIVE HIGH END (2026-09-23): keep lambda increasing until the images
+# break, so as to reach less conservative edits.
 #
 # The default ("plateau") behaviour stops the upward walk as soon as the reward
 # curve flattens, and then places the grid at 8-92% of the fitted rise. Both
@@ -88,13 +88,13 @@ SPIKE_DECADES = 3.0                     # energy spike threshold; see mark_suspe
 #
 #   * 24 of the 51 method-searches on disk stopped on `near_ceiling`, i.e.
 #     against REWARD_OBSERVED_RANGE, whose pickscore entry (18.0, 27.0) is
-#     labelled "MEASURED but WEAK: n=4 only" in reward_ranges.py. MPC on
+#     labelled "MEASURED but WEAK: n=4 only" in reward_ranges.py. ConicFlow on
 #     pickscore/"a portrait of a man" reaches r_ctrl ~= 32.8 at lam=280, so that
 #     ceiling is simply too low and the stop fires while the curve is climbing.
 #   * The 92% quantile caps placement well below the bracketed region: on that
-#     same cell the emitted MPC grid topped out at lam=21 (delta_r ~3.8) while
+#     same cell the emitted ConicFlow grid topped out at lam=21 (delta_r ~3.8) while
 #     the active region ran to 279 and lam=280 measured delta_r=13.0 with a
-#     clean image (results/auto/pickscore/.../mpc_seed42, lam0.95..280).
+#     clean image (results/auto/pickscore/.../conicflow_seed42, lam0.95..280).
 #
 # In "break" mode the plateau tests become recorded MARKERS (lam_knee) instead
 # of stops, and the walk continues until the IMAGE breaks or the reward
@@ -106,7 +106,7 @@ SPIKE_DECADES = 3.0                     # energy spike threshold; see mark_suspe
 # (pickscore, "a portrait of a man" -> "a smiling face", seed 42, N=8) where the
 # FMRG arm is visibly clean at lam=130 and visibly destroyed at lam=280:
 #
-#   metric                       mpc 280  hf 280  fmrg 130  fmrg 280  threshold
+#   metric                       conicflow 280  hf 280  fmrg 130  fmrg 280  threshold
 #   clipped-pixel excess vs unc     0.000   0.000     0.038     0.206      0.10
 #   total-variation ratio            1.12    1.11      1.35      1.52      1.45
 #   pixel-std ratio                  1.03    1.00      1.50      1.95      1.80
@@ -192,16 +192,16 @@ def scale_prior(method: str, pr: dict, dr_max: float, N: int) -> float:
 
     lam0 = c * dr_max / ||grad_z r||.  Rationale: the reward has to be moved by
     dr_max, and the gradient norm at the uncontrolled endpoint sets how much
-    latent displacement that costs; every method's lambda multiplies (MPC/HF via
+    latent displacement that costs; every method's lambda multiplies (ConicFlow/HF via
     the energy trade-off J = E/(2 lam) - r, FMRG as a gain on grad r) a
     displacement that is linear in lam to first order. A 1/||grad r||^2 law was
     tried first and was 3 decades low on ImageReward (||grad r|| ~ 12); the
-    measured knees -- MPC ~0.3 on ImageReward (||grad r|| 12.3, dr_max 3.3) and
+    measured knees -- ConicFlow ~0.3 on ImageReward (||grad r|| 12.3, dr_max 3.3) and
     ~30 on CLIP (0.19, 0.65) -- sit within a decade of the 1/||grad r|| form
-    with c ~ 1, which is what is used. FMRG's knee was ~2x MPC's on both.
+    with c ~ 1, which is what is used. FMRG's knee was ~2x ConicFlow's on both.
     """
     g = max(pr["grad_norm"], 1e-12)
-    c = {"mpc": 1.0, "hardflow": 1.0, "fmrg": 2.0}[method]
+    c = {"conicflow": 1.0, "hardflow": 1.0, "fmrg": 2.0}[method]
     lam = c * dr_max / g
     return float(min(max(lam, LAM_ABS_MIN), LAM_ABS_MAX))
 
@@ -273,8 +273,8 @@ def broken_reasons(row: dict, a) -> List[str]:
 def make_cfg(method: str, a, lam: float) -> rs.RunConfig:
     common = dict(prompt=a.prompt, edit_prompt=a.edit_prompt, N=a.probe_N, seed=a.seed,
                   lam=float(lam), sample_mode=a.sample_mode, height=a.height, width=a.width)
-    if method == "mpc":
-        cfg = rs.RunConfig(control_type="mpc", H=a.mpc_H, n_inner=a.mpc_n_inner, lr_inner=a.mpc_lr_inner,
+    if method == "conicflow":
+        cfg = rs.RunConfig(control_type="conicflow", H=a.conicflow_H, n_inner=a.conicflow_n_inner, lr_inner=a.conicflow_lr_inner,
                            endpoint_surrogate=a.endpoint_surrogate, **common)
     elif method == "hardflow":
         cfg = rs.RunConfig(control_type="hardflow", H=2, n_inner=a.hardflow_n_inner,
@@ -439,7 +439,7 @@ def _saturated(vp: List[dict], ceiling: float, tol: float,
 def break_stop_reasons(vp: List[dict], tol: float, a) -> List[str]:
     """The upward stop in --high_stop break: keep climbing until the IMAGE breaks
     or the reward collapses outright. The plateau tests are not consulted -- a
-    flat reward curve is precisely the regime Shervin asked to keep walking
+    flat reward curve is precisely the regime this mode is meant to keep walking
     through, because energy (hence how far the edit has moved) keeps rising
     there even when the scorer has stopped paying for it.
 
@@ -553,7 +553,7 @@ def quantile_grid(fit, n_grid: int, lo: float, hi: float,
     """lambda values where the fitted curve reaches equally spaced fractions of its rise.
 
     q_hi is the top of that range. At 0.92 the emitted grid stops where the fitted
-    rise is 92% done, which on MPC/pickscore cells sat 1-2 decades below the
+    rise is 92% done, which on ConicFlow/pickscore cells sat 1-2 decades below the
     measured active region -- grid top lam=21 against an active region to 279,
     where the sweep later measured delta_r=13.0 on an intact image.
 
@@ -596,14 +596,14 @@ def extend_high(grid: List[float], hi: float, n_high: int) -> List[float]:
 def shared_grid(results: List[dict], n_max: int, min_ratio: float) -> dict:
     """One lambda grid for all methods, so runs can be compared at the SAME lambda.
 
-    WHY THIS IS A LEGITIMATE COMPARISON. MPC's per-step linearised problem
+    WHY THIS IS A LEGITIMATE COMPARISON. ConicFlow's per-step linearised problem
     min ||resid||^2/(2 lam dt) - <grad r, resid> has the closed form
     resid* = lam*dt*grad r; FMRG's update, n_opt steps of (dt/n_opt)*lam*grad r,
     is exactly that per step; HardFlow's reg = N/(2 lam) is matched per step by
     the derivation in RunConfig. So at a shared lam all three are solving the
     same first-order problem, and the CSV's `objective` column
     (E/(2 lam) - r_ctrl) scores each of them against it. Where they differ is
-    feedback: MPC re-solves, FMRG is open-loop and overshoots at high lam.
+    feedback: ConicFlow re-solves, FMRG is open-loop and overshoots at high lam.
 
     CONSTRUCTION. Take the union of every method's quantile grid (each already
     spans 8-92% of that method's own rise), merge neighbours closer than
@@ -785,7 +785,7 @@ def main():
     p.add_argument("--reward", required=True, choices=rs.REWARD_CHOICES)
     p.add_argument("--prompt", required=True)
     p.add_argument("--edit_prompt", default=None)
-    p.add_argument("--methods", nargs="+", default=["mpc", "hardflow", "fmrg"], choices=["mpc", "hardflow", "fmrg"])
+    p.add_argument("--methods", nargs="+", default=["conicflow", "hardflow", "fmrg"], choices=["conicflow", "hardflow", "fmrg"])
     p.add_argument("--probe_N", type=int, default=4, help="cheap N used for range finding")
     p.add_argument("--target_N", type=int, default=10, help="N of the sweep you will run with the grid")
     p.add_argument("--n_grid", type=int, default=6, help="lambda points in the recommended grid")
@@ -806,7 +806,7 @@ def main():
                    help="stop when delta_r reaches this fraction of the ceiling estimate. Default "
                         "0.9 (plateau) / disabled (break). The ceiling comes from "
                         "REWARD_OBSERVED_RANGE, which for pickscore is an n=4 measurement that "
-                        "MPC overshoots, so this is the first thing to loosen.")
+                        "ConicFlow overshoots, so this is the first thing to loosen.")
     p.add_argument("--q_hi", type=float, default=None,
                    help="top logistic quantile for grid placement. Default 0.92 (plateau) / 0.995 "
                         "(break); the offset from the fitted midpoint is log10(q/(1-q))/k decades.")
@@ -839,10 +839,10 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sample_mode", default="flow_map2")
     p.add_argument("--height", type=int, default=256); p.add_argument("--width", type=int, default=256)
-    p.add_argument("--mpc_H", type=int, default=2); p.add_argument("--mpc_n_inner", type=int, default=6)
-    p.add_argument("--mpc_lr_inner", type=float, default=1e-2)
+    p.add_argument("--conicflow_H", type=int, default=2); p.add_argument("--conicflow_n_inner", type=int, default=6)
+    p.add_argument("--conicflow_lr_inner", type=float, default=1e-2)
     p.add_argument("--endpoint_surrogate", default="jump", choices=["rollout", "jump"],
-                   help="MPC surrogate for range finding; jump is ~3x cheaper and the transition matches")
+                   help="ConicFlow surrogate for range finding; jump is ~3x cheaper and the transition matches")
     p.add_argument("--hardflow_n_inner", type=int, default=40); p.add_argument("--hardflow_lr_inner", type=float, default=2.5)
     p.add_argument("--hardflow_lr_alpha", type=float, default=None,
                    help="lift HardFlow's lr*reg >= 1 floor: below it lr = ALPHA/reg (see run_sweep.py). "
@@ -892,7 +892,7 @@ def main():
                 prm.requires_grad_(False)
 
     # ── probes ────────────────────────────────────────────────────────────
-    probe_cfg = make_cfg("mpc", a, 1.0)
+    probe_cfg = make_cfg("conicflow", a, 1.0)
     pr = probe_uncontrolled(sampler, probe_cfg, device, dtype, a.reward, reward_device, rs._REWARD_DTYPES[a.reward_dtype])
     r_lo, r_hi = REWARD_OBSERVED_RANGE[a.reward]
     ceiling = max(r_hi - pr["r_unc"], 1e-6)

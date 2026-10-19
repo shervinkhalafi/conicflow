@@ -125,8 +125,8 @@ REWARD_PLAUSIBLE_RANGE = {
 # folded in.
 REWARD_OBSERVED_RANGE = {
     # MEASURED, strong. n=5453 pooled values, observed [0.00116, 0.77530];
-    # rounded outward to (0.0, 0.80). Independently corroborates
-    # pre-meeting §1's "unconstrained CLIP 0.276-0.339 across prompts" and
+    # rounded outward to (0.0, 0.80). Independently corroborates the
+    # earlier design note's "unconstrained CLIP 0.276-0.339 across prompts" and
     # its stated ~0.12-0.42 uncontrolled span -- this measurement reproduces
     # that from the CSVs without having been fitted to it.
     "clip":        (0.0, 0.80),

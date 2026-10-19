@@ -2,7 +2,7 @@
 Receding-Horizon Path-Space Control for Flow Matching
 =====================================================
 
-Implements the softened path-space MPC variant with an INEQUALITY constraint
+Implements the softened path-space ConicFlow variant with an INEQUALITY constraint
 h(x) <= 0 enforced via a Lagrangian dual term and projected dual ascent:
 
     min_{x_{1:H}}  sum_{l=0}^{H-1} (1/(2*lam*dt)) * ||x_{l+1} - x_l - dt*v(t_{j+l}, x_l)||^2
@@ -233,7 +233,7 @@ def receding_horizon_flow_control(
         lr_dual:       projected dual-ascent step size (>= 0).
                        0 keeps mu frozen at mu_init (fixed Lagrangian penalty).
         optimizer:     "lbfgs" or "adam" for the inner solve.
-        n_iters:       inner-solver iterations per MPC step.
+        n_iters:       inner-solver iterations per ConicFlow step.
         lr:            inner-solver learning rate.
         verbose:       print per-step diagnostics.
         device:        torch device (defaults to x0.device).
@@ -289,7 +289,7 @@ def receding_horizon_flow_control(
                     hx = hx.unsqueeze(-1)
                 mu_t = (mu_t + lr_dual * hx).clamp_min(0.0)
 
-        # ── Apply first MPC step ──────────────────────────────────────────────
+        # ── Apply first ConicFlow step ──────────────────────────────────────────────
         with torch.no_grad():
             v_j = v_theta(t_grid[j], x)
             u_star = (x1_star - x) / dt - v_j
@@ -318,7 +318,7 @@ B, D = 256, 2
 N_demo = 20
 
 v_theta    = model.calc_b
-mpc_device = next(model.parameters()).device
+conicflow_device = next(model.parameters()).device
 
 # Two inequality constraints composed into a single (B, 2) callable:
 #   c1: x_0 <= -0.5   (first coordinate below -0.5)
@@ -336,11 +336,11 @@ def endpoint_map(t_batch, x):
     ones = torch.ones_like(t_batch)
     return model(t_batch, ones, x)
 
-x0 = torch.randn(B, D, device=mpc_device)
+x0 = torch.randn(B, D, device=conicflow_device)
 
 # Uncontrolled rollout for comparison.
 dt_demo     = 1.0 / N_demo
-t_grid_demo = torch.linspace(0.0, 1.0, N_demo + 1, device=mpc_device, dtype=x0.dtype)
+t_grid_demo = torch.linspace(0.0, 1.0, N_demo + 1, device=conicflow_device, dtype=x0.dtype)
 with torch.no_grad():
     x_unc = x0.clone()
     traj_unc_list = [x_unc.clone()]
@@ -359,7 +359,7 @@ xN, traj, controls, mu_final = receding_horizon_flow_control(
     endpoint_map=endpoint_map,
     lr_dual=1.0,
     optimizer="lbfgs", n_iters=30, lr=0.5,
-    verbose=True, device=mpc_device,
+    verbose=True, device=conicflow_device,
 )
 
 print("\nfinal mean (controlled):  ", xN.mean(dim=0).tolist())
@@ -370,8 +370,8 @@ if mu_final is not None:
         col = mu_final[:, c]
         print(f"  mu[{c}]  mean={col.mean().item():.4f}  max={col.max().item():.4f}")
 
-# ── MPC visualisation ────────────────────────────────────────────────────────
-mpc_metrics = visualize_control_results(
+# ── ConicFlow visualisation ────────────────────────────────────────────────────────
+conicflow_metrics = visualize_control_results(
     traj_ctrl=traj,
     traj_unc=traj_unc,
     x0=x0,
@@ -380,13 +380,13 @@ mpc_metrics = visualize_control_results(
     controls=controls,
     r=r,
     bg_pts=sample_target(4000),
-    method_name="MPC",
-    controlled_label="Controlled (MPC)",
+    method_name="ConicFlow",
+    controlled_label="Controlled (ConicFlow)",
     lam=2.0,
     controls_are_velocity=True,
     n_particles=256,
     show_snaps=True,
     snap_times=[0.0, 0.25, 0.5, 0.75, 1.0],
     lim=3.5,
-    device=mpc_device,
+    device=conicflow_device,
 )

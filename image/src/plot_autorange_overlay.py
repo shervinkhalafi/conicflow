@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plot_autorange_overlay.py -- overlay MPC / HardFlow / FMRG on one panel per
+plot_autorange_overlay.py -- overlay ConicFlow / HardFlow / FMRG on one panel per
 reward, from the data lambda_autorange.py already wrote.
 
 Reads results/autorange/<reward>/autorange.json (skipping _-prefixed archive
@@ -10,7 +10,7 @@ dirs) and produces two figures:
                         overlaid. Within a reward every method shares the same
                         seed, N, prompt and therefore the same r_unc (asserted
                         below), so delta_r is directly comparable. lambda is
-                        NOT: it is a Lagrange weight for MPC, enters HardFlow
+                        NOT: it is a Lagrange weight for ConicFlow, enters HardFlow
                         as reg = N/(2*lambda), and is an open-loop gradient
                         gain for FMRG. Read the x positions as "where each
                         method's own transition sits", not as a shared setting.
@@ -32,7 +32,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-METHODS = [("mpc", "#2a78d6", "o"), ("hardflow", "#eb6834", "s"), ("fmrg", "#1baf7a", "^")]
+METHODS = [("conicflow", "#2a78d6", "o"), ("hardflow", "#eb6834", "s"), ("fmrg", "#1baf7a", "^")]
 REWARD_ORDER = ["imagereward", "clip", "pickscore"]
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-compare_methods.py -- one figure per comparison: uncontrolled | MPC | HardFlow | FMRG,
+compare_methods.py -- one figure per comparison: uncontrolled | ConicFlow | HardFlow | FMRG,
 with each panel's control energy and reward written underneath.
 
 THE MATCHING PROBLEM. The three methods do not reach the same operating point at
@@ -59,12 +59,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-METHODS = ["mpc", "hardflow", "fmrg"]
-PRETTY = {"mpc": "MPC", "hardflow": "HardFlow", "fmrg": "FMRG"}
+METHODS = ["conicflow", "hardflow", "fmrg"]
+PRETTY = {"conicflow": "ConicFlow", "hardflow": "HardFlow", "fmrg": "FMRG"}
 
 # ═════════════════════════════════════════════════════════════════════════════
 # What a "config" is. A method may be swept at several hyperparameter settings
-# (MPC at n_inner=12 and 24, say). Every tool here must then treat those as
+# (ConicFlow at n_inner=12 and 24, say). Every tool here must then treat those as
 # distinct arms of the same method, so the identity is defined ONCE, from the
 # CSV columns that describe the method's own knobs -- everything except lambda,
 # seed and the problem fields (reward, prompt, N). Any variation the sweep
@@ -72,7 +72,7 @@ PRETTY = {"mpc": "MPC", "hardflow": "HardFlow", "fmrg": "FMRG"}
 # ═════════════════════════════════════════════════════════════════════════════
 _COMMON_CFG = ["sample_mode", "lr_dual", "mu_init", "constraint_names"]
 CONFIG_FIELDS = {
-    "mpc": ["H", "n_inner", "lr_inner", "endpoint_surrogate", "drift_detach", "warmstart",
+    "conicflow": ["H", "n_inner", "lr_inner", "endpoint_surrogate", "drift_detach", "warmstart",
             "constraint_on", "n_alt", "skip_first_primal_step",
             "dual_adaptive"] + _COMMON_CFG,
     "hardflow": ["n_inner", "lr_inner", "hardflow_lr_alpha", "hardflow_endpoint_mode", "hardflow_rho",
@@ -124,7 +124,7 @@ def label_configs(runs: List[dict]) -> Dict[str, List[tuple]]:
 
 
 def cfg_name(run: dict) -> str:
-    """'MPC ni=24' or just 'MPC' when the method has a single config."""
+    """'ConicFlow ni=24' or just 'ConicFlow' when the method has a single config."""
     return PRETTY[run["method"]] + (f" {run['cfg_label']}" if run.get("cfg_label") else "")
 
 
@@ -340,7 +340,7 @@ def group_key(r: dict) -> tuple:
 # Figure
 # ═════════════════════════════════════════════════════════════════════════════
 def draw(sels: List[dict], gkey: tuple, match: str, out_path: str, dpi: int = 130) -> str:
-    """One figure, one row per selected triple: uncontrolled | MPC | HardFlow | FMRG."""
+    """One figure, one row per selected triple: uncontrolled | ConicFlow | HardFlow | FMRG."""
     reward, prompt, edit_prompt, N, seed = gkey
     what = "achieved reward" if match == "reward" else "control energy"
     # Selection order is by tightness; display order is by the matched value, so
@@ -352,7 +352,7 @@ def draw(sels: List[dict], gkey: tuple, match: str, out_path: str, dpi: int = 13
         picks = sel["picks"]
         unc = next((picks[m] for m in METHODS if os.path.isfile(picks[m]["img_unc"])), None)
         panels = [("Uncontrolled", unc["img_unc"] if unc else "", 0.0,
-                   unc["r_unc"] if unc else picks["mpc"]["r_unc"], None, "")]
+                   unc["r_unc"] if unc else picks["conicflow"]["r_unc"], None, "")]
         for m in METHODS:
             pk = picks[m]
             extra = ",".join(t for t in pk.get("cfg_label", "").split(",") if t and not t.startswith("ni="))
@@ -435,7 +435,7 @@ def main():
 
     runs = load_sweeps(a.runs) + load_autorange(a.autorange)
     if not runs:
-        raise SystemExit("no usable runs found (need run_ok=True rows of mpc/hardflow/fmrg)")
+        raise SystemExit("no usable runs found (need run_ok=True rows of conicflow/hardflow/fmrg)")
     groups: Dict[tuple, List[dict]] = {}
     for r in runs:
         groups.setdefault(group_key(r), []).append(r)

@@ -1,19 +1,25 @@
-# Conda environment for FLUX MPC / FMRG image control (run_sweep.py, image_mpc.py).
+# Conda environment for the reward-steered FLUX sampling experiments
+# (src/run_sweep.py, src/control_loops.py, src/image_conicflow.py).
 #
 # Create:
 #   conda env create -f environment.yml
 #   conda activate flowmaps
 #
-# Optional reward backends (ImageReward, HPSv2) need a post-install step — see
-# scripts/setup_reward_models.sh or fmrg/install.sh.
+# Then clone FMRG and fetch its FLUX FlowMap LoRA weights, which are NOT
+# vendored in this release (see README section 2):
+#   git clone https://github.com/jrrhuang/fmrg.git
+#   bash fmrg/checkpoints_download.sh
 #
 # After activating:
-#   export HF_TOKEN=hf_...          # required for FLUX.1-dev
-#   export HF_HUB_DISABLE_XET=1     # recommended
-#   export FMRG_DIR=$PWD/fmrg       # default in run_sweep.py
+#   export HF_TOKEN=hf_...            # required for the gated FLUX.1-dev
+#   export HF_HUB_DISABLE_XET=1       # recommended
+#   export FMRG_DIR=/path/to/fmrg     # no default; must be set
 #
-# Download FlowMap LoRA weights (not in repo):
-#   bash fmrg/checkpoints_download.sh
+# FLOW_MATCHING_DIR does NOT need to be set: image_conicflow.py is vendored in src/
+# and that is where run_sweep.py looks by default.
+#
+# The optional reward backends (ImageReward, HPSv2) need the post-install step
+# in fmrg/install.sh.
 
 name: flowmaps
 channels:

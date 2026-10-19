@@ -1,5 +1,5 @@
 """
-reward_normalization.py -- Two-family reward normalization (plan Step 3).
+reward_normalization.py -- Two-family reward normalization (the design plan).
 ======================================================================
 
 Pins the INTERFACE Step 4's constraint builder depends on: what a normalizer
@@ -8,35 +8,17 @@ shapes, and whether a normalizer is bound per-prompt or prompt-agnostic. Does
 NOT implement Step 3.3's sampling loop -- this module only defines the schema
 or that loop writes into and the builder reads out of.
 
-Two families (meeting, 2026-08-24; see 260825-task3-plan.md Step 3.1):
+Two families (decided 2026-08-24; see the design plan):
 
   Family A -- text-image pair scores (clip, hpsv2, pickscore, imagereward):
       normalized = (r - mean) / std
-      "The normalized reward, we want to have mean zero and standard
-      deviation one." (Shervin)
+      The normalized reward has mean zero and standard deviation one.
 
   Family B -- distance-type (style, lpips):
       normalized = r / sqrt(E[r^2])          -- NOT mean-subtracted.
-      "Do expectation of X squared and square root of that... kind of
-      implicitly consider[s] the mean to be zero." (Shervin) The family's
+      Dividing by sqrt(E[r^2]) implicitly treats the mean as zero. The family's
       natural minimum is 0 by construction (a distance / negated distance),
       so centering at the mean is meaningless for it.
-
-3.2 finding (2026-08-25, fetched from the paper text -- see session log
-§3.2): the lab's own prior work, "Composition and Alignment of Diffusion
-Models using Constrained Learning" (arXiv:2508.19104, NeurIPS 2025 -- the
-local checkout at /home/shervink/constrained_comp_align matches this paper's
-title but its Alignment/reward-aligned-models code was never checked in, so
-this was read from the paper text, not local code), normalizes ALL five of
-its rewards (aesthetic, hps, pickscore, imagereward, MPS) with a SINGLE
-z-score formula -- "we normalize each by computing the average and standard
-deviation over a number of batches" -- with NO Family B split, because none
-of their reward set is a distance-type metric bounded below at zero. That
-paper is precedent FOR Family A exactly as specified above, but offers NO
-precedent for Family B: style and LPIPS are not present in it, and the
-meeting's sqrt(E[X^2]) form is this project's own contribution, not a reuse
-of prior lab work. This is why §3.7's LPIPS question below still has to go
-to Shervin rather than being resolved by "check the old paper."
 
 3.7 -- LPIPS is ill-posed under Family B, BY CONSTRUCTION, not as a bug here.
 LPIPS's x_ref is the same-seed UNCONTROLLED output, so on uncontrolled
@@ -94,8 +76,7 @@ def reward_family(reward_name: str) -> str:
 
 
 # ── Family B scale function: injectable per 3.8 ─────────────────────────────
-# Shervin proposed sqrt(E[X^2]) in the meeting but said "I will think a bit
-# about what would be reasonable" for style/LPIPS specifically -- treat this
+# sqrt(E[X^2]) was adopted for style/LPIPS as a provisional choice -- treat this
 # as the working default, not a hardcoded formula. Step 4's builder (or this
 # module's caller) can pass a different `family_b_scale_fn` to compute_stats
 # without touching any call site.
@@ -272,8 +253,8 @@ class Stats:
                     f"auto-normalization, (b) redefine the calibration "
                     f"reference so it isn't structurally zero, or (c) "
                     f"normalize against CONTROLLED samples at some fixed "
-                    f"lambda instead of uncontrolled ones. This is Shervin's "
-                    f"call, not something to decide unilaterally here."
+                    f"lambda instead of uncontrolled ones. This is a design "
+                    f"decision, not something to make silently here."
                 )
             _check_low_spread(reward_name, prompt_key, rms)
             return Stats(reward_name, prompt_key, "B", n, list(seeds), rms=rms)
@@ -348,8 +329,8 @@ def compute_global_from_pooled(
     raw samples is the standard construction of a combined mean/std/rms and
     gives every individual sample equal weight regardless of which prompt it
     came from, whereas averaging per-prompt statistics would silently
-    up-weight prompts calibrated with fewer samples. Shervin's "either is
-    fine" leaves this choice open; this is the one made, recorded so it
+    up-weight prompts calibrated with fewer samples. Either choice is
+    defensible; this is the one made, recorded so it
     isn't re-derived differently later.
 
     `per_prompt_seeds` must have the same keys as `per_prompt_values`, each

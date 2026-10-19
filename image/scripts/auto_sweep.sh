@@ -3,17 +3,17 @@
 #
 #   auto_sweep.sh <gpu> <reward> "<prompt>" "<edit_prompt>" [extra run_sweep args...]
 #
-# Step 1 runs lambda_autorange.py at a cheap proxy N (default 4) for mpc,
+# Step 1 runs lambda_autorange.py at a cheap proxy N (default 4) for conicflow,
 # hardflow and fmrg and writes grids.txt with one --sweep_lam line per method.
 # Step 2 runs run_sweep.py once per method at TARGET_N on exactly that grid.
 # Everything lands under results/auto/<reward>/<slug>/.
 #
 # Environment overrides (all optional):
-#   TARGET_N=10  PROBE_N=4  N_GRID=6  SEEDS="42"  MPC_H=2  MPC_NI=12
+#   TARGET_N=10  PROBE_N=4  N_GRID=6  SEEDS="42"  CONICFLOW_H=2  CONICFLOW_NI=12
 #   AUTO_ROOT=results/auto        root of the output tree (see below)
 #   REDO_AUTORANGE=1              re-probe even if grids.txt already exists
 #   HF_NI=40 HF_LR=2.5  FMRG_NOPT=3  AUTORANGE_EXTRA="..."
-#   Per-method knobs take LISTS: MPC_NI="12 24" sweeps MPC at both inner counts
+#   Per-method knobs take LISTS: CONICFLOW_NI="12 24" sweeps ConicFlow at both inner counts
 #   (cartesian with the lambda grid, in the same out_dir). The diagnostics and
 #   compare_methods.py treat each setting as its own config of that method.
 #   SHARED_GRID=1   run every method on ONE grid (the `shared` line of grids.txt)
@@ -51,14 +51,16 @@
 set -u
 GPU="$1"; REWARD="$2"; PROMPT="$3"; EDIT="$4"; shift 4
 TARGET_N="${TARGET_N:-10}"; PROBE_N="${PROBE_N:-4}"; N_GRID="${N_GRID:-6}"; SEEDS="${SEEDS:-42}"
-MPC_H="${MPC_H:-2}"; MPC_NI="${MPC_NI:-12}"; HF_NI="${HF_NI:-40}"; HF_LR="${HF_LR:-2.5}"; FMRG_NOPT="${FMRG_NOPT:-3}"
+CONICFLOW_H="${CONICFLOW_H:-2}"; CONICFLOW_NI="${CONICFLOW_NI:-12}"; HF_NI="${HF_NI:-40}"; HF_LR="${HF_LR:-2.5}"; FMRG_NOPT="${FMRG_NOPT:-3}"
 SHARED_GRID="${SHARED_GRID:-0}"; HF_ALPHA="${HF_ALPHA:-}"
 DIAG="${DIAG:-}"
 HF_ALPHA_ARGS=(); [ -n "$HF_ALPHA" ] && HF_ALPHA_ARGS=(--hardflow_lr_alpha "$HF_ALPHA")
 # (2026-09-23) Only the range finder takes it; the sweep just runs whatever grid
 # grids.txt ends up holding, so there is nothing to pass on to run_sweep.py.
 HIGH_STOP_ARGS=(); [ -n "${HIGH_STOP:-}" ] && HIGH_STOP_ARGS=(--high_stop "$HIGH_STOP")
-cd "$(dirname "$0")" || exit 3
+# Everything below runs from src/, where the Python lives. Output paths are
+# therefore relative to src/ unless AUTO_ROOT is absolute.
+cd "$(dirname "$0")/../src" || exit 3
 SLUG="$(printf '%s__%s' "$PROMPT" "$EDIT" | tr -c 'A-Za-z0-9' '_' | cut -c1-60)"
 # AUTO_ROOT (2026-09-22) so a sweep can be kept in its own tree instead of
 # landing in results/auto/ with everything else. paper_figures.py already takes
@@ -71,7 +73,7 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 # Reuse an existing grids.txt (2026-09-22). Range finding costs ~14 min and
 # depends only on (reward, prompt, edit_prompt) -- never on the seed. The loop
 # below is method-outer/seed-inner, so a run killed partway leaves some seeds
-# with MPC but no HardFlow, which is exactly the comparison the cell exists to
+# with ConicFlow but no HardFlow, which is exactly the comparison the cell exists to
 # make. Calling this script once per seed instead makes every cutoff land on a
 # seed boundary, but that re-ran range finding per seed. Caching it makes the
 # per-seed call cheap, so the safe ordering is also the affordable one.
@@ -81,17 +83,17 @@ if [ -s "$OUT/autorange/grids.txt" ] && [ "${REDO_AUTORANGE:-0}" != "1" ]; then
 else
 echo "[auto_sweep] step 1/2: lambda range finding ($REWARD, proxy N=$PROBE_N -> target N=$TARGET_N)"
 python lambda_autorange.py --reward "$REWARD" --prompt "$PROMPT" --edit_prompt "$EDIT" \
-    --methods mpc hardflow fmrg --probe_N "$PROBE_N" --target_N "$TARGET_N" --n_grid "$N_GRID" \
+    --methods conicflow hardflow fmrg --probe_N "$PROBE_N" --target_N "$TARGET_N" --n_grid "$N_GRID" \
     --flux_device cuda:0 --reward_device cuda:0 --out_dir "$OUT/autorange" ${AUTORANGE_EXTRA:-} \
     ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"} ${HIGH_STOP_ARGS[@]+"${HIGH_STOP_ARGS[@]}"} \
     || { echo "[auto_sweep] range finding FAILED"; exit 1; }
 
 # (2026-09-23) Trim the emitted grid to where the measured curve stops moving.
-# --high_stop break has no upward stop for MPC: MPC's plateau is flat, not
+# --high_stop break has no upward stop for ConicFlow: ConicFlow's plateau is flat, not
 # destructive, so neither the image-break test nor the reward-collapse test ever
 # fires and the walk runs to the lambda box.  On the first live break-mode cell
-# (garden, seed 811) that put five of MPC's eight points above lam=6300, all
-# re-measuring one plateau point at 239 s each -- half the MPC budget per cell.
+# (garden, seed 811) that put five of ConicFlow's eight points above lam=6300, all
+# re-measuring one plateau point at 239 s each -- half the ConicFlow budget per cell.
 # trim_grids.py cuts on the probe curve only, so a method still climbing at its
 # grid top is left alone (HardFlow and FMRG were, on that cell).  It is NOT the
 # near_ceiling stop coming back; see its module docstring.  Runs only on a fresh
@@ -107,9 +109,9 @@ if [ "$SHARED_GRID" = "1" ]; then
     echo "[auto_sweep]   shared grid: $SHARED"
     grep '^ *# ' "$OUT/autorange/grids.txt" | tail -3 | sed 's/^/[auto_sweep]   /'
     # one line per method, all on the shared grid
-    METHOD_LINES="$(printf 'mpc --sweep_lam %s\nhardflow --sweep_lam %s\nfmrg --sweep_lam %s\n' "$SHARED" "$SHARED" "$SHARED")"
+    METHOD_LINES="$(printf 'conicflow --sweep_lam %s\nhardflow --sweep_lam %s\nfmrg --sweep_lam %s\n' "$SHARED" "$SHARED" "$SHARED")"
 else
-    METHOD_LINES="$(grep -E '^(mpc|hardflow|fmrg) +--sweep_lam' "$OUT/autorange/grids.txt")"
+    METHOD_LINES="$(grep -E '^(conicflow|hardflow|fmrg) +--sweep_lam' "$OUT/autorange/grids.txt")"
 fi
 while read -r method flag grid; do
     [ "$flag" = "--sweep_lam" ] || continue
@@ -118,7 +120,7 @@ while read -r method flag grid; do
     # run_sweep.py's --sweep_* flags take several values.
     # shellcheck disable=SC2206
     case "$method" in
-        mpc)      extra=(--sweep_H $MPC_H --sweep_n_inner $MPC_NI --sweep_lr_inner 1e-2) ;;
+        conicflow)      extra=(--sweep_H $CONICFLOW_H --sweep_n_inner $CONICFLOW_NI --sweep_lr_inner 1e-2) ;;
         hardflow) extra=(--sweep_H 2 --sweep_n_inner $HF_NI --sweep_lr_inner $HF_LR ${HF_ALPHA_ARGS[@]+"${HF_ALPHA_ARGS[@]}"}) ;;
         fmrg)     extra=(--sweep_n_inner $FMRG_NOPT) ;;
         *)        continue ;;

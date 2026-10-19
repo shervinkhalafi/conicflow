@@ -8,7 +8,7 @@
 #
 # WHY THIS FILE EXISTS. Every launcher in this directory grew its own copy of
 # "wait for a GPU, then launch", and the copies disagreed. The 2026-09-04
-# post-mortem (260904-post-call-actions.md) traced ~1.25 h of wall clock and
+# post-mortem (the GPU-safety post-mortem) traced ~1.25 h of wall clock and
 # zero completed runs to two independent bugs in two of those copies, and the
 # 2026-09-05 memory work then invalidated the memory constant that most of them
 # had hardcoded. Three generations currently coexist:
@@ -17,7 +17,7 @@
 #          -- no GPU gate at all.
 #   Gen 2  overnight_sweep.sh's wait_for_gpu0
 #          -- waits 15 min, then prints "proceeding anyway" and launches into a
-#             full card. Do not copy it; CLAUDE.md used to point at it.
+#             full card. Do not copy it.
 #   Gen 3  hardflow_*.sh, lpips_reward_2c_sweep.sh
 #          -- the mature pattern, which is what this file is extracted from.
 #
@@ -41,12 +41,12 @@
 # That was conservative, so it never caused an OOM -- but it is why the numbers
 # below look smaller than the ones they replace by more than the real saving.
 #
-# WHAT CHANGED. The old NEED_MIB_MPC=24100 was never the RUN requirement.
+# WHAT CHANGED. The old NEED_MIB_CONICFLOW=24100 was never the RUN requirement.
 # FluxFlowMapSampler used to move the full bf16 transformer (23.8 GB) onto the
 # card and only then quantize it to 12.26 GB -- a 24.21 GB LOAD spike, ~3 GB
 # above the peak of the run that followed. The gate was therefore sized by the
-# load, and MPC appeared to need an effectively empty card. It does not, and has
-# not since 2026-09-05 (260905-memory-optimization.md). Load now peaks at
+# load, and ConicFlow appeared to need an effectively empty card. It does not, and has
+# not since 2026-09-05 (the memory-budget notes). Load now peaks at
 # 12.33 GB, so the run genuinely binds for the first time.
 #
 # MEASURED 2026-09-05, both arms on the SAME worst-case config
@@ -54,15 +54,15 @@
 # disk, 3 resident scorers), peak_reserved_flux_gb:
 #
 #     arm  config                        was       now       now MiB   gate
-#     mpc  lpips + clip + imagereward    23.23 GB  21.29 GB  20304     21000
+#     conicflow  lpips + clip + imagereward    23.23 GB  21.29 GB  20304     21000
 #     hf   lpips + clip + imagereward    20.63 GB  18.83 GB  17958     18500
 #
-# For reference, MPC's COMMON config (--reward none, clip + lpips) is lighter
+# For reference, ConicFlow's COMMON config (--reward none, clip + lpips) is lighter
 # still at 18.52 GB = 17662 MiB. The gates below deliberately use the WORST
 # config per arm, because a gate that clears a card the heaviest config cannot
 # fit is worse than useless.
 #
-# Note MPC > HardFlow now. That ordering is real: MPC holds H-step horizon
+# Note ConicFlow > HardFlow now. That ordering is real: ConicFlow holds H-step horizon
 # graphs plus the endpoint rollout, HardFlow does not. The old "HardFlow is the
 # lighter arm" gap was mostly the shared load spike, not the algorithms.
 #
@@ -70,12 +70,12 @@
 #
 # Do NOT lower these to "get runs through". A launch that cannot fit does not
 # fail fast; it wastes a ~90 s model load and one attempt.
-: "${NEED_MIB_MPC:=21000}"
+: "${NEED_MIB_CONICFLOW:=21000}"
 : "${NEED_MIB_HF:=18500}"
 
 # FMRG added 2026-09-14 for the unconstrained wall-clock probe. need_mib_for
 # used to gpu_die on this arm, which is correct behaviour for an unmeasured one
-# -- so it is measured here rather than borrowed from MPC.
+# -- so it is measured here rather than borrowed from ConicFlow.
 #
 # MEASURED from the only fmrg rows on disk (results/*/summary.csv,
 # control_type in {fmrg, boffi_fmrg}, 4 rows, all --reward clip, N=10,
@@ -87,7 +87,7 @@
 #  1. Those rows used CLIP as the scorer. ImageReward is a heavier model, so a
 #     --reward imagereward fmrg run may peak above 22.12 GB. 21800 MiB of 24564
 #     already means "an effectively empty card", so there is no headroom left to
-#     add on this box -- if an fmrg+imagereward run OOMs, that is the finding,
+#     add on a 24 GB card -- if an fmrg+imagereward run OOMs, that is the finding,
 #     not a gate to lower.
 #  2. n_inner was 5. The probe runs n_inner=46. FMRG's inner loop should not
 #     accumulate graph across inner steps, so this is expected to be flat in
@@ -224,8 +224,8 @@ install_gpu_trap() {
 #  1. CUDA_VISIBLE_DEVICES pins the process to a single card, which is then
 #     cuda:0 from inside. Anything using DataParallel claims every VISIBLE GPU.
 #  2. --flux_device and --reward_device are BOTH cuda:0, i.e. the same card.
-#     Cross-GPU copies on this box silently return approximately zeros with no
-#     error raised (260904-post-call-actions.md B1). --reward_device defaults to
+#     Cross-GPU copies on the development machine silently return approximately zeros with no
+#     error raised (the GPU-safety post-mortem B1). --reward_device defaults to
 #     "auto", which resolves to the OTHER card whenever two are visible, and
 #     that is how ImageReward came back as exactly -0.16733 for 294 images.
 #     Never pass --reward_device auto here.
@@ -243,7 +243,7 @@ run_on_gpu() {
 # need_mib_for <control_type>  -- the gate for an arm, from the constants above.
 need_mib_for() {
   case "$1" in
-    mpc)       echo "$NEED_MIB_MPC" ;;
+    conicflow)       echo "$NEED_MIB_CONICFLOW" ;;
     hardflow)  echo "$NEED_MIB_HF" ;;
     fmrg)      echo "$NEED_MIB_FMRG" ;;
     *) gpu_die "need_mib_for: no measured gate for control_type '$1'. Measure it

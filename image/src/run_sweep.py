@@ -38,7 +38,7 @@ from typing import Callable, List, Optional
 
 # Set BEFORE torch is imported -- the allocator reads this once at init, so
 # setting it later is a silent no-op. Recommended by the OOM message itself;
-# MPC reserves ~0.3 GB more than it allocates and this reclaims part of that
+# ConicFlow reserves ~0.3 GB more than it allocates and this reclaims part of that
 # fragmentation gap. Two of the ~25 launcher scripts exported it, so whether a
 # sweep got it depended on which script you happened to use; setting it here
 # makes it unconditional. An explicit env var still wins.
@@ -54,35 +54,40 @@ import matplotlib.pyplot as plt
 _REWARD_DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 # ── path setup ───────────────────────────────────────────────────────────────
-# This is a standalone copy (sungcho) — image_mpc.py / fluxfm_sampler_reward.py
-# are NOT duplicated here, they're imported read-only from Shervin's original
-# checkout. Override FLOW_MATCHING_DIR / FMRG_DIR env vars once you have your
-# own copies of those modules.
-FLOW_MATCHING_DIR = os.environ.get("FLOW_MATCHING_DIR", "/home/shervink/flow_matching")
-FMRG_DIR = os.environ.get("FMRG_DIR", os.path.join(FLOW_MATCHING_DIR, "fmrg"))
+# `image_conicflow.py` is vendored next to this file, so FLOW_MATCHING_DIR defaults to
+# this directory and nothing needs to be set for it.
+#
+# FMRG (github.com/jrrhuang/fmrg, Apache-2.0) is vendored at the repository
+# root as `fmrg/`, with the local changes listed in fmrg/MODIFICATIONS.md, so
+# FMRG_DIR defaults to it. Its FLUX FlowMap LoRA weights are not in git: fetch
+# them with `bash fmrg/checkpoints_download.sh`. The only symbols taken from it
+# are the sampler and the reward-model wrappers in `fluxfm_sampler_reward.py`.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+FLOW_MATCHING_DIR = os.environ.get("FLOW_MATCHING_DIR", _HERE)
+FMRG_DIR = os.environ.get("FMRG_DIR", os.path.join(_REPO_ROOT, "fmrg"))
 sys.path.insert(0, FMRG_DIR)
-sys.path.insert(0, FLOW_MATCHING_DIR)           # image_mpc.py lives here (read-only import)
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, FLOW_MATCHING_DIR)           # image_conicflow.py lives here
+sys.path.insert(0, _HERE)
 
-from image_mpc import (
+from image_conicflow import (
     make_flux_wrappers,
     fmrg_j_image,
     trajectory_rewards,
     tune_sampler_speed,
 )
-# receding_horizon_flow_control comes from OUR derived copy, not Shervin's
-# image_mpc.py, so plan Step 5's n_alt parameter (primal/dual alternation
-# per fixed window) doesn't require editing his file. See
-# image_mpc_edited_sung.py's module docstring for why this is a full copy
-# rather than a partial import, and for how it stays in sync. Every other
-# import above still comes from image_mpc.py unmodified.
-from image_mpc_edited_sung import receding_horizon_flow_control, hardflow_image
+# receding_horizon_flow_control and hardflow_image come from control_loops.py,
+# NOT from image_conicflow.py: the ConicFlow loop there has no `n_alt` (primal/dual
+# alternation per fixed window) and no HardFlow at all. See control_loops.py's
+# module docstring for the full list of divergences. Every other import above
+# still comes from image_conicflow.py unmodified.
+from control_loops import receding_horizon_flow_control, hardflow_image
 
 
 def stack_constraints(fns):
     """Combine scalar constraint functions into one (B, C) callable.
 
-    Inlined from mpc_cell.py to avoid importing that module's demo code.
+    Inlined from conicflow_cell.py to avoid importing that module's demo code.
     Each fn must return (B,) or (B,1); the result is (B, C) column-stacked.
     """
     def combined(x):
@@ -134,24 +139,24 @@ REWARD_CHOICES = ["clip", "hpsv2", "pickscore", "imagereward", "style", "lpips",
 # is a one-line change here (CSV_KEYS is generated from it).
 MAX_CONSTRAINTS = 4
 
-# Control types that accept inequality constraints. "mpc" is ours; "hardflow"
+# Control types that accept inequality constraints. "conicflow" is ours; "hardflow"
 # is the HardFlow baseline (Li, Alim & Azizan, TPAMI 2026), added 2026-08-31 as
-# the constrained comparison -- see 260829-hardflow-check.md. "fmrg" and
+# the constrained comparison -- see the HardFlow port audit. "fmrg" and
 # "boffi_fmrg" are unconstrained methods and are deliberately NOT in this set:
 # requesting constraints with them raises in _validate_constraint_cfg rather
 # than silently running unconstrained.
-CONSTRAINED_CONTROL_TYPES = frozenset({"mpc", "hardflow"})
+CONSTRAINED_CONTROL_TYPES = frozenset({"conicflow", "hardflow"})
 
-# Settings the plan (260825-task3-plan.md, "Locked decisions -- do not
-# re-litigate") fixes, not merely defaults.
+# Settings the design plan ("Locked decisions -- do not re-litigate") fixes,
+# not merely defaults.
 #
-# drift_detach WAS one of them (locked at False: "it's what we know is correct"
-# -- Shervin; "True's only benefit is speed"). Lifted 2026-09-16: measurement
+# drift_detach WAS one of them (locked at False as the known-correct setting,
+# with speed as True's only expected benefit). Lifted 2026-09-16: measurement
 # showed True is both faster and BETTER on the objective, so the rationale no
 # longer holds and the axis is open again. See _RETIRED_LOCKS below.
 #
-#   constraint_on="endpoint" -- resolved the mine-vs-his disagreement in the
-#                           meeting. A WRONG default here once made an entire
+#   constraint_on="endpoint" -- resolved a disagreement between two
+#                           development copies. A WRONG default here once made an entire
 #                           ablation (horizon-mode) structurally
 #                           uninterpretable after the fact -- the exact failure
 #                           _assert_locked_defaults exists to catch before it
@@ -180,7 +185,7 @@ _RETIRED_LOCKS = frozenset({"drift_detach"})
 
 def _assert_locked_defaults(cfg, log=print) -> None:
     """Print the resolved config for the three locked settings and RAISE if
-    any diverges (plan Step 2's acceptance criterion verbatim: "a trivial run
+    any diverges (the design plan's acceptance criterion verbatim: "a trivial run
     prints all three correctly, and the assertions fire if any is changed").
 
     RAISES rather than silently running under a divergent config -- the
@@ -207,8 +212,8 @@ def _assert_locked_defaults(cfg, log=print) -> None:
     indistinguishable afterwards from one made under the lock -- which was the
     whole point of the original assert.
 
-    WHY drift_detach is being unlocked today: the 2026-09-08 call made MPC wall
-    clock "priority one". The lock's recorded rationale (2026-08-25) was "True's
+    WHY drift_detach is being unlocked today: as of 2026-09-08 ConicFlow wall
+    clock is "priority one". The lock's recorded rationale (2026-08-25) was "True's
     only benefit is speed, the speed gain is small" -- a judgement made when
     speed did not matter, and made one day BEFORE the 2026-08-26 endpoint-gradient
     fix that turned ``endpoint_map(..., grad=True)`` into the sole gradient path
@@ -232,7 +237,7 @@ def _assert_locked_defaults(cfg, log=print) -> None:
     if bad:
         raise ValueError(
             f"config diverges from the plan's locked defaults (see "
-            f"260825-task3-plan.md, 'Locked decisions -- do not re-litigate'): "
+            f"the design plan, 'Locked decisions -- do not re-litigate'): "
             f"got {bad}, expected {({k: _LOCKED_DEFAULTS[k] for k in bad})}. "
             f"These are closed decisions, not sweepable axes. To lift a lock "
             f"deliberately, set FLOWMAPS_UNLOCK to a comma-separated list of "
@@ -277,7 +282,7 @@ def _assert_boffi_rng_reachability_closed(cfg, latent: Optional[torch.Tensor]) -
     unreachable for this call.
 
     WHY THIS EXISTS (2026-08-25, following on from the numerical-inertness
-    check in the session log's Step 1 write-up, section 1.4d). That check
+    check in the development log's Step 1 write-up, section 1.4d). That check
     found CLIPReward construction ADVANCES the global RNG, and concluded the
     constraint-CLIP-loading narrowing is inert only because nothing
     DOWNSTREAM of the load consumes global RNG on the paths run_sweep.py
@@ -366,7 +371,7 @@ VALID_CONSTRAINT_DIRECTIONS = ("ge", "le")
 # Default StatsStore JSON backing ConstraintSpec normalizers. Single source
 # of truth shared by ConstraintSpec's own field default and the general-path
 # CLI's --constraint_stats_json default, so the two cannot drift apart.
-DEFAULT_STATS_JSON = "/home/sungcho/calibration_stats.json"
+DEFAULT_STATS_JSON = "calibration_stats.json"
 
 # Reward types whose ConstraintSpec.arg is a TEXT target (scored against the
 # image), as opposed to "style" (arg = a reference image path) or "lpips"
@@ -488,24 +493,24 @@ class RunConfig:
     prompt:       str   = "a cat wearing sunglasses on a beach"     # image-generation prompt
     edit_prompt:  Optional[str] = None  # reward-model target prompt; falls back to `prompt` if None
     N:            int   = 4       # total denoising steps
-    H:            int   = 2       # MPC planning horizon (ignored for fmrg/boffi_fmrg)
-    control_type: str   = "mpc"   # "mpc" | "fmrg" | "boffi_fmrg" | "hardflow" | "none"
+    H:            int   = 2       # ConicFlow planning horizon (ignored for fmrg/boffi_fmrg)
+    control_type: str   = "conicflow"   # "conicflow" | "fmrg" | "boffi_fmrg" | "hardflow" | "none"
     lam:          float = 10.0    # control / guidance strength (== upstream step_size for boffi_fmrg)
-    n_inner:      int   = 5       # inner iters (MPC), n_opt (fmrg), or num_optim_iters (boffi_fmrg)
-    lr_inner:     float = 1e-2    # inner Adam lr (MPC only)
+    n_inner:      int   = 5       # inner iters (ConicFlow), n_opt (fmrg), or num_optim_iters (boffi_fmrg)
+    lr_inner:     float = 1e-2    # inner Adam lr (ConicFlow only)
     sample_mode:  str   = "flow_map2"
     guidance_scale: float = 3.5
     height:       int   = 256
     width:        int   = 256
-    warmstart:    bool  = True    # MPC only
-    n_alt:        int   = 1       # MPC only. Primal<->dual alternations per fixed
-                                      # window before it shifts (plan Step 5).
+    warmstart:    bool  = True    # ConicFlow only
+    n_alt:        int   = 1       # ConicFlow only. Primal<->dual alternations per fixed
+                                      # window before it shifts (the design plan).
                                       # 1 = original behavior (single solve, single
                                       # dual update). See
-                                      # image_mpc_edited_sung.receding_horizon_flow_control's
+                                      # control_loops.receding_horizon_flow_control's
                                       # n_alt docstring -- requires constraints
                                       # active (h + lr_dual>0) when > 1.
-    skip_first_primal_step: bool = False  # MPC only. Plan Step 7 option (b):
+    skip_first_primal_step: bool = False  # ConicFlow only. design plan option (b):
                                       # one dual-ascent update on the
                                       # UNCONTROLLED rollout's h, before the
                                       # loop starts, instead of wasting j=0's
@@ -514,10 +519,10 @@ class RunConfig:
                                       # warm start => energy=0 => nothing to
                                       # optimize at step 0). Composable with
                                       # a nonzero mu_init (option (a)) -- see
-                                      # image_mpc_edited_sung.py's docstring.
+                                      # control_loops.py's docstring.
                                       # Requires constraints active
                                       # (h + lr_dual>0) when True.
-    # MPC only. Default flipped False -> True and the lock LIFTED on 2026-09-16
+    # ConicFlow only. Default flipped False -> True and the lock LIFTED on 2026-09-16
     # (see _RETIRED_LOCKS for the full rationale and numbers). True evaluates
     # the drift for ell>0 under no_grad, dropping the J_v^T term from the
     # gradient. That is an approximation of the gradient, but the measured
@@ -536,22 +541,22 @@ class RunConfig:
     drift_detach: bool  = True
     # How endpoint_map predicts the terminal latent inside the inner objective.
     # "rollout" (default) integrates the remaining N-j-H steps, which is what
-    # makes MPC quadratic in N. "jump" takes ONE flow-map call with t_next=0 --
+    # makes ConicFlow quadratic in N. "jump" takes ONE flow-map call with t_next=0 --
     # the surrogate only; the applied trajectory is unchanged. Measured
     # 2026-09-16 at N=8/H=4: -33% wall clock, J better at lam=1 (2.2 sd) and
     # within noise at lam=10/100. Default stays "rollout" because it has not
     # been re-checked at the suite's N=10 and because switching it reproduces
-    # none of the results currently on disk. See image_mpc.make_flux_wrappers.
+    # none of the results currently on disk. See image_conicflow.make_flux_wrappers.
     endpoint_surrogate: str = "rollout"
-    constraint_on: str  = "endpoint"  # MPC only; "horizon" evaluates reward and
+    constraint_on: str  = "endpoint"  # ConicFlow only; "horizon" evaluates reward and
                                       # constraint at raw x_H, "endpoint" at the
                                       # flow-map-predicted terminal latent.
                                       # Default is "endpoint" per the locked
-                                      # decision (Shervin's copy defaulted to
+                                      # decision (an earlier copy defaulted to
                                       # "horizon"; deliberately not ported).
     # Inequality constraints: h_i(z) = threshold_i - clip(z, prompt_i) <= 0.
     # Each prompt pairs with the same-index threshold. Empty -> no constraint.
-    # MPC-only by design: requesting constraints with control_type != "mpc"
+    # ConicFlow-only by design: requesting constraints with control_type != "conicflow"
     # RAISES (see _run_one) rather than silently running unconstrained.
     # Step 4 of the plan replaces this pair with a general per-constraint spec
     # (arbitrary reward type + direction + normalizer); until then every
@@ -567,7 +572,7 @@ class RunConfig:
     constraint_specs: List["ConstraintSpec"] = field(default_factory=list)
     lr_dual:  float = 0.0   # dual-ascent step size (0 = frozen multipliers)
     mu_init:  float = 0.0   # initial value for all Lagrange multipliers
-    # MPC only. Normalize the dual step (and the Lagrangian's constraint term)
+    # ConicFlow only. Normalize the dual step (and the Lagrangian's constraint term)
     # per constraint by a running RMS scale, so constraints whose typical
     # violation is small are not starved of dual pressure under a shared
     # lr_dual. See receding_horizon_flow_control's dual_adaptive docstring.
@@ -588,14 +593,14 @@ class RunConfig:
     boffi_early_stop:       int = 0                # 0 = no uncontrolled tail
     boffi_unguided_steps:   int = 0
     boffi_noise_mode:       str = "deterministic"
-    # hardflow only -- passed through to image_mpc_edited_sung.hardflow_image.
+    # hardflow only -- passed through to control_loops.hardflow_image.
     # Defaults reproduce the authors' released implementation (utils/methods.py
     # in azizanlab/HardFlow@016adb2), per the 2026-08-31 decision to "keep their
     # implementation the same and just change the model". Two exceptions, both
     # deliberate and both recorded in hardflow_image's docstring:
     #   - hardflow_activation defaults to 0.0 (control from step 0) rather than
-    #     their hard-coded 0.5, for parity with our MPC setting. Shervin asked
-    #     for this to be a hyperparameter rather than hard-coded; set 0.5 to
+    #     their hard-coded 0.5, for parity with our ConicFlow setting. It is
+    #     exposed as a hyperparameter rather than hard-coded; set 0.5 to
     #     reproduce their schedule.
     #   - the regularizer SIGN is the paper's, not their code's (theirs rewards
     #     deviation from the nominal endpoint -- see the docstring).
@@ -607,7 +612,7 @@ class RunConfig:
     # factor of 2*dt and hides an N-dependence). Derivation, both in terms of
     # the same u_t that summary.csv's ctrl_energy is built from:
     #
-    #   MPC        resid_l = dt*u_l, so the energy term is
+    #   ConicFlow        resid_l = dt*u_l, so the energy term is
     #              sum_l ||dt*u_l||^2 / (2*lam*dt) = ctrl_energy_window/(2*lam)
     #   HardFlow   the applied displacement is D = alpha*(x_hat - z_pred_ref)
     #              = z - z_next_ref, and the stored control is u_k = D/dt, so
@@ -624,7 +629,7 @@ class RunConfig:
     # run_preflight prints the implied equivalent lam on every hardflow run so
     # a mismatch is visible in the log rather than silent.
     #
-    # The correspondence is exact PER STEP only. MPC's penalty is summed over an
+    # The correspondence is exact PER STEP only. ConicFlow's penalty is summed over an
     # H-step planning window that is re-solved each outer step and mostly
     # discarded, so no single scalar makes the two objectives identical -- this
     # matches the marginal cost of control effort, not the total.
@@ -633,19 +638,19 @@ class RunConfig:
     # opposite of `lam` above, which divides.
     # n_inner and lr_inner above are REUSED for hardflow rather than shadowed:
     # they are the same axis (inner iterations per outer step, and the inner
-    # step size), and the compute-budget comparison Shervin asked for needs one
+    # step size), and the compute-budget comparison needs one
     # column to mean one thing across control types. The authors' values are
     # n_inner=40, lr_inner=2.5 -- set them explicitly on hardflow configs; they
-    # are NOT the RunConfig defaults, which are MPC's.
+    # are NOT the RunConfig defaults, which are ConicFlow's.
     hardflow_rho:        float = 5.0    # AL quadratic penalty weight
     hardflow_rho_mult:   float = 2.0    # rho growth factor on violation
     hardflow_dual_every: int   = 8      # inner steps between dual updates
-    # 0.0 as of 2026-09-10 (was 0.02, the authors' hard-coded value). Decided on
-    # the 09-10 call: the margin tightens every constraint by 0.02 while the run
+    # 0.0 as of 2026-09-10 (was 0.02, the authors' hard-coded value). Decision of
+    # 2026-09-10: the margin tightens every constraint by 0.02 while the run
     # is scored against the UNtightened threshold, and it is undocumented in
-    # their paper. Shervin's read is that it is specific to the setting they
+    # their paper. Our reading is that it is specific to the setting they
     # constrained in; ours does not want it. It also removed a real asymmetry --
-    # the MPC arm gets no margin at all, so every HardFlow-vs-MPC row before
+    # the ConicFlow arm gets no margin at all, so every HardFlow-vs-ConicFlow row before
     # today gave HardFlow a 0.02 head start on feasibility (generous to the
     # baseline, not stingy, so earlier "HardFlow still loses" conclusions stand).
     #
@@ -657,12 +662,12 @@ class RunConfig:
     hardflow_margin:     float = 0.0    # was 0.02 = their constraint tightening
     hardflow_activation: float = 0.0    # fraction of steps to skip (theirs: 0.5)
     # None = DERIVE as reg = N/(2*lam) (derivation above), the value that makes
-    # HardFlow's control-effort penalty match MPC's per step.
+    # HardFlow's control-effort penalty match ConicFlow's per step.
     #
     # Was a fixed 5e-4 until 2026-09-16. WHY THAT CHANGED: 5e-4 is N/(2*lam) at
     # lam=10000 and N=10 AND NOWHERE ELSE -- reg is N-dependent, so every other
-    # (N, lam) point silently mismatched the MPC arm it was plotted against (an
-    # N=20 hardflow arm ran half as regularized as its MPC counterpart). A
+    # (N, lam) point silently mismatched the ConicFlow arm it was plotted against (an
+    # N=20 hardflow arm ran half as regularized as its ConicFlow counterpart). A
     # constant cannot track two axes. Deriving also makes `lam` mean the same
     # thing on both paths; it used to be read-but-inert on this one.
     #
@@ -673,13 +678,13 @@ class RunConfig:
     # Resolved to a float by _resolve_hardflow_reg before any run executes;
     # run_preflight raises if an unresolved None reaches a hardflow run.
     hardflow_reg:        Optional[float] = None  # deviation penalty; None = derive
-    # "flow_map1" | "flow_matching" | "mpc_rollout".
+    # "flow_map1" | "flow_matching" | "conicflow_rollout".
     # The first two are single-NFE terminal estimates, which is HardFlow's
-    # efficiency claim. "mpc_rollout" is the ESTIMATOR ABLATION (2026-09-08):
-    # it hands hardflow_image MPC's endpoint_map instead, so the head-to-head
+    # efficiency claim. "conicflow_rollout" is the ESTIMATOR ABLATION (2026-09-08):
+    # it hands hardflow_image ConicFlow's endpoint_map instead, so the head-to-head
     # stops confounding "which control algorithm" with "which endpoint
     # estimate" -- the two disagree by ~2 ImageReward units at step 0
-    # (260907-two-constraint-report.md SS3). Affordable because HardFlow
+    # (the two-constraint report SS3). Affordable because HardFlow
     # evaluates the endpoint once per OUTER step, not per inner step; it takes
     # NFE from 2N to N + N(N+1)/2, so ~115 s/run rather than ~90 s.
     hardflow_endpoint_mode: str = "flow_map1"
@@ -689,7 +694,7 @@ class RunConfig:
     # that is a floor lam >= N*lr/2 -- 12.5 at N=10 with the authors' lr=2.5 --
     # which for ImageReward sits ABOVE HardFlow's entire transition, so every
     # admissible lam is a plateau point and the method can never be compared to
-    # MPC at a shared lam in the regularised regime (results/autorange/).
+    # ConicFlow at a shared lam in the regularised regime (results/autorange/).
     # When set, any run with lr_inner*reg >= 1 uses lr = hardflow_lr_alpha/reg
     # instead, i.e. the product lr*reg is pinned at hardflow_lr_alpha < 1. That
     # is not a hack around the guard: the inner loop's contraction factor
@@ -709,7 +714,7 @@ class RunConfig:
     # (best perceptual correlation in the original LPIPS paper, but by far
     # the most expensive: no early aggressive downsampling keeps activations
     # large through many layers) given only ~4.8GB headroom measured at the
-    # MPC H=4/drift_detach=False worst case (see style reward's S4 memory
+    # ConicFlow H=4/drift_detach=False worst case (see style reward's S4 memory
     # measurement, same mechanism applies here). 'squeeze' is a fallback if
     # 'alex' doesn't fit; not yet measured on GPU.
     lpips_net: str = "alex"   # "alex" | "vgg" | "squeeze"
@@ -720,24 +725,24 @@ class RunConfig:
 
 SWEEP_CONFIGS: List[RunConfig] = [
     # ── prompt sweep ────────────────────────────────────────────────────────
-    RunConfig(prompt="a sunset over the ocean",         N=4, H=2, control_type="mpc",  lam=50.0),
+    RunConfig(prompt="a sunset over the ocean",         N=4, H=2, control_type="conicflow",  lam=50.0),
     RunConfig(prompt="a sunset over the ocean",         N=4, H=2, control_type="boffi_fmrg", lam=5.0),
     RunConfig(prompt="a sunset over the ocean",         N=4, H=2, control_type="none"),
-    # ── horizon sweep (mpc) ─────────────────────────────────────────────────
-    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=1, control_type="mpc",  lam=50.0),
-    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="mpc",  lam=50.0),
-    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=3, control_type="mpc",  lam=50.0),
+    # ── horizon sweep (conicflow) ─────────────────────────────────────────────────
+    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=1, control_type="conicflow",  lam=50.0),
+    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="conicflow",  lam=50.0),
+    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=3, control_type="conicflow",  lam=50.0),
     # ── N sweep ─────────────────────────────────────────────────────────────
-    RunConfig(prompt="a cat wearing sunglasses",        N=3, H=2, control_type="mpc",  lam=50.0),
-    RunConfig(prompt="a cat wearing sunglasses",        N=6, H=2, control_type="mpc",  lam=50.0),
+    RunConfig(prompt="a cat wearing sunglasses",        N=3, H=2, control_type="conicflow",  lam=50.0),
+    RunConfig(prompt="a cat wearing sunglasses",        N=6, H=2, control_type="conicflow",  lam=50.0),
     # ── lambda sweep ────────────────────────────────────────────────────────
-    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="mpc",  lam=5.0),
-    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="mpc",  lam=200.0),
+    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="conicflow",  lam=5.0),
+    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="conicflow",  lam=200.0),
     # ── sample mode comparison ───────────────────────────────────────────────
-    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="mpc",  lam=50.0, sample_mode="flow_map1"),
+    RunConfig(prompt="a cat wearing sunglasses",        N=4, H=2, control_type="conicflow",  lam=50.0, sample_mode="flow_map1"),
     # ── edit_prompt example: generate with one prompt, reward against another ──
     RunConfig(prompt="a portrait of a man",             edit_prompt="a smiling face",
-              N=4, H=2, control_type="mpc",  lam=50.0),
+              N=4, H=2, control_type="conicflow",  lam=50.0),
     RunConfig(prompt="a portrait of a man",             edit_prompt="a smiling face",
               N=4, H=2, control_type="boffi_fmrg", lam=5.0),
 ]
@@ -762,7 +767,7 @@ def _run_uncontrolled(sampler, z0, cfg: RunConfig, device, dtype, log: Callable 
     done so) because this function is directly, independently callable --
     _run_one calls it, but so, plausibly, will the Step 3 calibration script,
     which sample-only-varies-seed from the uncontrolled model and has no
-    reason to route through _run_one's full MPC/reward-closure machinery at
+    reason to route through _run_one's full ConicFlow/reward-closure machinery at
     all. check_boffi_rng is never set: this function has nothing to do with
     boffi_fmrg regardless of cfg.control_type (it's the plain uncontrolled
     rollout for whatever N/sample_mode is configured), so that check is
@@ -798,7 +803,7 @@ def _run_uncontrolled(sampler, z0, cfg: RunConfig, device, dtype, log: Callable 
 
 def _ctrl_norms_from_traj(
     traj: torch.Tensor,
-    v_theta_mpc,
+    v_theta_conicflow,
     N: int,
     device: torch.device,
     dtype: torch.dtype,
@@ -808,7 +813,7 @@ def _ctrl_norms_from_traj(
     Uses the definition   u_t = x_{t+1} - x_t - dt * b_t(x_t)
     (i.e. the residual between the actual step and the uncontrolled drift).
 
-    This is independent of how the control was parameterized internally (MPC
+    This is independent of how the control was parameterized internally (ConicFlow
     stores u/dt, FMRG stores the guidance displacement), so norms are
     comparable across methods.
 
@@ -825,7 +830,7 @@ def _ctrl_norms_from_traj(
         for t_idx in range(N):
             x_t   = traj[t_idx    ].to(device=device, dtype=dtype)
             x_next = traj[t_idx + 1].to(device=device, dtype=dtype)
-            b_t   = v_theta_mpc(t_grid[t_idx].to(device), x_t)
+            b_t   = v_theta_conicflow(t_grid[t_idx].to(device), x_t)
             u_t   = x_next - x_t - dt * b_t          # displacement residual
             norms.append(u_t.flatten(1).norm(dim=1).mean().item())
     import numpy as np
@@ -836,7 +841,7 @@ def _ctrl_norms_from_traj(
 
 def _ctrl_norms_from_traj_nonuniform(
     traj: torch.Tensor,
-    v_theta_mpc,
+    v_theta_conicflow,
     dts: list,
     t_curs: list,
     device: torch.device,
@@ -852,9 +857,9 @@ def _ctrl_norms_from_traj_nonuniform(
     time for every step past the first, silently miscomputing ctrl_energy.
     dts/t_curs are the ACTUAL per-step values realized by that trajectory.
 
-    t_curs are in FLUX time convention (1=noise, 0=data); converted to MPC's
-    s = 1 - t_flux to match what v_theta_mpc (from make_flux_wrappers)
-    expects, same convention used throughout image_mpc.py.
+    t_curs are in FLUX time convention (1=noise, 0=data); converted to ConicFlow's
+    s = 1 - t_flux to match what v_theta_conicflow (from make_flux_wrappers)
+    expects, same convention used throughout image_conicflow.py.
 
     Instrumentation (added 2026-08-21, Phase A of the boffi_fmrg
     ctrl_energy=nan investigation): raises FloatingPointError at the FIRST
@@ -888,8 +893,8 @@ def _ctrl_norms_from_traj_nonuniform(
             x_t_finite = bool(torch.isfinite(x_t).all().item())
             x_next_finite = bool(torch.isfinite(x_next).all().item())
 
-            s_mpc = torch.tensor(1.0 - t_cur_i, device=device)
-            b_t = v_theta_mpc(s_mpc, x_t)
+            s_conicflow = torch.tensor(1.0 - t_cur_i, device=device)
+            b_t = v_theta_conicflow(s_conicflow, x_t)
             b_t_finite = bool(torch.isfinite(b_t).all().item())
 
             u_t = x_next - x_t - dt_i * b_t
@@ -910,10 +915,10 @@ def _ctrl_norms_from_traj_nonuniform(
                     f"  whole traj tensor non-finite on arrival (checked before loop start): {not traj_finite_on_arrival}",
                     f"  ARRIVED BAD at this step (x_t/x_next already non-finite entering it): {arrived_bad}",
                     f"  CREATED BAD inside this step (b_t or u_t non-finite despite finite x_t/x_next): {not arrived_bad}",
-                    f"  dt_i={dt_i}  t_cur_i={t_cur_i}  s_mpc={s_mpc.item()}",
+                    f"  dt_i={dt_i}  t_cur_i={t_cur_i}  s_conicflow={s_conicflow.item()}",
                     "  " + _stats("x_t", x_t),
                     "  " + _stats("x_next", x_next),
-                    "  " + _stats("b_t (v_theta_mpc output)", b_t),
+                    "  " + _stats("b_t (v_theta_conicflow output)", b_t),
                     "  " + _stats("u_t (= x_next - x_t - dt*b_t)", u_t),
                 ])
                 if dump_path:
@@ -941,7 +946,7 @@ def _sample_boffi_fmrg_with_trajectory(sampler, boffi_reward, z0, cfg, device):
     arguments, its return value passed through completely unmodified), and
     restores the original afterward. This is a runtime attribute shadow on
     one Python object in one process -- nothing on disk (fluxfm_sampler_reward.py,
-    image_mpc.py) is touched by it.
+    image_conicflow.py) is touched by it.
 
     Reconstruction: for grad_mode="jac", sample_mode in {flow_map1, flow_map2},
     reward_consistency_xt is called exactly once per outer step (no warmup)
@@ -1485,7 +1490,7 @@ def _specs_from_cli_lists(
     ``--constraint_prompts``/``--constraint_thresholds`` pair, so
     ``RunConfig.constraint_specs`` -- the field the whole generalized path
     reads -- was reachable only by editing SWEEP_CONFIGS or writing a driver
-    script in Python. That made plan Steps 6, 7, 8 and 10 unlaunchable from
+    script in Python. That made several planned experiments unlaunchable from
     the command line, since every one of them needs a non-CLIP constraint
     (style / ImageReward / LPIPS). Found while assembling the run commands
     for the first real GPU window.
@@ -1580,11 +1585,11 @@ def _validate_constraint_cfg(cfg) -> int:
         return 0
 
     # (i) Constraints are supported ONLY by the constrained control types.
-    # Originally MPC-only (locked decision); "hardflow" joined it on
+    # Originally ConicFlow-only (locked decision); "hardflow" joined it on
     # 2026-08-31 as the constrained baseline -- it is a constrained method by
     # construction, so running it with no constraint would be pointless
     # rather than merely degraded. fmrg/boffi_fmrg remain unconstrained
-    # methods and still RAISE here: Shervin's original logged
+    # methods and still RAISE here: an earlier copy logged
     # "WARNING: ... ignoring.", ran unconstrained with h=None and exited 0,
     # while the CSV row still claimed n_constraints=2.
     if cfg.control_type not in CONSTRAINED_CONTROL_TYPES:
@@ -1597,7 +1602,7 @@ def _validate_constraint_cfg(cfg) -> int:
             f"drop the constraints."
         )
 
-    # (ii) The silent no-op (plan step 1.5): lr_dual and mu_init BOTH default to
+    # (ii) The silent no-op (see the design plan): lr_dual and mu_init BOTH default to
     # 0.0, which makes sum_i mu_i h_i identically zero for the whole run. The
     # constraint is then a no-op with no error anywhere.
     if cfg.lr_dual == 0.0 and cfg.mu_init == 0.0:
@@ -1628,7 +1633,7 @@ def _validate_constraint_cfg(cfg) -> int:
             raise ValueError(
                 "ConstraintSpec(reward_type='lpips', normalize=True): LPIPS "
                 "normalization is ill-posed on uncontrolled calibration "
-                "samples (plan section 3.7, unresolved -- Shervin's call). "
+                "samples (plan section 3.7, unresolved). "
                 "Pass normalize=False to use a raw-scale LPIPS threshold, or "
                 "wait for that decision."
             )
@@ -1706,10 +1711,10 @@ def _report_cuda_topology(log=print) -> None:
 
 def _validate_dual_options_cfg(cfg, n_constraints: int) -> None:
     """Fail-fast mirror of the two primal/dual option guards that otherwise
-    only fire INSIDE image_mpc_edited_sung.receding_horizon_flow_control.
+    only fire INSIDE control_loops.receding_horizon_flow_control.
 
-    WHY THIS EXISTS (2026-08-26). `n_alt` (plan Step 5) and
-    `skip_first_primal_step` (plan Step 7 option (b)) both validate
+    WHY THIS EXISTS (2026-08-26). `n_alt` (the design plan) and
+    `skip_first_primal_step` (the design plan option (b)) both validate
     themselves at the top of `receding_horizon_flow_control` -- correct, but
     that function is only reached AFTER the FLUX load AND after the
     uncontrolled baseline rollout completes, so a mis-specified Step 7
@@ -1720,14 +1725,14 @@ def _validate_dual_options_cfg(cfg, n_constraints: int) -> None:
     in-function guards are deliberately KEPT -- this is a second, earlier
     check of the same conditions, not a relocation, because
     `receding_horizon_flow_control` is importable and callable directly
-    (Shervin's side, notebooks) without going through run_preflight at all.
+    (e.g. from notebooks) without going through run_preflight at all.
 
     Third check, which the in-function guards structurally CANNOT make:
-    both options are MPC-only and are simply not passed on the fmrg /
+    both options are ConicFlow-only and are simply not passed on the fmrg /
     boffi_fmrg / none paths, so setting either away from its default with a
-    non-mpc control_type is a silent no-op -- the run completes, exits 0,
+    non-conicflow control_type is a silent no-op -- the run completes, exits 0,
     and its CSV row records `n_alt=2` for a run that never alternated. Same
-    class as D5 (constraints + non-mpc control_type) and given the same
+    class as D5 (constraints + non-conicflow control_type) and given the same
     treatment: raise.
     """
     dual_opts_set = []
@@ -1740,17 +1745,17 @@ def _validate_dual_options_cfg(cfg, n_constraints: int) -> None:
     if not dual_opts_set:
         return
 
-    # (i) MPC-only. Neither option is forwarded on any other control path, so
-    # a non-mpc run would silently ignore it while the CSV row still claims it.
-    if cfg.control_type != "mpc":
+    # (i) ConicFlow-only. Neither option is forwarded on any other control path, so
+    # a non-conicflow run would silently ignore it while the CSV row still claims it.
+    if cfg.control_type != "conicflow":
         raise ValueError(
             f"{' and '.join(dual_opts_set)} requested with "
-            f"control_type={cfg.control_type!r}. Both are MPC-only (they are "
+            f"control_type={cfg.control_type!r}. Both are ConicFlow-only (they are "
             f"arguments to receding_horizon_flow_control and are not passed "
             f"on the fmrg/boffi_fmrg/none paths), so this would run to "
             f"completion having silently ignored them while the CSV row "
             f"still recorded them -- indistinguishable afterwards from a run "
-            f"that honored them. Use control_type=mpc, or leave both at "
+            f"that honored them. Use control_type=conicflow, or leave both at "
             f"their defaults (n_alt=1, skip_first_primal_step=False)."
         )
 
@@ -1788,7 +1793,7 @@ def run_preflight(
     log: Callable = print,
 ) -> int:
     """Single preflight entry point for every code path that executes a
-    RunConfig. Existing entry points: _run_one (MPC/fmrg/boffi_fmrg),
+    RunConfig. Existing entry points: _run_one (ConicFlow/fmrg/boffi_fmrg),
     _run_uncontrolled (the uncontrolled baseline -- called both from inside
     _run_one and, standalone, by the Step 3 calibration script once it's
     built), main()'s pre-FLUX-load sweep check, and
@@ -1798,8 +1803,8 @@ def run_preflight(
     _assert_locked_defaults / _validate_constraint_cfg / (for the boffi path)
     _assert_boffi_rng_reachability_closed directly and separately. Three
     independent call sites are three places to drift out of sync -- exactly
-    the class of failure Step 1 spent an entire session undoing (mine vs.
-    Shervin's diverged run_sweep.py copies). Every future entry point
+    the class of failure Step 1 spent an entire session undoing (two
+    diverged run_sweep.py copies). Every future entry point
     (starting with the Step 3 calibration script) should call THIS function,
     not the three guards individually.
 
@@ -1810,9 +1815,9 @@ def run_preflight(
     at all):
       - _assert_locked_defaults  (constraint_on / warmstart; drift_detach was
         lifted 2026-09-16 -- see _RETIRED_LOCKS)
-      - _validate_constraint_cfg (D5 mpc-only / D4 silent-no-op / D3
+      - _validate_constraint_cfg (D5 conicflow-only / D4 silent-no-op / D3
         threshold-count / MAX_CONSTRAINTS)
-      - _validate_dual_options_cfg (n_alt / skip_first_primal_step: MPC-only,
+      - _validate_dual_options_cfg (n_alt / skip_first_primal_step: ConicFlow-only,
         and both no-ops without an active dual update -- an EARLIER copy of
         guards that also live inside receding_horizon_flow_control, so a bad
         Step 5/7 sweep fails before the FLUX load rather than minutes into
@@ -1868,16 +1873,16 @@ def _resolve_hardflow_reg(cfg: RunConfig, *, log: Callable = print) -> None:
 
     WHY DERIVED RATHER THAN SUPPLIED (2026-09-16). reg and lam are the same
     physical quantity -- the coefficient on the squared displacement away from
-    the nominal flow -- but MPC gets N/(2*lam) structurally out of its energy
+    the nominal flow -- but ConicFlow gets N/(2*lam) structurally out of its energy
     term (``resid^2 / (2*lam*dt)`` with ``dt = 1/N``), while HardFlow took reg
     as a raw number that nothing derived and nothing checked. Since reg carries
     an N-dependence, a value matched to a lam at one step count is wrong at
     every other one, silently. Deriving removes that entire class of error.
 
     NOT APPLIED to non-hardflow control types. reg is never passed to the
-    mpc/fmrg/boffi_fmrg paths, so it is inert there; those rows keep
+    conicflow/fmrg/boffi_fmrg paths, so it is inert there; those rows keep
     _HARDFLOW_REG_LEGACY_DEFAULT rather than acquiring a freshly-computed
-    number in an existing CSV column, which keeps pre-2026-09-16 mpc/fmrg rows
+    number in an existing CSV column, which keeps pre-2026-09-16 conicflow/fmrg rows
     comparable with post- ones on a column that never meant anything for them.
 
     LOUD FAIL on lam <= 0 rather than a fallback: N/(2*lam) is undefined at
@@ -1900,7 +1905,7 @@ def _resolve_hardflow_reg(cfg: RunConfig, *, log: Callable = print) -> None:
 
 
 def _log_hardflow_reg_equivalence(cfg: RunConfig, *, log: Callable = print) -> None:
-    """Print the MPC `lam` that this run's `hardflow_reg` is equivalent to.
+    """Print the ConicFlow `lam` that this run's `hardflow_reg` is equivalent to.
 
     WHY THIS IS PRINTED RATHER THAN ASSERTED. hardflow_reg and lam are the same
     physical quantity under reg = N/(2*lam) (see the RunConfig comment for the
@@ -1928,8 +1933,8 @@ def _log_hardflow_reg_equivalence(cfg: RunConfig, *, log: Callable = print) -> N
             "comparable with runs that derive reg from lam.")
         return
     lam_equiv = cfg.N / (2.0 * cfg.hardflow_reg)
-    log(f"  hardflow_reg={cfg.hardflow_reg:g} at N={cfg.N} == MPC lam {lam_equiv:g} "
-        f"(reg = N/(2*lam)). Compare against MPC arms run at that lam.")
+    log(f"  hardflow_reg={cfg.hardflow_reg:g} at N={cfg.N} == ConicFlow lam {lam_equiv:g} "
+        f"(reg = N/(2*lam)). Compare against ConicFlow arms run at that lam.")
 
     # See the docstring: derived reg agrees with cfg.lam by construction, so a
     # disagreement can only come from an explicit --sweep_hardflow_reg.
@@ -1998,7 +2003,7 @@ def _build_constraint_fn(
     _build_reward_fn call lets C constraints at one z share one VAE decode
     instead of paying C. The slot is keyed by tensor identity and evicted on
     every miss (capacity 1), so it never accumulates memory across the many
-    DIFFERENT z's one MPC run's inner solve evaluates h at -- it only ever
+    DIFFERENT z's one ConicFlow run's inner solve evaluates h at -- it only ever
     helps the C constraints within a single h(z) call, never across calls.
 
     Returns None when specs is empty.
@@ -2027,7 +2032,7 @@ def _build_constraint_fn(
     # alive, `ref() is z` identifies it exactly; if it died, the weakref reads
     # None, so an address-recycled newcomer is a miss rather than a false hit.
     # A strong reference would also be correct but would pin the cached z's
-    # autograd graph alive between inner-loop iterations, which this box's
+    # autograd graph alive between inner-loop iterations, which the
     # memory budget cannot spare.
     _decode_slot: dict = {"ref": None, "val": None}
 
@@ -2084,7 +2089,7 @@ def _build_constraint_fn(
             # `spec.arg` is something else entirely per reward type -- a
             # style REFERENCE IMAGE PATH, or an imagereward TEXT TARGET -- so
             # the lookup was for keys that can never exist
-            # (store.get('style', '/home/.../xingkong_style_ref.jpg') -> None,
+            # (store.get('style', '/path/to/style_ref.jpg') -> None,
             # raising "No calibration stats"). It coincidentally looked right
             # for a CLIP constraint whose text target happened to equal the
             # generation prompt, which is why it survived Step 4's tests.
@@ -2103,7 +2108,7 @@ def _build_boffi_reward_ensemble(reward_device, reward_model: str) -> RewardEnse
     """RewardEnsemble with only `reward_model`'s weight turned on.
 
     Lets sample_reward_guided's guidance be driven by a single reward model,
-    matching what our fmrg_j_image/MPC paths score against -- the other three
+    matching what our fmrg_j_image/ConicFlow paths score against -- the other three
     models are never loaded (RewardEnsemble skips loading a model whose weight
     is 0).
     """
@@ -2127,7 +2132,7 @@ def _clip_score_pixel(clip_reward_obj, preprocess, img_01: torch.Tensor, prompt:
 
     Same convention as _build_reward_fn's "clip" branch (raw cosine, no
     logit_scale, no loss offset) so it's directly comparable to r_unc/r_ctrl
-    from the mpc/fmrg paths when --reward clip is used. Reuses whatever CLIP
+    from the conicflow/fmrg paths when --reward clip is used. Reuses whatever CLIP
     weights are already loaded via _build_reward_fn -- no extra GPU memory.
     """
     with torch.no_grad():
@@ -2145,7 +2150,7 @@ def _independent_clip_rescore(sampler, z: torch.Tensor, prompt: str, device) -> 
     """Re-score a latent's raw CLIP cosine similarity via a code path that
     shares NO object with _build_reward_fn's clip closure or _clip_score_pixel
     (which explicitly reuses the closure's weights). Added 2026-08-21, Phase B:
-    MPC shares one r_image closure between the optimization gradient and the
+    ConicFlow shares one r_image closure between the optimization gradient and the
     logged r_ctrl -- a clean-looking log is not by itself evidence the
     optimized objective was clean. This builds a fresh CLIPModel + tokenizer,
     computes a fresh text embedding, and re-decodes the latent fresh, so the
@@ -2200,7 +2205,7 @@ def _run_one(
 
     ``probe_h_repeat`` / ``probe_hardflow_duals`` are DIAGNOSTICS, default-off
     and inert when off. Both exist to answer questions raised by the
-    ``20260904_231018_lpr2c`` grid (see ``260907-two-constraint-report.md``):
+    ``20260904_231018_lpr2c`` grid (see the two-constraint report):
 
       probe_h_repeat K       -- 3 of 24 runs tripped the endpoint/raw alignment
                                 guard, i.e. h(endpoint_map(1, z_N)) != h(z_N)
@@ -2241,11 +2246,11 @@ def _run_one(
     # _sample_boffi_fmrg_with_trajectory, once the latent exists.
     n_constraints = run_preflight(cfg, log=log)
 
-    # ── Peak-memory instrumentation (added 2026-08-26 for plan Step 6) ──────
+    # ── Peak-memory instrumentation (added 2026-08-26 for the design plan) ──────
     # Step 6's stated deliverable is "a peak-memory number... for the actual
     # Task 3 pair under the actual loop" -- but nothing in this file measured
     # memory at all: the only peak-memory numbers on record came from
-    # calibrate_rewards.py (no MPC, no gradients) and from a pre-meeting
+    # calibrate_rewards.py (no ConicFlow, no gradients) and from an early
     # single fwd+bwd probe. So Step 6 was not satisfiable by running this
     # script, independently of GPU availability. Reset here (per run, after
     # preflight so a rejected config doesn't clear a prior run's stats) and
@@ -2306,7 +2311,7 @@ def _run_one(
     # type is used as both --reward and a constraint, that checkpoint resides
     # TWICE simultaneously (once per _build_reward_fn call). Registry-based
     # sharing across reward-path and constraint-path scorers is still
-    # deferred (plan Step 4.3's TODO, carried forward unresolved) -- this is
+    # deferred (the design plan's TODO, carried forward unresolved) -- this is
     # only the notice, not the fix. NOT quiet-gated (plain print, not log()):
     # memory-relevant, not routine progress. Costs zero on every currently
     # planned config, all of which run --reward none.
@@ -2404,7 +2409,7 @@ def _run_one(
     # LPIPS constraint's r_image closure would then hit the "called before
     # ref_holder['x_ref'] was populated" RuntimeError on every run using it
     # -- e.g. the planned Step 8 usage (--reward none, LPIPS as a
-    # constraint). Plan Step 8 explicitly asks for "an explicit assert that
+    # constraint). The design plan explicitly asks for "an explicit assert that
     # ref_holder is populated before the first h evaluation"; populating it
     # correctly here is the fix that assert is checking for.
     _lpips_needs_ref = (reward_model == "lpips") or any(
@@ -2440,13 +2445,13 @@ def _run_one(
     endpoint_map = None
     time_ctrl = 0.0
     r_ctrl_final = float("nan")
-    r_ctrl_independent = float("nan")   # MPC only -- see the independent re-scoring block below
-    mu_final = None      # (B, C) tensor of final multipliers, MPC + constraints only
+    r_ctrl_independent = float("nan")   # ConicFlow only -- see the independent re-scoring block below
+    mu_final = None      # (B, C) tensor of final multipliers, ConicFlow + constraints only
     mu_hist = None       # (N, B, C) tensor of per-outer-step multipliers
-    h_dual_hist = None   # (N, B, C) the h each dual update actually consumed (mpc and
-                         # hardflow as of 2026-09-08; fmrg has no duals. Formerly MPC-only;
+    h_dual_hist = None   # (N, B, C) the h each dual update actually consumed (conicflow and
+                         # hardflow as of 2026-09-08; fmrg has no duals. Formerly ConicFlow-only;
                          # None elsewhere). Recorded because the reconstruction below
-                         # evaluates h at the REALIZED state while MPC's dual reads it at
+                         # evaluates h at the REALIZED state while ConicFlow's dual reads it at
                          # the optimizer's horizon endpoint, H steps ahead -- so the two
                          # disagree and mu appears to fall while h is still positive.
     boffi_img_tensor = None   # only set for control_type == "boffi_fmrg" (decoded pixel image, no latent)
@@ -2462,20 +2467,26 @@ def _run_one(
             f"silently record nothing."
         )
 
+    # Bound before the guard, not inside it: control_type="none" skips the whole
+    # control block but _run_one still writes hardflow_lr_eff into its result
+    # dict, so leaving it to the hardflow path made every "none" run die with
+    # UnboundLocalError. The constrained experiment's threshold probe is a
+    # control_type="none" run, so this is load-bearing there.
+    hardflow_lr_eff = ""          # filled on the hardflow path; blank elsewhere
+
     if cfg.control_type != "none":
         v_theta, _, endpoint_map = make_flux_wrappers(
             sampler, cfg.prompt,
             guidance_scale=cfg.guidance_scale,
-            n_mpc_steps=cfg.N,
+            n_conicflow_steps=cfg.N,
             sample_mode=cfg.sample_mode,
             endpoint_surrogate=cfg.endpoint_surrogate,
         )
 
         log(f"  {cfg.control_type} run...")
         t0 = time.perf_counter()
-        hardflow_lr_eff = ""          # filled on the hardflow path; blank elsewhere
 
-        if cfg.control_type == "mpc":
+        if cfg.control_type == "conicflow":
             z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = receding_horizon_flow_control(
                 v_theta=v_theta,
                 r=r_image,
@@ -2517,7 +2528,7 @@ def _run_one(
                     f">= 1 -> using lr={hardflow_lr_eff:.4g} (= hardflow_lr_alpha "
                     f"{cfg.hardflow_lr_alpha:g} / reg)")
             # HardFlow (Li, Alim & Azizan, TPAMI 2026), ported in
-            # image_mpc_edited_sung.hardflow_image. Same return contract as
+            # control_loops.hardflow_image. Same return contract as
             # receding_horizon_flow_control, so mu_final/mu_hist feed the
             # existing constraint bookkeeping (mu_trace CSV, constraint plots)
             # with no changes. Note it takes `sampler` rather than v_theta:
@@ -2545,7 +2556,7 @@ def _run_one(
                 # given, so the mode string is the switch and only one of the
                 # two is ever in effect.
                 endpoint_map=(endpoint_map
-                              if cfg.hardflow_endpoint_mode == "mpc_rollout"
+                              if cfg.hardflow_endpoint_mode == "conicflow_rollout"
                               else None),
                 # Records h at HardFlow's own decision variable x_hat, so the
                 # constraint panel has a comparable series for this arm
@@ -2575,7 +2586,7 @@ def _run_one(
             # sample_reward_guided() itself only returns a decoded pixel image (no
             # latent/trajectory) -- _sample_boffi_fmrg_with_trajectory reconstructs the
             # latent trajectory via a temporary, non-invasive monkey-patch so control
-            # energy can be computed in the same convention as the mpc/fmrg paths.
+            # energy can be computed in the same convention as the conicflow/fmrg paths.
             boffi_reward = _build_boffi_reward_ensemble(reward_device, reward_model)
             boffi_img_tensor, boffi_traj, boffi_dts, boffi_t_curs = _sample_boffi_fmrg_with_trajectory(
                 sampler, boffi_reward, z0, cfg, device,
@@ -2600,7 +2611,7 @@ def _run_one(
                 boffi_img_tensor.float().detach().cpu(), output_type="pil")[0]
         else:
             r_ctrl_final = eval_r(z_ctrl).mean().item()
-            # Independent re-scoring (added 2026-08-21, Phase B): MPC shares
+            # Independent re-scoring (added 2026-08-21, Phase B): ConicFlow shares
             # one r_image closure between the optimization gradient and this
             # logging call -- a clean-looking log is not by itself evidence
             # the optimized objective was clean (Category A of the
@@ -2633,7 +2644,7 @@ def _run_one(
     _free(traj_unc)
 
     # Per-step control norms: u_t = x_{t+1} - x_t - dt·b_t(x_t)
-    # Computed from the trajectory for both MPC and FMRG so scales match.
+    # Computed from the trajectory for both ConicFlow and FMRG so scales match.
     ctrl_norms  = None
     ctrl_energy = float("nan")
     ctrl_dts    = None   # per-step dt, needed to split ctrl_energy across steps
@@ -2678,7 +2689,7 @@ def _run_one(
     #                           h(endpoint_map(s_t, z_t)), i.e. h at the
     #                           flow-map-predicted TERMINAL latent, which is the
     #                           quantity the dual update actually responds to
-    #                           (image_mpc.py's own progress bar uses exactly
+    #                           (image_conicflow.py's own progress bar uses exactly
     #                           this, ~L501-503). Under "horizon" the two coincide.
     #
     # This matters for Step 10.4: mu_hist is driven by the endpoint-convention
@@ -2692,8 +2703,8 @@ def _run_one(
     # does not return. What is reconstructed here is h at the endpoint predicted
     # from the REALIZED state after step j. Same convention, same units, and it is
     # the honest post-hoc proxy -- but it is not literally the number the dual
-    # step consumed. Recovering that exactly would require changing image_mpc.py,
-    # which is out of scope (locked: "image_mpc.py -- no change needed").
+    # step consumed. Recovering that exactly would require changing image_conicflow.py,
+    # which is out of scope (locked: "image_conicflow.py -- no change needed").
     #
     # Cost: the endpoint series adds ~N(N-1)/2 transformer forwards over the run
     # (endpoint_map rolls N-j-1 steps at outer step j). Deliberately NOT behind a
@@ -2821,7 +2832,7 @@ def _run_one(
     # (ctrl_norms itself, from _ctrl_norms_from_traj[_nonuniform] above -- the
     # trajectory-derived u_t = x_{t+1}-x_t-dt*b_t(x_t), never the progress-bar's
     # "|u|" field: fmrg_j_image's is the pre-lambda reward gradient, not a
-    # control at all, and MPC's inner/outer pbar values are a live, per-inner-
+    # control at all, and ConicFlow's inner/outer pbar values are a live, per-inner-
     # iteration preview of the same quantity computed here, not a substitute
     # for it. See EVIDENCE_REPORT.md's drift_detach-field investigation for why
     # these are named separately instead of repurposing the pbar field.
@@ -2829,8 +2840,8 @@ def _run_one(
     ctrl_norm_max  = float(ctrl_norms.max())  if ctrl_norms is not None else float("nan")
 
     # Lagrangian objective J = control_energy / (2*lam) - r_ctrl, matching the
-    # sign/scaling of the inner-loop loss in _horizon_objective (image_mpc.py).
-    # Lower J is better; this is what makes MPC vs. FMRG comparable at a fixed lam.
+    # sign/scaling of the inner-loop loss in _horizon_objective (image_conicflow.py).
+    # Lower J is better; this is what makes ConicFlow vs. FMRG comparable at a fixed lam.
     objective = float("nan")
     if cfg.control_type != "none":
         objective = ctrl_energy / (2.0 * cfg.lam) - r_ctrl_final
@@ -2964,8 +2975,8 @@ def _run_one(
         constraint_cells[f"sat_{i}"] = (_h_i <= 0.0) if _h_i is not None else ""
         constraint_cells[f"viol_{i}"] = max(_h_i, 0.0) if _h_i is not None else ""
 
-    # Peak memory for this run (plan Step 6). Read at the very end so it
-    # covers the whole run -- uncontrolled baseline, the MPC loop with its
+    # Peak memory for this run (the design plan). Read at the very end so it
+    # covers the whole run -- uncontrolled baseline, the ConicFlow loop with its
     # horizon graphs and Adam state, every constraint decode/score, and the
     # independent re-scoring pass. Empty (not 0.0) on CPU-only runs, so a
     # missing measurement is never mistaken for "used no memory".
@@ -3063,7 +3074,7 @@ def _run_one(
         _h_probe = _h_probe_result,           # diagnostic only, None unless --probe_h_repeat
         _dual_probe = _dual_probe,            # diagnostic only, None unless --probe_hardflow_duals
         _mu_hist         = mu_hist,           # tensor (N, B, C) or None
-        _h_dual_hist     = h_dual_hist,       # tensor (N, B, C) or None -- mpc + hardflow
+        _h_dual_hist     = h_dual_hist,       # tensor (N, B, C) or None -- conicflow + hardflow
         _constraint_specs      = list(_constraint_specs),
     )
 
@@ -3195,11 +3206,11 @@ def _save_constraint_plot(result: dict, out_dir: Path, cfg_tag: str) -> None:
         (b) mu_i     — Lagrange multiplier trajectory.
         (c) h_i      — constraint value, at three different endpoint estimates.
 
-    PANEL ORDER AND CONTENT match Shervin's low-dim
+    PANEL ORDER AND CONTENT match the low-dim
     ``lowdim/visualization_utils.py:visualize_control_results`` figures 3/4/5,
     and the post-hoc ``plot_lowdim_panels.py``, so the three figures can be read
-    against each other (2026-09-08 call: "ideally we would want them to be as
-    overlapping as possible"). Panel (a) is new as of that date; it was
+    against each other (2026-09-08: the three should be as overlapping as
+    possible). Panel (a) is new as of that date; it was
     previously only a bar chart in ``__reward.png`` on an integer outer-step
     axis, which does not line up with the other two panels' progress-time axis.
     Existing result dirs keep the old 1x2 layout -- they are immutable records.
@@ -3248,11 +3259,11 @@ def _save_constraint_plot(result: dict, out_dir: Path, cfg_tag: str) -> None:
             arg = os.path.basename(arg)
         return f"{rtype}:{arg}"[:40] if arg else rtype
 
-    # x-axis: progress time s=0..1 sampled at each MPC outer step
+    # x-axis: progress time s=0..1 sampled at each ConicFlow outer step
     t_steps = np.linspace(0.0, 1.0, N_steps + 1)
 
     # The h the DUAL actually consumed, one row per outer step (N), so it
-    # shares the mu panel's x-axis, not t_steps. See the 2026-09-03 call: the
+    # shares the mu panel's x-axis, not t_steps. Note (2026-09-03): the
     # reconstructed series below evaluates h at the REALIZED state x_j, while
     # the dual reads it at the optimizer's horizon endpoint x_{j+H} -- the two
     # disagree by ~H steps, which is why mu looked like it fell while h was
@@ -3417,7 +3428,7 @@ def _write_constraint_trace(result: dict, out_dir: Path, cfg_tag: str) -> Option
     violation shrink?" is unanswerable without the value it started from.
 
     COLUMNS
-        step               outer MPC step, 0..N (0 = initial condition)
+        step               outer ConicFlow step, 0..N (0 = initial condition)
         s                  progress time, step/N (0 = noise, 1 = data)
         constraint_names   ordered names, repeated per row so the file is
                            self-describing standalone; also joins to summary.csv
@@ -3537,7 +3548,7 @@ CSV_KEYS = [
     # a lifted lock is never indistinguishable afterwards from one made under
     # it -- which is the entire reason the lock assert exists.
     "unlocked",
-    # Peak memory per run (plan Step 6). Empty on CPU-only runs -- never 0.0,
+    # Peak memory per run (the design plan). Empty on CPU-only runs -- never 0.0,
     # so an absent measurement is distinguishable from a real zero.
     "peak_alloc_flux_gb", "peak_reserved_flux_gb", "peak_alloc_reward_gb",
     "n_constraints", "constraint_names", "lr_dual", "mu_init",
@@ -3848,20 +3859,20 @@ Sweep via CLI (cartesian product of all provided lists):
       --sweep_prompt "a sunset" "a cat" \\
       --sweep_N 4 6 \\
       --sweep_H 2 3 \\
-      --sweep_control_type mpc fmrg \\
+      --sweep_control_type conicflow fmrg \\
       --sweep_lam 50.0 200.0
 
   # separate generation prompt vs. editing/reward prompt:
   python run_sweep.py \\
       --sweep_prompt "a portrait of a man" \\
       --sweep_edit_prompt "a smiling face" \\
-      --sweep_control_type mpc fmrg \\
+      --sweep_control_type conicflow fmrg \\
       --sweep_lam 5.0 50.0 200.0
 
   # CLIP as constraint only (r = zero):
   python run_sweep.py \\
       --sweep_prompt "a portrait of a man" \\
-      --sweep_control_type mpc \\
+      --sweep_control_type conicflow \\
       --sweep_lam 10000.0 \\
       --reward none \\
       --constraint_prompts "a smiling face" \\
@@ -3872,7 +3883,7 @@ Sweep via CLI (cartesian product of all provided lists):
   # Steps 7/8/10 all steer entirely through constraints, never a scored reward):
   python run_sweep.py \\
       --sweep_prompt "a portrait of a man" \\
-      --sweep_control_type mpc \\
+      --sweep_control_type conicflow \\
       --sweep_lam 10000.0 \\
       --reward none \\
       --constraint_prompts "a smiling face" "with glasses" \\
@@ -3895,10 +3906,10 @@ Sweep via CLI (cartesian product of all provided lists):
   # style-DISTANCE as an upper bound.
   python run_sweep.py \\
       --sweep_prompt "a portrait of a man" --sweep_edit_prompt "a smiling face" \\
-      --sweep_control_type mpc --sweep_N 10 --sweep_H 4 --sweep_lam 10000.0 \\
+      --sweep_control_type conicflow --sweep_N 10 --sweep_H 4 --sweep_lam 10000.0 \\
       --reward none \\
       --constraint_types style imagereward \\
-      --constraint_args "/home/sungcho/xingkong_style_ref.jpg" "a smiling face" \\
+      --constraint_args "/path/to/style_ref.jpg" "a smiling face" \\
       --constraint_thresholds -900.0 -1.0 \\
       --constraint_directions ge ge \\
       --lr_dual 0.1 --mu_init 0.01
@@ -3907,9 +3918,9 @@ Sweep via CLI (cartesian product of all provided lists):
   # breaks"). Comma-joined negative specs are accepted:
   python run_sweep.py \\
       --sweep_prompt "a portrait of a man" --sweep_edit_prompt "a smiling face" \\
-      --sweep_control_type mpc --reward none \\
+      --sweep_control_type conicflow --reward none \\
       --constraint_types style imagereward \\
-      --constraint_args "/home/sungcho/xingkong_style_ref.jpg" "a smiling face" \\
+      --constraint_args "/path/to/style_ref.jpg" "a smiling face" \\
       --constraint_directions ge ge \\
       --sweep_constraint_thresholds "-900,-1.0" "-800,-0.5" "-700,0.0" \\
       --lr_dual 0.1 --mu_init 0.01
@@ -3920,15 +3931,15 @@ Sweep via CLI (cartesian product of all provided lists):
   # pool_calibration_stats.py first. bind_mode=global needs a GLOBAL entry.
   python run_sweep.py \\
       --sweep_prompt "a portrait of a man" --sweep_edit_prompt "a smiling face" \\
-      --sweep_control_type mpc --reward none \\
+      --sweep_control_type conicflow --reward none \\
       --constraint_types style imagereward \\
-      --constraint_args "/home/sungcho/xingkong_style_ref.jpg" "a smiling face" \\
+      --constraint_args "/path/to/style_ref.jpg" "a smiling face" \\
       --constraint_thresholds 1.0 1.0 \\
       --constraint_directions ge ge \\
       --constraint_normalize true true --constraint_bind_mode global \\
       --lr_dual 0.1 --mu_init 0.01
 
-Constraints are supported by --sweep_control_type mpc and hardflow only.
+Constraints are supported by --sweep_control_type conicflow and hardflow only.
 Requesting them with fmrg/boffi_fmrg raises (those are unconstrained methods),
 and so does lr_dual=0 together with mu_init=0 (a silent no-op).
 --constraint_prompts (legacy, CLIP-only) and --constraint_types (general) are
@@ -3941,7 +3952,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     )
     # ── infrastructure ───────────────────────────────────────────────────────
     # Absolute default (anchored to this script's own directory) so a relative
-    # "results" never lands inside Shervin's original repo if this is invoked
+    # "results" never lands inside another checkout if this is invoked
     # from a different cwd (e.g. cwd = flow_matching to pick up its imports).
     # Timestamp-prefixed subfolder: keeps runs chronologically sortable and
     # avoids different sweeps colliding on the same run_idx-based image tags.
@@ -4048,7 +4059,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     except Exception as _e:
         print(f"  note: diagnostics flags unavailable ({type(_e).__name__}: {_e})")
     parser.add_argument("--pbar_rewards", action="store_true",
-                        help="Compute the reward shown in the MPC progress bar. "
+                        help="Compute the reward shown in the ConicFlow progress bar. "
                              "OFF by default (2026-09-16): it costs a no-grad "
                              "endpoint rollout plus a decode and a reward-model "
                              "pass every outer step, and another decode + reward "
@@ -4069,7 +4080,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     parser.add_argument("--sweep_N",             nargs="+", type=int,   metavar="N")
     parser.add_argument("--sweep_H",             nargs="+", type=int,   metavar="H")
     parser.add_argument("--sweep_control_type",  nargs="+",
-                        choices=["mpc", "fmrg", "boffi_fmrg", "hardflow", "none"],
+                        choices=["conicflow", "fmrg", "boffi_fmrg", "hardflow", "none"],
                         metavar="TYPE")
     parser.add_argument("--sweep_lam",           nargs="+", type=float, metavar="LAM")
     parser.add_argument("--sweep_n_inner",       nargs="+", type=int,   metavar="N_INNER")
@@ -4099,7 +4110,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                         help="hardflow only. Fraction of sampling steps to skip "
                              "before enabling the constraint. Authors hard-code "
                              "0.5; default here is 0.0 (control from step 0) for "
-                             "parity with MPC.")
+                             "parity with ConicFlow.")
     parser.add_argument("--sweep_hardflow_reg",        nargs="+", type=float, metavar="REG",
                         help="hardflow only. Deviation-from-nominal-endpoint "
                              "penalty. MULTIPLIES (bigger = stronger), the "
@@ -4108,7 +4119,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "reg = N/(2*lam), NOT 1/lam -- it depends on N. "
                              "OMIT THIS FLAG and reg is DERIVED per config as "
                              "N/(2*lam), which is what matches HardFlow's "
-                             "effort penalty to MPC's per step -- that is the "
+                             "effort penalty to ConicFlow's per step -- that is the "
                              "default as of 2026-09-16 (it was a fixed 5e-4, "
                              "correct only at lam=10000/N=10). Supplying it "
                              "OVERRIDES the derivation and is never "
@@ -4116,10 +4127,10 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "before 2026-09-09, which had no effort penalty.")
     parser.add_argument("--sweep_endpoint_surrogate", nargs="+",
                         choices=["rollout", "jump"], metavar="MODE",
-                        help="mpc only. How endpoint_map predicts the terminal "
+                        help="conicflow only. How endpoint_map predicts the terminal "
                              "latent INSIDE the inner objective. 'rollout' "
                              "(default) integrates the remaining N-j-H steps -- "
-                             "this is the n_inner*N(N-1)/2 term that makes MPC "
+                             "this is the n_inner*N(N-1)/2 term that makes ConicFlow "
                              "quadratic in N. 'jump' takes one flow-map call "
                              "with t_next=0 instead, making it linear. Only the "
                              "surrogate the optimizer differentiates changes; "
@@ -4129,12 +4140,12 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "noise floor at lam=10/100. Not yet re-checked at "
                              "N=10, hence opt-in.")
     parser.add_argument("--sweep_hardflow_endpoint_mode", nargs="+",
-                        choices=["flow_map1", "flow_matching", "mpc_rollout"],
+                        choices=["flow_map1", "flow_matching", "conicflow_rollout"],
                         metavar="MODE",
                         help="hardflow only. How the terminal estimate is taken. "
                              "flow_map1/flow_matching are single-NFE -- that is "
-                             "the method's efficiency claim. mpc_rollout is the "
-                             "estimator ablation: run HardFlow on MPC's full "
+                             "the method's efficiency claim. conicflow_rollout is the "
+                             "estimator ablation: run HardFlow on ConicFlow's full "
                              "endpoint_map rollout, so a head-to-head no longer "
                              "confounds the algorithm with the endpoint estimate.")
     parser.add_argument("--sweep_guidance_scale",nargs="+", type=float, metavar="CFG")
@@ -4143,14 +4154,14 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     parser.add_argument("--sweep_warmstart",     nargs="+", type=lambda x: x.lower() != "false",
                         metavar="BOOL")
     parser.add_argument("--sweep_n_alt",         nargs="+", type=int,   metavar="N_ALT",
-                        help="MPC only. Primal<->dual alternations per fixed window "
-                             "before it shifts (plan Step 5). Default 1 = original "
+                        help="ConicFlow only. Primal<->dual alternations per fixed window "
+                             "before it shifts (the design plan). Default 1 = original "
                              "behavior. >1 requires constraints active (h + lr_dual>0) "
                              "-- see receding_horizon_flow_control's n_alt docstring "
-                             "in image_mpc_edited_sung.py.")
+                             "in control_loops.py.")
     parser.add_argument("--sweep_dual_adaptive", nargs="+",
                         type=lambda x: x.lower() != "false", metavar="BOOL",
-                        help="MPC only. Normalize the projected dual step per "
+                        help="ConicFlow only. Normalize the projected dual step per "
                              "constraint by a running RMS scale, and use the same "
                              "normalized constraint in the Lagrangian. Equalizes "
                              "dual pressure across constraints whose typical "
@@ -4160,24 +4171,24 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "options. Default False = plain dual ascent.")
     parser.add_argument("--sweep_skip_first_primal_step", nargs="+",
                         type=lambda x: x.lower() != "false", metavar="BOOL",
-                        help="MPC only. Plan Step 7 option (b): one dual-ascent "
+                        help="ConicFlow only. design plan option (b): one dual-ascent "
                              "update on the uncontrolled rollout's h before the "
                              "loop starts, instead of wasting step 0's primal solve "
                              "on a zero-gradient objective. Composable with a "
                              "nonzero --mu_init (option (a)). Requires constraints "
                              "active (h + lr_dual>0) when True -- see "
                              "receding_horizon_flow_control's skip_first_primal_step "
-                             "docstring in image_mpc_edited_sung.py.")
+                             "docstring in control_loops.py.")
     parser.add_argument("--sweep_drift_detach",  nargs="+", type=lambda x: x.lower() != "false",
                         metavar="BOOL")
     parser.add_argument("--sweep_constraint_on", nargs="+",
                         choices=["horizon", "endpoint"], metavar="MODE",
-                        help="MPC only. Where to evaluate reward and constraint h(x): "
+                        help="ConicFlow only. Where to evaluate reward and constraint h(x): "
                              "'endpoint' (default -- flow-map to t=1) or 'horizon' (raw x_H).")
 
     # ── constraint flags (global, not sweep axes, except the threshold sweep) ──
     parser.add_argument("--constraint_prompts", nargs="+", default=[], metavar="PROMPT",
-                        help="One or more CLIP constraint prompts (MPC only). Each "
+                        help="One or more CLIP constraint prompts (ConicFlow only). Each "
                              "enforces clip_score(image, prompt) >= threshold. "
                              f"At most {MAX_CONSTRAINTS}; more raises.")
     parser.add_argument("--constraint_thresholds", nargs="+", type=float, default=[],
@@ -4202,7 +4213,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     parser.add_argument("--constraint_types", nargs="+", default=[],
                         choices=[c for c in REWARD_CHOICES if c != "none"],
                         metavar="TYPE",
-                        help="Reward type per constraint (MPC only), e.g. "
+                        help="Reward type per constraint (ConicFlow only), e.g. "
                              "'style imagereward'. Pairs positionally with "
                              "--constraint_args / --constraint_thresholds / "
                              "--constraint_directions, all of which are "
@@ -4474,7 +4485,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
         if _is_oom:
             print("  This is a CUDA OOM during model load -- the card did not have "
                   "enough free memory. Check the launcher's memory gate against "
-                  "the current measured requirement (see 260905-memory-optimization.md).")
+                  "the current measured requirement (see the memory-budget notes).")
         raise SystemExit(1)
 
     device = next(sampler.pipeline.transformer.parameters()).device
@@ -4485,7 +4496,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     # transformer already has 0/1864 params requiring grad (torchao's quantized
     # weights are not trainable), but the VAE has 244 params / 83.8 M elements
     # that DO, and the VAE decode sits inside the differentiated graph. Both
-    # image_mpc_edited_sung.py and image_mpc.py use `.backward()` rather than
+    # control_loops.py and image_conicflow.py use `.backward()` rather than
     # `autograd.grad` (deliberately -- autograd.grad is incompatible with the
     # reentrant checkpointing diffusers defaults to), and `.backward()`
     # populates `.grad` on every leaf that wants it, which opt.zero_grad() never

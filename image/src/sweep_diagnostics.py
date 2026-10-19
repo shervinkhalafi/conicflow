@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-sweep_diagnostics.py -- post-sweep comparison of MPC / HardFlow / FMRG.
+sweep_diagnostics.py -- post-sweep comparison of ConicFlow / HardFlow / FMRG.
 
 Two diagnostics, either or both:
 
   win rates   For every (lambda, seed) combo in which all three methods ran,
               which one reached the lowest objective? Reports the share of
-              combos each method wins, plus MPC-vs-FMRG, MPC-vs-HardFlow and
-              MPC-vs-both.
+              combos each method wins, plus ConicFlow-vs-FMRG, ConicFlow-vs-HardFlow and
+              ConicFlow-vs-both.
 
   pareto      Reward against control energy, scattered per method, with each
               method's own non-dominated frontier drawn and the globally
@@ -17,7 +17,7 @@ WHAT MAKES THE WIN-RATE COMPARISON VALID, and when it is not. The objective
   J = ctrl_energy / (2*lam) - r_ctrl        (LOWER is better)
 is only a common yardstick when the three runs share a lambda, because lam is
 what weights energy against reward in it. At a shared lam they really are
-scoring the same first-order problem: MPC's per-step linearised optimum is
+scoring the same first-order problem: ConicFlow's per-step linearised optimum is
 resid* = lam*dt*grad r, FMRG's update is exactly that per step, and HardFlow's
 reg = N/(2*lam) matches it (see lambda_autorange.shared_grid). So combos are
 keyed on (lam, seed) and a method is only compared against runs at ITS OWN lam.
@@ -63,7 +63,7 @@ from compare_methods import METHODS, PRETTY, load_sweeps, load_autorange, cfg_na
 def combos(runs: List[dict]) -> Dict[tuple, Dict[str, dict]]:
     """(reward, prompt, edit, N, lam, seed) -> {method: that method's BEST run there}.
 
-    A method may have several configs at one combo (MPC at n_inner=12 and 24,
+    A method may have several configs at one combo (ConicFlow at n_inner=12 and 24,
     say). Each method is represented by its lowest-J config at that combo --
     "best config per method per combo" -- and the chosen config is recorded on
     the run (`n_cands`, and the row's cfg_<method> column) rather than hidden.
@@ -96,7 +96,7 @@ def win_rates(runs: List[dict]) -> dict:
     n = len(full)
     res = dict(n_combos=n, n_partial=partial,
                lowest={m: 0 for m in METHODS},
-               mpc_beats={"fmrg": 0, "hardflow": 0, "both": 0}, rows=[],
+               conicflow_beats={"fmrg": 0, "hardflow": 0, "both": 0}, rows=[],
                # per method: which config represented it, and how often
                cfg_wins={m: defaultdict(int) for m in METHODS},
                cands={m: set() for m in METHODS})
@@ -106,14 +106,14 @@ def win_rates(runs: List[dict]) -> dict:
             res["cands"][m].add(bym[m].get("n_cands", 1))
         best = min(METHODS, key=lambda m: bym[m]["J"])
         res["lowest"][best] += 1
-        bf = bym["mpc"]["J"] < bym["fmrg"]["J"]
-        bh = bym["mpc"]["J"] < bym["hardflow"]["J"]
-        res["mpc_beats"]["fmrg"] += bf
-        res["mpc_beats"]["hardflow"] += bh
-        res["mpc_beats"]["both"] += (bf and bh)
+        bf = bym["conicflow"]["J"] < bym["fmrg"]["J"]
+        bh = bym["conicflow"]["J"] < bym["hardflow"]["J"]
+        res["conicflow_beats"]["fmrg"] += bf
+        res["conicflow_beats"]["hardflow"] += bh
+        res["conicflow_beats"]["both"] += (bf and bh)
         res["rows"].append(dict(
             reward=key[0], prompt=key[1], edit_prompt=key[2], N=key[3], lam=key[4], seed=key[5],
-            winner=best, mpc_beats_fmrg=bf, mpc_beats_hardflow=bh, mpc_beats_both=bf and bh,
+            winner=best, conicflow_beats_fmrg=bf, conicflow_beats_hardflow=bh, conicflow_beats_both=bf and bh,
             **{f"cfg_{m}": bym[m].get("cfg_label", "") for m in METHODS},
             **{f"J_{m}": bym[m]["J"] for m in METHODS},
             **{f"r_ctrl_{m}": bym[m]["r_ctrl"] for m in METHODS},
@@ -137,9 +137,9 @@ def print_win_rates(res: dict, log=print) -> None:
     for m in sorted(METHODS, key=lambda m: -res["lowest"][m]):
         log(f"      {PRETTY[m]:9} {pct(res['lowest'][m])}")
     log("    head to head")
-    log(f"      MPC beats FMRG      {pct(res['mpc_beats']['fmrg'])}")
-    log(f"      MPC beats HardFlow  {pct(res['mpc_beats']['hardflow'])}")
-    log(f"      MPC beats both      {pct(res['mpc_beats']['both'])}")
+    log(f"      ConicFlow beats FMRG      {pct(res['conicflow_beats']['fmrg'])}")
+    log(f"      ConicFlow beats HardFlow  {pct(res['conicflow_beats']['hardflow'])}")
+    log(f"      ConicFlow beats both      {pct(res['conicflow_beats']['both'])}")
     # Gate on how many configs a method HAD, not on how many of them ever won:
     # one config sweeping every combo is precisely when the unequal-draws note
     # below is worth reading.
@@ -198,8 +198,8 @@ def plot_pareto(runs: List[dict], out_dir: str, dpi: int = 130, log=print) -> Li
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    COL = {"mpc": "#2a78d6", "hardflow": "#eb6834", "fmrg": "#1baf7a"}
-    MK = {"mpc": "o", "hardflow": "s", "fmrg": "^"}
+    COL = {"conicflow": "#2a78d6", "hardflow": "#eb6834", "fmrg": "#1baf7a"}
+    MK = {"conicflow": "o", "hardflow": "s", "fmrg": "^"}
 
     groups: Dict[tuple, List[dict]] = defaultdict(list)
     for r in runs:
@@ -272,7 +272,7 @@ DIAGS: Dict[str, dict] = {
     "winrates": dict(
         fn=_run_winrates,
         help="For every (lambda, seed) combo in which all three methods ran, which reached the "
-             "lowest objective J = energy/(2*lambda) - r_ctrl, plus MPC vs FMRG / HardFlow / "
+             "lowest objective J = energy/(2*lambda) - r_ctrl, plus ConicFlow vs FMRG / HardFlow / "
              "both. Writes winrates.csv. REQUIRES a shared lambda grid across the methods -- J "
              "is only comparable at equal lambda -- otherwise it reports zero combos and why."),
     "pareto": dict(
@@ -304,7 +304,7 @@ def run_diagnostics(run_dirs: List[str], which: List[str], out_dir: Optional[str
         return {}
     runs = load_sweeps(run_dirs)
     if not runs:
-        log("  diagnostics: no run_ok rows of mpc/hardflow/fmrg found.")
+        log("  diagnostics: no run_ok rows of conicflow/hardflow/fmrg found.")
         return {}
     out_dir = out_dir or (run_dirs[0] if os.path.isdir(run_dirs[0]) else ".")
     os.makedirs(out_dir, exist_ok=True)

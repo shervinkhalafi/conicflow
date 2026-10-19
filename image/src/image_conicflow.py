@@ -1,29 +1,29 @@
 """
-image_mpc.py — Receding-Horizon Path-Space MPC for FLUX FlowMap images
+image_conicflow.py — Receding-Horizon Path-Space ConicFlow for FLUX FlowMap images
 =======================================================================
 
 Two sections:
-  1. Core MPC engine  (generic, works for any state shape)
+  1. Core ConicFlow engine  (generic, works for any state shape)
   2. FLUX image wrappers + demo  (assumes a loaded FluxFlowMapSampler)
 
 Time conventions
 ----------------
-  MPC  : s ∈ [0, 1]   s=0 is noise, s=1 is clean data
+  ConicFlow  : s ∈ [0, 1]   s=0 is noise, s=1 is clean data
   FLUX : t ∈ [0, 1]   t=1 is noise, t=0 is clean data
-  Mapping : t_flux = 1 - s_mpc
-  Velocity: dx/ds = -dx/dt_flux  →  v_mpc(s,z) = -v_flux(1-s, z)
+  Mapping : t_flux = 1 - s_conicflow
+  Velocity: dx/ds = -dx/dt_flux  →  v_conicflow(s,z) = -v_flux(1-s, z)
 
 Usage in notebook
 -----------------
   After running cells 0-2 (imports + model load):
 
-      from image_mpc import (
+      from image_conicflow import (
           receding_horizon_flow_control,
           make_flux_wrappers,
-          run_image_mpc_demo,
+          run_image_conicflow_demo,
       )
       v_theta, r_fn, endpoint_map = make_flux_wrappers(sampler, PROMPT, guidance_scale=3.5)
-      run_image_mpc_demo(sampler, PROMPT)
+      run_image_conicflow_demo(sampler, PROMPT)
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def _pbar_postfix(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Section 1 — Core MPC engine
+# Section 1 — Core ConicFlow engine
 # ═════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -122,7 +122,7 @@ def _shift_warmstart(
 ) -> torch.Tensor:
     """Shift the previous window's solution into a warm start for the next window.
 
-    The window solved at MPC step ``t0_idx - 1`` produced ``prev_traj`` covering
+    The window solved at ConicFlow step ``t0_idx - 1`` produced ``prev_traj`` covering
     times t_{t0_idx}, ..., t_{t0_idx + H_prev - 1}.  The state at t_{t0_idx} has
     now been consumed as the current state, so dropping it leaves an optimized
     guess for t_{t0_idx+1}, ..., t_{t0_idx + H_prev - 1} — exactly the head of
@@ -273,7 +273,7 @@ def solve_horizon_problem(
         drift_detach: treat the drift as locally constant, removing all
                       transformer backward passes (approximate but much faster).
         v_cur:        precomputed v_theta(t_{t0_idx}, x_cur).  The caller usually
-                      needs this tensor anyway to apply the MPC step, so passing
+                      needs this tensor anyway to apply the ConicFlow step, so passing
                       it in avoids recomputing it here.
 
     Returns:
@@ -397,7 +397,7 @@ def receding_horizon_flow_control(
                        constraint_on="endpoint".
         lr_dual:       projected dual-ascent step size (>= 0).
         optimizer:     "lbfgs" or "adam" for the inner solve.
-        n_iters:       inner-solver iterations per MPC step.
+        n_iters:       inner-solver iterations per ConicFlow step.
         lr:            inner-solver learning rate.
         warmstart:     reuse the previous window's solution as the initial guess.
                        The window at step j covers t_{j+1}..t_{j+H}; the previous
@@ -458,7 +458,7 @@ def receding_horizon_flow_control(
     prev_window = None   # previous window's optimized states (warmstart only)
 
     pbar = tqdm(
-        total=N * n_iters, desc="MPC", disable=not show_progress,
+        total=N * n_iters, desc="ConicFlow", disable=not show_progress,
     )
 
     for j in range(N):
@@ -471,7 +471,7 @@ def receding_horizon_flow_control(
             )
 
         # Drift at the current state: needed both by the inner objective (ell=0)
-        # and to apply the MPC step below, so evaluate it a single time.
+        # and to apply the ConicFlow step below, so evaluate it a single time.
         with torch.no_grad():
             v_j = v_theta(t_grid[j], x)
 
@@ -507,7 +507,7 @@ def receding_horizon_flow_control(
         if mu_t is not None:
             mu_history.append(mu_t.clone())
 
-        # Apply first MPC step, reusing the drift computed above
+        # Apply first ConicFlow step, reusing the drift computed above
         with torch.no_grad():
             u_star = (x1_star - x) / dt - v_j
             x = x + dt * (v_j + u_star)
@@ -577,10 +577,10 @@ def tune_sampler_speed(
       ``fast=True`` disables checkpointing ONLY when it is safe to do so, i.e.
       when the inner solve does NOT backprop through the transformer:
         - control_type="none":                   no backward at all → safe
-        - MPC, drift_detach=True AND
+        - ConicFlow, drift_detach=True AND
           constraint_on="horizon":               nothing differentiable left
                                                  in the transformer → safe
-        - MPC, constraint_on="endpoint":         UNSAFE whatever drift_detach
+        - ConicFlow, constraint_on="endpoint":         UNSAFE whatever drift_detach
                                                  says — see below
         - FMRG:                                  always backprops → UNSAFE
 
@@ -650,9 +650,9 @@ def tune_sampler_speed(
             f"vae_tiling={tiling}, vae_slicing={slicing}, "
             f"quantize_mode={getattr(sampler, 'quantize_mode', 'n/a')})"
         )
-        if fast and control_type == "mpc" and drift_detach is True:
+        if fast and control_type == "conicflow" and drift_detach is True:
             print(
-                "  note: MPC+drift_detach=True: transformer checkpointing is not "
+                "  note: ConicFlow+drift_detach=True: transformer checkpointing is not "
                 "on the hot path — speedup is from VAE tiling only."
             )
         elif fast and transformer_backward_needed:
@@ -668,20 +668,20 @@ def make_flux_wrappers(
     sampler,
     prompt: str,
     guidance_scale: float = 3.5,
-    n_mpc_steps: int = 4,
+    n_conicflow_steps: int = 4,
     sample_mode: str = "flow_map2",
     endpoint_surrogate: str = "rollout",
 ):
     """Build (v_theta, r, endpoint_map) callables for use with receding_horizon_flow_control.
 
-    The MPC uses progress time s ∈ [0,1] (s=0 noise, s=1 data).
+    The ConicFlow uses progress time s ∈ [0,1] (s=0 noise, s=1 data).
     FLUX uses t ∈ [0,1] (t=1 noise, t=0 data).  Mapping: t = 1 - s.
 
     Args:
         sampler:        loaded FluxFlowMapSampler instance.
         prompt:         text prompt used for guidance (must match sampler.cached_*).
         guidance_scale: CFG scale passed to predict_vector.
-        n_mpc_steps:    N used in the outer MPC loop (needed for step size and endpoint_map).
+        n_conicflow_steps:    N used in the outer ConicFlow loop (needed for step size and endpoint_map).
         sample_mode:    "flow_map2" (canonical, t_next = t_cur - dt)  ← default
                         "flow_map1" (shortcut, t_next = 0)
                         "flow_matching" (plain ODE, t_next = t_cur)
@@ -691,7 +691,7 @@ def make_flux_wrappers(
                         flow-map call with t_next=0.  See endpoint_map.
 
     Returns:
-        v_theta_mpc:   (s: tensor, z: tensor) -> tensor  velocity in MPC convention
+        v_theta_conicflow:   (s: tensor, z: tensor) -> tensor  velocity in ConicFlow convention
         r_image:       (z: tensor) -> (B,)               differentiable reward
         endpoint_map:  (s: tensor, z: tensor) -> tensor  predicted final latent
     """
@@ -715,7 +715,7 @@ def make_flux_wrappers(
 
     pe  = sampler.cached_prompt_embeds
     ppe = sampler.cached_pooled_prompt_embeds
-    dt_flux = 1.0 / n_mpc_steps   # FLUX-time step size
+    dt_flux = 1.0 / n_conicflow_steps   # FLUX-time step size
 
     def _t_next_for_mode(t_flux: float) -> float:
         """Return t_next to pass to predict_vector based on the sample mode."""
@@ -726,9 +726,9 @@ def make_flux_wrappers(
         else:  # flow_matching
             return t_flux                        # standard ODE (t_next = t_cur)
 
-    def v_theta_mpc(s_mpc: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """FLUX velocity in MPC convention: v_mpc = -v_flux(1-s, z)."""
-        t_flux = 1.0 - s_mpc.item()
+    def v_theta_conicflow(s_conicflow: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """FLUX velocity in ConicFlow convention: v_conicflow = -v_flux(1-s, z)."""
+        t_flux = 1.0 - s_conicflow.item()
         t_next = _t_next_for_mode(t_flux)
         ctx = torch.enable_grad() if z.requires_grad else torch.no_grad()
         with ctx:
@@ -752,7 +752,7 @@ def make_flux_wrappers(
         img = sampler.decode(z)              # (B, 3, H, W) in [-1, 1], grads flow
         return img.mean(dim=(1, 2, 3))
 
-    def endpoint_map(s_mpc: torch.Tensor, z: torch.Tensor, grad: bool = False) -> torch.Tensor:
+    def endpoint_map(s_conicflow: torch.Tensor, z: torch.Tensor, grad: bool = False) -> torch.Tensor:
         """Predict the final latent by rolling the uncontrolled FLUX flow to t=0.
 
         Args:
@@ -765,11 +765,11 @@ def make_flux_wrappers(
         Cost, and the two 2026-09-16 changes below.  Since the 2026-08-26
         endpoint-gradient fix this rollout is the sole gradient path through the
         transformer, so at grad=True every step here is a forward AND a
-        backward.  Called n_inner times per outer step, it is what makes MPC
+        backward.  Called n_inner times per outer step, it is what makes ConicFlow
         quadratic in N: the rollout is N-j-H steps long at outer step j.
         """
-        t_start = 1.0 - s_mpc.item()
-        n_exact = round(t_start * n_mpc_steps)
+        t_start = 1.0 - s_conicflow.item()
+        n_exact = round(t_start * n_conicflow_steps)
 
         # (a) The window already reaches t=0, so the rollout has no steps to
         # take.  The previous `max(1, ...)` ran ONE transformer call anyway,
@@ -830,15 +830,15 @@ def make_flux_wrappers(
                 z_run = z_run - dt_r * u
         return z_run
 
-    return v_theta_mpc, r_image, endpoint_map
+    return v_theta_conicflow, r_image, endpoint_map
 
 
-def run_image_mpc_demo(
+def run_image_conicflow_demo(
     sampler,
     prompt: str,
     height: int = 256,
     width: int = 256,
-    n_mpc_steps: int = 4,
+    n_conicflow_steps: int = 4,
     h_horizon: int = 2,
     lam: float = 1.0,
     n_inner: int = 20,
@@ -848,7 +848,7 @@ def run_image_mpc_demo(
     sample_mode: str = "flow_map2",
     warmstart: bool = False,
 ):
-    """Run a side-by-side uncontrolled vs MPC-controlled FLUX image demo.
+    """Run a side-by-side uncontrolled vs ConicFlow-controlled FLUX image demo.
 
     Prints per-step control norms and shows a matplotlib figure.
 
@@ -856,10 +856,10 @@ def run_image_mpc_demo(
         sampler:         loaded FluxFlowMapSampler.
         prompt:          text prompt (must match sampler's cached embeddings).
         height/width:    output image resolution.
-        n_mpc_steps:     N — total denoising steps.
-        h_horizon:       H — MPC planning horizon.
+        n_conicflow_steps:     N — total denoising steps.
+        h_horizon:       H — ConicFlow planning horizon.
         lam:             control weight lambda.
-        n_inner:         inner Adam iterations per MPC step.
+        n_inner:         inner Adam iterations per ConicFlow step.
         lr_inner:        inner Adam learning rate.
         guidance_scale:  CFG guidance scale.
         seed:            random seed for the initial noise.
@@ -869,9 +869,9 @@ def run_image_mpc_demo(
     device = next(sampler.pipeline.transformer.parameters()).device
     dtype  = next(sampler.pipeline.transformer.parameters()).dtype
 
-    v_theta_mpc, r_image, endpoint_map = make_flux_wrappers(
+    v_theta_conicflow, r_image, endpoint_map = make_flux_wrappers(
         sampler, prompt, guidance_scale=guidance_scale,
-        n_mpc_steps=n_mpc_steps, sample_mode=sample_mode,
+        n_conicflow_steps=n_conicflow_steps, sample_mode=sample_mode,
     )
 
     # Initial noise latent
@@ -882,12 +882,12 @@ def run_image_mpc_demo(
     z0 = torch.randn(1, in_ch, H_lat, W_lat, device=device, dtype=dtype)
 
     # Uncontrolled baseline using the same sample_mode
-    dt_flux = 1.0 / n_mpc_steps
+    dt_flux = 1.0 / n_conicflow_steps
     print(f"Running uncontrolled baseline ({sample_mode})...")
     with torch.no_grad():
         z_unc = z0.clone()
-        ts_unc = torch.linspace(1.0, 0.0, n_mpc_steps + 1, device=device, dtype=dtype)
-        for j in range(n_mpc_steps):
+        ts_unc = torch.linspace(1.0, 0.0, n_conicflow_steps + 1, device=device, dtype=dtype)
+        for j in range(n_conicflow_steps):
             t_c = ts_unc[j].item()
             if sample_mode == "flow_map2":
                 t_n = max(0.0, t_c - dt_flux)
@@ -908,13 +908,13 @@ def run_image_mpc_demo(
         sampler.decode_no_grad(z_unc).float().detach().cpu(), output_type="pil"
     )[0]
 
-    # MPC-controlled run
-    print("Running MPC...")
-    z_mpc, traj_mpc, controls_mpc, mu_final, _ = receding_horizon_flow_control(
-        v_theta   = v_theta_mpc,
+    # ConicFlow-controlled run
+    print("Running ConicFlow...")
+    z_conicflow, traj_conicflow, controls_conicflow, mu_final, _ = receding_horizon_flow_control(
+        v_theta   = v_theta_conicflow,
         r         = r_image,
         x0        = z0,
-        N         = n_mpc_steps,
+        N         = n_conicflow_steps,
         H         = h_horizon,
         lam       = lam,
         optimizer = "adam",
@@ -924,22 +924,22 @@ def run_image_mpc_demo(
         verbose   = True,
         device    = device,
     )
-    img_mpc = sampler.pipeline.image_processor.postprocess(
-        sampler.decode_no_grad(z_mpc).float().detach().cpu(), output_type="pil"
+    img_conicflow = sampler.pipeline.image_processor.postprocess(
+        sampler.decode_no_grad(z_conicflow).float().detach().cpu(), output_type="pil"
     )[0]
 
     # Side-by-side plot
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     axes[0].imshow(img_unc); axes[0].axis("off"); axes[0].set_title("Uncontrolled")
-    axes[1].imshow(img_mpc); axes[1].axis("off")
-    axes[1].set_title(f"MPC  H={h_horizon}  λ={lam}  N_inner={n_inner}")
+    axes[1].imshow(img_conicflow); axes[1].axis("off")
+    axes[1].set_title(f"ConicFlow  H={h_horizon}  λ={lam}  N_inner={n_inner}")
     plt.suptitle(prompt[:70], fontsize=10)
     plt.tight_layout()
     plt.show()
 
-    ctrl_norms = controls_mpc.flatten(2).norm(dim=2)   # (N, B)
+    ctrl_norms = controls_conicflow.flatten(2).norm(dim=2)   # (N, B)
     print(f"\nMean control ‖u‖ per step: {ctrl_norms.mean(dim=1).tolist()}")
-    return img_unc, img_mpc, traj_mpc, controls_mpc
+    return img_unc, img_conicflow, traj_conicflow, controls_conicflow
 
 
 def fmrg_j_image(
@@ -1135,17 +1135,17 @@ def trajectory_rewards(
 # ─────────────────────────────────────────────────────────────────────────────
 # Notebook snippet (paste into a cell after loading the sampler)
 # ─────────────────────────────────────────────────────────────────────────────
-# from image_mpc import run_image_mpc_demo, make_flux_wrappers
+# from image_conicflow import run_image_conicflow_demo, make_flux_wrappers
 #
-# img_unc, img_mpc, traj, controls = run_image_mpc_demo(
+# img_unc, img_conicflow, traj, controls = run_image_conicflow_demo(
 #     sampler, PROMPT,
 #     height=256, width=256,
-#     n_mpc_steps=4, h_horizon=2, lam=1.0, n_inner=20,
+#     n_conicflow_steps=4, h_horizon=2, lam=1.0, n_inner=20,
 # )
 #
 # -- or build wrappers manually and call receding_horizon_flow_control --
 # v_theta, r, endpoint_map = make_flux_wrappers(sampler, PROMPT)
-# z_mpc, traj, controls, mu, mu_hist = receding_horizon_flow_control(
+# z_conicflow, traj, controls, mu, mu_hist = receding_horizon_flow_control(
 #     v_theta, r, z0, N=4, H=2, lam=1.0,
 #     optimizer="adam", n_iters=20, lr=1e-3, verbose=True,
 # )
