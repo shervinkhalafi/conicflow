@@ -27,7 +27,9 @@ fi
 
 # FLUX.1-Dev is gated. Accept the license at
 # https://huggingface.co/black-forest-labs/FLUX.1-dev and run `huggingface-cli login`.
-huggingface-cli download black-forest-labs/FLUX.1-dev --quiet || true
+# MODIFIED (see MODIFICATIONS.md): --cache-dir "$HF_HOME" so the weights land where
+# FluxFlowMapSampler loads them from (cache_dir=$HF_HOME), not in $HF_HOME/hub.
+huggingface-cli download black-forest-labs/FLUX.1-dev --cache-dir "$HF_HOME" --quiet || true
 
 # Pre-warm reward-model caches.
 python - <<'PY' || true

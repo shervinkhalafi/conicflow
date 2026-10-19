@@ -6,7 +6,7 @@ licensed under the Apache License 2.0 (`LICENSE` in this directory). It
 supplies the FLUX.1-dev FlowMap sampler and the reward-model wrappers that all
 image experiments in this repository run on, and the FMRG baseline.
 
-It was taken from upstream commit `be485ba` (2026-06-10). Two files differ from
+It was taken from upstream commit `be485ba` (2026-06-10). Three files differ from
 upstream; everything else is unchanged.
 
 **`fluxfm_sampler_reward.py`** — memory-related changes so that FLUX.1-dev plus
@@ -27,3 +27,9 @@ control loops:
 `flowmaps` conda environment (reusing its PyTorch/CUDA stack) instead of
 creating a separate `fmrg_env`, and repairs the `peft`/`protobuf` pins that
 the ImageReward/HPSv2 install downgrades.
+
+**`checkpoints_download.sh`** — the final FLUX.1-dev download passes
+`--cache-dir "$HF_HOME"`, so the weights land where `FluxFlowMapSampler` loads
+them from (`from_pretrained(..., cache_dir=$HF_HOME)`). Upstream downloads to
+the default `$HF_HOME/hub`, which the sampler does not read, so the 32 GB model
+was fetched twice.
