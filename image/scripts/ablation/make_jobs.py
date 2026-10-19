@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""make_jobs.py -- build jobs.tsv, the job list of the appendix ablations.
+"""make_jobs.py -- build the job lists of the appendix ablations.
 
-    python make_jobs.py > jobs.tsv
+    python make_jobs.py --preset arxiv_v1 > jobs_arxiv_v1.tsv   # arXiv v1, Tables 7-9
+    python make_jobs.py > jobs.tsv                              # extended design
 
 One row = one (cell, arm) = one `run_sweep.py` invocation over that arm's
 lambda list, where a cell is one (editing prompt pair, seed). The output is
@@ -14,7 +15,18 @@ COLUMNS (tab-separated):
 `unlock` is the FLOWMAPS_UNLOCK value for the row ('-' for none); only the
 horizon-objective arms set it. `args` are the arm's run_sweep.py flags.
 
-DESIGN
+PRESET arxiv_v1 (the ablations of arXiv v1, Appendix D, Tables 7-9)
+  ed1-ed4 only, every arm on the six `shared` lambdas (no top-up):
+  * Table 7, planning horizon: ConicFlow H in {1, 2, 4, 6, 8} at seed 317.
+  * Table 8, matched wall clock: ConicFlow n_inner 12, HardFlow 167, FMRG-J 13
+    at seeds 317 and 1289.
+  * Table 9, evaluation point: ConicFlow H=2 endpoint and horizon, HardFlow 40,
+    FMRG-J 3 at seeds 317 and 1289.
+  72 rows. Every one of them is also a row of the extended design (same output
+  directory, a subset of its lambdas), so the extended design can be run on
+  top of the preset without re-running anything.
+
+EXTENDED DESIGN (prepared for a later revision; not in arXiv v1)
   8 editing pairs (ed1-ed8) x seeds {317, 1289, 2718, 3141} = 32 cells, each
   running all 11 arms of the H ladder, the compute ladder and the H=2 horizon
   arm. Seeds 317 and 1289 (16 cells) also run the horizon objective at
@@ -108,7 +120,24 @@ def lams_for(tag, seed, arm, line, g):
     return list(g[line])
 
 
+def arxiv_v1_rows():
+    """(tag, seed, arm) of arXiv v1's Tables 7-9, in table order."""
+    keep = []
+    for tag in ("ed1", "ed2", "ed3", "ed4"):
+        keep += [(tag, 317, f"conicflow_H{h}_ni24") for h in (1, 2, 4, 6, 8)]
+        for seed in (317, 1289):
+            keep += [(tag, seed, a) for a in COMPUTE]
+            keep += [(tag, seed, a) for a in ("conicflow_H2_ni24", "conicflow_H2_ni24_horizon",
+                                              "hardflow_ni40", "fmrg_nopt3")]
+    return list(dict.fromkeys(keep))   # Table 7's H=2 at seed 317 is also Table 9's
+
+
 def main():
+    preset = None
+    if sys.argv[1:] == ["--preset", "arxiv_v1"]:
+        preset = "arxiv_v1"
+    elif sys.argv[1:]:
+        raise SystemExit("usage: make_jobs.py [--preset arxiv_v1]")
     rows = []
     for tag, p, e in PROMPTS:
         g = read_grids(os.path.join(GRID_DIR, f"{tag}.txt"))
@@ -120,6 +149,16 @@ def main():
                 lams = lams_for(tag, seed, arm, line, g)
                 rows.append("\t".join([tag, str(seed), arm, unlock, " ".join(lams),
                                        p, e, f"{COMMON} {args}"]))
+    if preset == "arxiv_v1":
+        # same rows, but on the six shared lambdas only: the HardFlow top-up
+        # points were added after arXiv v1 and are not in its tables
+        by_key = {tuple(r.split("\t")[:3]): r.split("\t") for r in rows}
+        grids = {tag: read_grids(os.path.join(GRID_DIR, f"{tag}.txt")) for tag, _, _ in PROMPTS}
+        rows = []
+        for tag, seed, arm in arxiv_v1_rows():
+            f = by_key[(tag, str(seed), arm)]
+            f[4] = " ".join(grids[tag]["shared"])
+            rows.append("\t".join(f))
     print("#tag\tseed\tarm\tunlock\tlams\tprompt\tedit_prompt\targs")
     print("\n".join(rows))
     print(f"make_jobs: {len(rows)} jobs", file=sys.stderr)

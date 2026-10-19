@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# run_ablation.sh -- run (part of) the appendix ablations from jobs.tsv.
+# run_ablation.sh -- run (part of) the appendix ablations.
 #
-#   bash run_ablation.sh <gpu> [--arms "<names or globs>"] [--tags "ed1 ed2 ..."]
-#                              [--seeds "317 1289 ..."] [--dry_run]
+#   bash run_ablation.sh <gpu> [--preset arxiv_v1] [--arms "<names or globs>"]
+#                              [--tags "ed1 ed2 ..."] [--seeds "317 1289 ..."] [--dry_run]
+#
+# --preset arxiv_v1 runs jobs_arxiv_v1.tsv: exactly the runs behind Tables 7-9
+# of the arXiv v1 paper (72 rows, ~20 GPU-h). Without it the job list is
+# jobs.tsv, the extended 8-edit design (464 rows, ~130 GPU-h), which contains
+# every arXiv v1 row as a subset.
 #
 # Examples
-#   bash run_ablation.sh 0                                 # everything (~130 GPU-h)
+#   bash run_ablation.sh 0 --preset arxiv_v1               # arXiv v1, Tables 7-9
+#   bash run_ablation.sh 0                                 # extended design (~130 GPU-h)
 #   bash run_ablation.sh 0 --arms core                     # the three default arms
 #   bash run_ablation.sh 1 --arms 'conicflow_H4_ni24'      # one horizon
 #   bash run_ablation.sh 0 --arms '*_horizon' --seeds 317  # objective-point arms, one seed
@@ -28,9 +34,10 @@
 set -u
 usage() { sed -n '4,5p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 GPU="${1:-}"; [ -n "$GPU" ] || usage; shift
-ARMS="*"; TAGS="*"; SEEDS="*"; DRY=0
+ARMS="*"; TAGS="*"; SEEDS="*"; DRY=0; PRESET=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --preset)  PRESET="${2:?}"; shift 2 ;;
         --arms)    ARMS="${2:?}"; shift 2 ;;
         --tags)    TAGS="${2:?}"; shift 2 ;;
         --seeds)   SEEDS="${2:?}"; shift 2 ;;
@@ -42,7 +49,11 @@ done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(cd "$HERE/../../src" && pwd)"
-JOBS="${JOBS:-$HERE/jobs.tsv}"
+case "$PRESET" in
+    "")       JOBS="${JOBS:-$HERE/jobs.tsv}" ;;
+    arxiv_v1) JOBS="$HERE/jobs_arxiv_v1.tsv" ;;
+    *) echo "unknown preset '$PRESET' (known: arxiv_v1)"; exit 2 ;;
+esac
 OUT_ROOT="${OUT_ROOT:-results/ablation}"
 cd "$SRC" || exit 3
 [ "$DRY" -eq 1 ] || mkdir -p "$OUT_ROOT/logs"

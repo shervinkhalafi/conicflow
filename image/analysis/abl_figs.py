@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""abl_figs.py -- the appendix ablation figures and tables.
+"""abl_figs.py -- figures and tables of the extended ablation design.
+
+The extended design (8 edits x 4-6 seeds, scored with G) was prepared for a
+later revision and is not in arXiv v1; arXiv v1's Tables 7-9 come from
+abl_tables_arxiv_v1.py.
 
     python abl_figs.py [--roots DIR [DIR ...]] [--out figs/ablation]
 
