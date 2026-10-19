@@ -12,6 +12,11 @@ __pycache__/
 # Sweep / experiment outputs
 results/
 lowdim/results*/
+# Regenerated figures (analysis-script outputs)
+image/figures/
+image/src/figures/
+image/src/figs/
+image/analysis/figs/
 
 # Local artifacts
 unguided_sample.png
