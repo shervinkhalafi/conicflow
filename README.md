@@ -186,10 +186,22 @@ four bootstrap-interval endpoints in the ablation tables differ by 0.01
 because of cell ordering. The image figures come out byte-identical to the
 originals, and so do Figure 1's two frontier panels when drawn from the
 shipped CSVs. A fresh run reproduces the results
-statistically rather than digit for digit. Uncontrolled samples are
-deterministic for a given seed. Controlled runs are not bitwise reproducible on
-GPU; HardFlow's control energy in particular can vary by up to ~1.8× between
-identical runs.
+statistically rather than digit for digit:
+
+- **Uncontrolled samples are deterministic for a given seed.** A fresh clone in
+  the uv environment reproduced the paper's uncontrolled rewards and
+  constraint thresholds bit for bit.
+- **Controlled runs are not bitwise reproducible on GPU.** Re-running one
+  ablation cell (edit ed1, seed 317):
+  - ConicFlow at λ = 5.9 gave reward 25.04 vs the paper's 25.11, with energy
+    within 3%.
+  - FMRG and HardFlow, over all six λ, gave rewards within 0.6 of the paper's.
+    Their control energies were within 0.6–1.1× of the paper's, except at
+    FMRG's largest λ, where it was 2.4× lower.
+- **Feasibility can flip near a constraint boundary.** Three runs of one
+  constrained ConicFlow config (p01_smile, seed 310, m = 1.5) gave
+  h = −3.56, −0.28 and +0.58, with energy within 5%. Figure 3 pools 16
+  problems per m, so expect its feasibility counts to move by a run or two.
 
 ## Methods and options
 
