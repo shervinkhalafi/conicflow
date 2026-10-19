@@ -1,41 +1,45 @@
 #!/usr/bin/env python3
 """
-run_sweep.py — Sweep MPC, HardFlow, and FMRG controllers on two-moons.
+run_sweep.py — Sweep ConicFlow, HardFlow, and FMRG controllers on two-moons.
 
 Iterates over every combination of the supplied hyperparameter lists,
 runs each config, logs metrics to a CSV, and saves all plots as a single
 PNG per run.
 
+ConicFlow (the paper's method) is called `mpc` throughout this script: the
+`--methods mpc` choice, the `mpc_*` flags and the CSV `method` column.
+reproduce_fig1.sh holds the exact sweeps behind paper Figure 1.
+
 Usage examples
 --------------
 # MPC: sweep H, constraint_on, lam, n_iters, and inner lr (single line)
-python run_sweep.py --ckpt /path/to/model.pkl --methods mpc --N 16 --H 4 8 16 --constraint_on horizon endpoint --lam 0.1 0.5 1.0 2.0 --mpc_n_iters 10 20 50 --mpc_optimizer adam --mpc_lr 0.01 0.05 --output_dir results/mpc_sweep
+python run_sweep.py --ckpt model/two_moons_lsd_15k.npz --methods mpc --N 16 --H 4 8 16 --constraint_on horizon endpoint --lam 0.1 0.5 1.0 2.0 --mpc_n_iters 10 20 50 --mpc_optimizer adam --mpc_lr 0.01 0.05 --output_dir results/mpc_sweep
 
 # HardFlow: sweep lam and outer iterations
-python run_sweep.py --ckpt /path/to/model.pkl \\
+python run_sweep.py --ckpt model/two_moons_lsd_15k.npz \\
     --methods hardflow \\
     --lam 0.5 1.0 2.0 \\
     --hf_n_outer 5 10
 
 # FMRG (J and E variants): sweep guidance iterations and strength
-python run_sweep.py --ckpt /path/to/model.pkl \\
+python run_sweep.py --ckpt model/two_moons_lsd_15k.npz \\
     --methods fmrg \\
     --lam 1.0 2.0 5.0 \\
     --fmrg_n_iters 1 3 5 \\
     --fmrg_variant J E
 
 # All three together
-python run_sweep.py --ckpt /path/to/model.pkl \\
+python run_sweep.py --ckpt model/two_moons_lsd_15k.npz \\
     --methods mpc hardflow fmrg \\
     --H 5 10 --constraint_on endpoint --lam 2.0 \\
     --fmrg_n_iters 3 \\
     --output_dir results/my_sweep
 
 # Dry-run: print all configs without running
-python run_sweep.py --ckpt /path/to/model.pkl --dry_run
+python run_sweep.py --ckpt model/two_moons_lsd_15k.npz --dry_run
 
 # Pin to a single GPU (overrides --device)
-python run_sweep.py --ckpt /path/to/model.pkl --gpu 1 --methods mpc --dry_run
+python run_sweep.py --ckpt model/two_moons_lsd_15k.npz --gpu 1 --methods mpc --dry_run
 """
 
 import argparse
@@ -73,7 +77,7 @@ from visualization_utils import visualize_control_results
 
 
 # =============================================================================
-# Model (FlowMapMLP) — identical to lowdim_comparisons.ipynb cell 3
+# Model (FlowMapMLP) — PyTorch port of the flow-maps (JAX/Flax) two-moons MLP
 # =============================================================================
 
 class FlowMapMLP(nn.Module):
@@ -123,19 +127,39 @@ def _flax_to_pt(flax_dense: dict, pt_linear: nn.Linear) -> None:
     pt_linear.bias.data.copy_(b)
 
 
-def load_model(ckpt_path: str, device: torch.device) -> FlowMapMLP:
-    """Load a FlowMapMLP from a JAX/Flax msgpack .pkl checkpoint."""
-    from flax.serialization import msgpack_restore
+def _read_phi_npz(ckpt_path: str) -> Tuple[dict, int]:
+    """EMA phi_mlp weights from the .npz written by convert_checkpoint.py.
 
+    Holds exactly the arrays the .pkl branch below reads (keys
+    "Dense_<k>/kernel", "Dense_<k>/bias"), so no jax/flax is needed.
+    """
+    with np.load(ckpt_path) as z:
+        phi: dict = {}
+        for key in z.files:
+            if "/" in key:
+                dname, leaf = key.split("/", 1)
+                phi.setdefault(dname, {})[leaf] = z[key]
+        step = int(z["step"]) if "step" in z.files else -1
+    return phi, step
+
+
+def load_model(ckpt_path: str, device: torch.device) -> FlowMapMLP:
+    """Load a FlowMapMLP from a JAX/Flax msgpack .pkl checkpoint, or from the
+    flax-free .npz export of one (see convert_checkpoint.py)."""
     print(f"Loading checkpoint: {ckpt_path}")
-    with open(ckpt_path, "rb") as f:
-        raw = msgpack_restore(f.read())
+    if str(ckpt_path).endswith(".npz"):
+        phi, step = _read_phi_npz(ckpt_path)
+    else:
+        from flax.serialization import msgpack_restore
+        with open(ckpt_path, "rb") as f:
+            raw = msgpack_restore(f.read())
+        ema_key = list(raw["ema_params"].keys())[0]
+        phi = raw["ema_params"][ema_key]["params"]["flow_map"]["phi_mlp"]
+        step = int(raw.get("step", -1))
 
     rescale = float(np.std(sample_two_moons(500_000)))
     print(f"  RESCALE = {rescale:.4f}  (std of two-moons training data)")
 
-    ema_key = list(raw["ema_params"].keys())[0]
-    phi = raw["ema_params"][ema_key]["params"]["flow_map"]["phi_mlp"]
     dense_names = sorted(phi.keys())                       # Dense_0, Dense_1, ...
     n_dense = len(dense_names)
     n_hidden = n_dense - 2                                 # first + n_hidden hidden + output
@@ -156,13 +180,12 @@ def load_model(ckpt_path: str, device: torch.device) -> FlowMapMLP:
         _flax_to_pt(phi[dname], model.phi_mlp[seq_idx])
 
     model.eval()
-    step = int(raw.get("step", -1))
     print(f"  Loaded step={step}  arch: {n_hidden} hidden × {n_neurons}  in={input_dim}  out={output_dim}")
     return model
 
 
 # =============================================================================
-# Reward and constraint (hardcoded to match lowdim_comparisons.ipynb)
+# Reward and constraint
 # =============================================================================
 
 _N_CON = 5   # number of constraint components reported per-column
@@ -452,7 +475,12 @@ def _compute_control_metrics(
     lam: float,
     controls_are_velocity: bool,
 ) -> Tuple[float, float]:
-    """Return (ctrl_cost_raw, ctrl_cost_obj) from a control sequence."""
+    """Return (ctrl_cost_raw, ctrl_cost_obj) from a control sequence.
+
+    ctrl_cost_raw is sum_j ||dx_j||^2, the DISPLACEMENT energy: it is the
+    energy E = sum_j ||u_j||^2 dt that the controller penalises divided by
+    N = 1/dt. make_fig1.py multiplies by N on load; do not also change it here.
+    """
     N_steps = controls.shape[0]
     dt = 1.0 / N_steps
     dx = (dt * controls) if controls_are_velocity else controls
@@ -895,7 +923,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── model / device ────────────────────────────────────────────────────────
     p.add_argument("--ckpt", required=True,
-                   help="Path to FlowMapMLP .pkl checkpoint (JAX/Flax format).")
+                   help="FlowMapMLP checkpoint: the flax-free .npz shipped in "
+                        "model/ (see convert_checkpoint.py), or a JAX/Flax "
+                        ".pkl from flow-maps/py (needs flax).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
                    help="Torch device string (default: cuda if available). "
                         "Ignored when --gpu is set.")
