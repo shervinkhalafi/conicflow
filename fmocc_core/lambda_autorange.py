@@ -30,6 +30,15 @@ ceiling -- and places the grid across the transition:
      a distinct point on the energy/reward frontier. The refined points are
      evaluated too, so the output is the whole measured curve.
 
+HOW FAR UP (--high_stop, 2026-09-23). The default stops at the plateau, which is
+where the reward stops paying -- NOT where the edit stops getting stronger, since
+energy keeps climbing past it. `--high_stop break` instead walks up until the
+IMAGE breaks (pixel-side statistics against the uncontrolled sample, see the
+PERMISSIVE HIGH END block), records the plateau onset as `lam_knee` on the way
+past, and extends the grid above it. Use it when the sweep wants the aggressive
+end of the frontier; measured on pickscore, MPC at lam=280 gives delta_r=13.0 on
+a clean image while the default grid for that cell topped out at lam=21.
+
 It runs in ONE process -- FLUX loads once, the reward model loads once per
 (reward, edit_prompt) -- by calling run_sweep._run_one directly, so every
 guard in that path (locked defaults, plausibility ranges, non-finite checks)
@@ -68,6 +77,54 @@ from reward_ranges import REWARD_OBSERVED_RANGE           # noqa: E402
 
 LAM_ABS_MIN, LAM_ABS_MAX = 1e-4, 1e7    # search never leaves this (log-)box
 SPIKE_DECADES = 3.0                     # energy spike threshold; see mark_suspects
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERMISSIVE HIGH END (2026-09-23, Shervin's request: "I want lambda to keep
+# increasing until the images break -- I want less conservative edits").
+#
+# The default ("plateau") behaviour stops the upward walk as soon as the reward
+# curve flattens, and then places the grid at 8-92% of the fitted rise. Both
+# were measured to be conservative by 1-2 decades:
+#
+#   * 24 of the 51 method-searches on disk stopped on `near_ceiling`, i.e.
+#     against REWARD_OBSERVED_RANGE, whose pickscore entry (18.0, 27.0) is
+#     labelled "MEASURED but WEAK: n=4 only" in reward_ranges.py. MPC on
+#     pickscore/"a portrait of a man" reaches r_ctrl ~= 32.8 at lam=280, so that
+#     ceiling is simply too low and the stop fires while the curve is climbing.
+#   * The 92% quantile caps placement well below the bracketed region: on that
+#     same cell the emitted MPC grid topped out at lam=21 (delta_r ~3.8) while
+#     the active region ran to 279 and lam=280 measured delta_r=13.0 with a
+#     clean image (results/auto/pickscore/.../mpc_seed42, lam0.95..280).
+#
+# In "break" mode the plateau tests become recorded MARKERS (lam_knee) instead
+# of stops, and the walk continues until the IMAGE breaks or the reward
+# collapses. Reward alone cannot be the break signal: on pickscore HardFlow
+# scores 11.7-15.8 on visibly destroyed images, i.e. the scorer rewards the
+# wreckage, which is why the test below is pixel-side.
+#
+# THRESHOLD PROVENANCE, read before trusting them. Calibrated on ONE cell
+# (pickscore, "a portrait of a man" -> "a smiling face", seed 42, N=8) where the
+# FMRG arm is visibly clean at lam=130 and visibly destroyed at lam=280:
+#
+#   metric                       mpc 280  hf 280  fmrg 130  fmrg 280  threshold
+#   clipped-pixel excess vs unc     0.000   0.000     0.038     0.206      0.10
+#   total-variation ratio            1.12    1.11      1.35      1.52      1.45
+#   pixel-std ratio                  1.03    1.00      1.50      1.95      1.80
+#   relative pixel L2                0.26    0.26      0.74      1.31      1.00
+#
+# So they separate "destroyed" from "large but clean" on n=1, and nothing more.
+# They are a CATASTROPHE stop, not a quality judgment -- they do not catch
+# HardFlow's crunchy-texture degradation at lam=280, which is visible to the eye
+# but moves none of them. That is why break mode also writes the decoded image
+# for every lambda it evaluates (--save_images): the operator decides where
+# "too far" is by looking, and these numbers only stop the search running away.
+# ─────────────────────────────────────────────────────────────────────────────
+BREAK_CLIP_EXCESS = 0.10                # fraction of channel values at 0/255, above uncontrolled
+BREAK_TV_RATIO    = 1.45                # total variation vs uncontrolled
+BREAK_STD_RATIO   = 1.80                # pixel std vs uncontrolled
+BREAK_PIX_L2      = 1.00                # ||img_ctrl - img_unc|| / ||img_unc||
+BREAK_DR_DROP     = 0.50                # reward collapse, as a fraction of the observed rise
+CEILING_STOP_FRAC = 0.90                # near_ceiling stop; >1 disables it
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -155,6 +212,62 @@ def hardflow_floor(N: int, lr: float) -> float:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Image-side break statistics (2026-09-23) -- see the PERMISSIVE HIGH END block.
+# _run_one already returns both decoded PIL images (`_img_ctrl`, `_img_unc`), so
+# every one of these is free: no extra NFE, no extra model, no decode.
+# ═════════════════════════════════════════════════════════════════════════════
+IMG_STAT_KEYS = ("pix_l2", "tv_ratio", "std_ratio", "clip_excess")
+
+
+def _nan_img_stats() -> Dict[str, float]:
+    return {k: float("nan") for k in IMG_STAT_KEYS}
+
+
+def image_break_stats(img_ctrl, img_unc) -> Dict[str, float]:
+    """Four cheap off-manifold statistics of the controlled image vs the
+    uncontrolled one at the same seed. All are ratios or relative quantities, so
+    they are comparable across prompts (an intrinsically dark or busy
+    uncontrolled image shifts the numerator and the denominator together)."""
+    if img_ctrl is None or img_unc is None:
+        return _nan_img_stats()
+    a = np.asarray(img_ctrl.convert("RGB"), dtype=np.float64)
+    b = np.asarray(img_unc.convert("RGB"), dtype=np.float64)
+    if a.shape != b.shape:
+        return _nan_img_stats()
+
+    def tv(x):    # mean absolute gradient, both axes
+        return 0.5 * (np.abs(np.diff(x, axis=0)).mean() + np.abs(np.diff(x, axis=1)).mean())
+
+    # `clip_excess` is measured AGAINST the uncontrolled image rather than
+    # absolutely: the uncontrolled portrait cell already has 0.2% of its channel
+    # values pinned at 0 (a dark background), and an absolute threshold would
+    # charge that to the controller.
+    clipped = lambda x: float((((x <= 2.0) | (x >= 253.0)).mean()))
+    return dict(pix_l2=float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-9)),
+                tv_ratio=float(tv(a) / max(tv(b), 1e-9)),
+                std_ratio=float(a.std() / max(b.std(), 1e-9)),
+                clip_excess=float(clipped(a) - clipped(b)))
+
+
+def broken_reasons(row: dict, a) -> List[str]:
+    """Which break thresholds this evaluation trips. Any one is enough; they are
+    deliberately loose (see the provenance table) so that a large-but-clean edit
+    does not stop the walk."""
+    out = []
+    if not math.isfinite(row.get("pix_l2", float("nan"))):
+        return out                      # no image (failed run) -- not evidence of breaking
+    if row["clip_excess"] > a.break_clip_excess:
+        out.append(f"clip_excess={row['clip_excess']:.3f}>{a.break_clip_excess:g}")
+    if row["tv_ratio"] > a.break_tv_ratio:
+        out.append(f"tv_ratio={row['tv_ratio']:.2f}>{a.break_tv_ratio:g}")
+    if row["std_ratio"] > a.break_std_ratio:
+        out.append(f"std_ratio={row['std_ratio']:.2f}>{a.break_std_ratio:g}")
+    if row["pix_l2"] > a.break_pix_l2:
+        out.append(f"pix_l2={row['pix_l2']:.2f}>{a.break_pix_l2:g}")
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Evaluation of one lambda
 # ═════════════════════════════════════════════════════════════════════════════
 def make_cfg(method: str, a, lam: float) -> rs.RunConfig:
@@ -180,6 +293,9 @@ class Evaluator:
         self.sampler, self.device, self.reward_device, self.dtype, self.a = sampler, device, reward_device, dtype, a
         self.reward_dtype = rs._REWARD_DTYPES[a.reward_dtype]
         self.rows: List[dict] = []
+        self.img_dir = Path(a.out_dir) / "images" if a.save_images else None
+        if self.img_dir:
+            self.img_dir.mkdir(parents=True, exist_ok=True)
 
     def __call__(self, method: str, lam: float) -> dict:
         cfg = make_cfg(method, self.a, lam)
@@ -191,17 +307,33 @@ class Evaluator:
             row = dict(method=method, lam=float(lam), ok=bool(res["run_ok"]),
                        r_unc=res["r_unc"], r_ctrl=res["r_ctrl"], dr=res["delta_r"], E=res["ctrl_energy"],
                        J=res["objective"], t_ctrl=res["time_ctrl_s"], err=res.get("error_msg", ""))
+            # (2026-09-23) Image-side break statistics, and optionally the image
+            # itself. Both come from _run_one's already-decoded PIL outputs; a
+            # failed run returns img_ctrl = img_unc as a placeholder, so guard on
+            # run_ok rather than on the images being present.
+            row.update(image_break_stats(res.get("_img_ctrl"), res.get("_img_unc"))
+                       if row["ok"] else _nan_img_stats())
+            if self.img_dir is not None and row["ok"] and res.get("_img_ctrl") is not None:
+                res["_img_ctrl"].save(self.img_dir / f"{method}__lam{lam:.4g}__ctrl.png")
+                unc = self.img_dir / "uncontrolled.png"
+                if not unc.exists() and res.get("_img_unc") is not None:
+                    res["_img_unc"].save(unc)
         except Exception as e:  # e.g. HardFlow's lr*reg >= 1 guard, OOM
             row = dict(method=method, lam=float(lam), ok=False, r_unc=float("nan"), r_ctrl=float("nan"),
                        dr=float("nan"), E=float("nan"), J=float("nan"), t_ctrl=float("nan"),
                        err=f"{type(e).__name__}: {str(e)[:160]}")
+            row.update(_nan_img_stats())
             torch.cuda.empty_cache()
         row["suspect"] = False      # set later by mark_suspects; keeps the CSV column stable
+        row["broken"] = ""          # set by the upward stop in break mode; ditto
         row["wall_s"] = time.perf_counter() - t0
         self.rows.append(row)
         flag = "" if row["ok"] else f"   FAILED: {row['err'][:70]}"
+        img = ("" if not math.isfinite(row["pix_l2"]) else
+               f"  L2={row['pix_l2']:.2f} TV={row['tv_ratio']:.2f} sd={row['std_ratio']:.2f}"
+               f" clip={row['clip_excess']:+.3f}")
         print(f"    {method:8} lam={lam:<10.4g} dr={row['dr']:8.4f}  E={row['E']:9.4f}  J={row['J']:9.4f}"
-              f"  t={row['t_ctrl']:6.1f}s{flag}", flush=True)
+              f"  t={row['t_ctrl']:6.1f}s{img}{flag}", flush=True)
         return row
 
 
@@ -255,28 +387,75 @@ def mark_suspects(points: Dict[float, dict], spike_decades: float = SPIKE_DECADE
     return [p for p in vp if not p["suspect"]]
 
 
-def _saturated(vp: List[dict], ceiling: float, tol: float) -> bool:
-    """Top of the bracket is flat. Judged on the OBSERVED rise, not the
-    theoretical ceiling: the reward's documented maximum is what the model can
-    reach on some image, not what this prompt pair can reach (CLIP's observed
-    max 0.80 gave a ceiling of 0.65 here while the real plateau was 0.24, and a
-    ceiling-only rule then walked lambda up to 3.5e6 looking for it)."""
+def saturation_reasons(vp: List[dict], ceiling: float, tol: float,
+                       ceiling_frac: float = CEILING_STOP_FRAC) -> List[str]:
+    """Which plateau tests fire at the top of the bracket. Judged on the OBSERVED
+    rise, not the theoretical ceiling: the reward's documented maximum is what the
+    model can reach on some image, not what this prompt pair can reach (CLIP's
+    observed max 0.80 gave a ceiling of 0.65 here while the real plateau was 0.24,
+    and a ceiling-only rule then walked lambda up to 3.5e6 looking for it)."""
     if len(vp) < 2:
-        return False
+        return []
     a, b = vp[-2], vp[-1]
     drs = [p["dr"] for p in vp]
-    rise = b["dr"] - min(drs)                     # how far the curve has climbed so far
+    # (2026-09-23) `rise` was `b["dr"] - min(drs)`, i.e. the LAST point minus the
+    # curve's minimum. On a collapsing curve the last point IS the minimum, so
+    # rise was identically 0, `risen` was False, and flat/energy_waste/falling --
+    # every test that needs it -- were gated off exactly in the overshoot case
+    # `falling` was written for. Measured consequence: FMRG on
+    # pickscore/"A Japanese garden at dawn" peaked at delta_r=4.19 (lam=25), fell
+    # to -6.08, and the upward walk ran to LAM_ABS_MAX instead of stopping at
+    # lam=160; 60 of 529 evaluations across the 17 cells on disk were spent above
+    # the peak on a falling curve, and 6 searches reported an active region out to
+    # >=1e5, which then dragged their shared grid (see docs/lambda_autorange.md).
+    # The rise of a CURVE is max-min, which is what this now computes.
+    rise = max(drs) - min(drs)
     gain = b["dr"] - a["dr"]                      # what the last decade bought
     # "risen" guards against calling two ~0 points saturated. 2*tol rather than a
     # larger multiple: HardFlow's admissible floor can sit partway up the curve, so
     # its whole visible rise may be small (CLIP: 0.08 with tol 0.033 -- a 4*tol
     # guard walked it to lam=5e6 before stopping, 2*tol stops at the plateau).
     risen = rise >= 2.0 * tol
-    flat = risen and gain < tol
-    near_ceiling = b["dr"] >= 0.9 * ceiling
-    energy_waste = risen and b["E"] > 3.0 * max(a["E"], 1e-9) and gain < 2.0 * tol
-    falling = risen and b["dr"] < max(drs) - tol  # overshoot: the image is being destroyed
-    return flat or near_ceiling or energy_waste or falling
+    out = []
+    if risen and gain < tol:
+        out.append("flat")
+    # ceiling_frac > 1 disables this test. It is the single most common stop --
+    # 24 of 51 searches on disk -- and it fires against REWARD_OBSERVED_RANGE,
+    # which for pickscore is an n=4 measurement; see the PERMISSIVE HIGH END block.
+    if b["dr"] >= ceiling_frac * ceiling:
+        out.append("near_ceiling")
+    if risen and b["E"] > 3.0 * max(a["E"], 1e-9) and gain < 2.0 * tol:
+        out.append("energy_waste")
+    if risen and b["dr"] < max(drs) - tol:        # overshoot: reward is going back down
+        out.append("falling")
+    return out
+
+
+def _saturated(vp: List[dict], ceiling: float, tol: float,
+               ceiling_frac: float = CEILING_STOP_FRAC) -> bool:
+    return bool(saturation_reasons(vp, ceiling, tol, ceiling_frac))
+
+
+def break_stop_reasons(vp: List[dict], tol: float, a) -> List[str]:
+    """The upward stop in --high_stop break: keep climbing until the IMAGE breaks
+    or the reward collapses outright. The plateau tests are not consulted -- a
+    flat reward curve is precisely the regime Shervin asked to keep walking
+    through, because energy (hence how far the edit has moved) keeps rising
+    there even when the scorer has stopped paying for it.
+
+    The reward-collapse test requires a drop of `--break_dr_drop` x the observed
+    rise, not the `tol` that `falling` uses. FMRG's response bifurcates near its
+    knee (a 0.06 change in lam flipped delta_r between 0.09 and 2.94 on
+    ImageReward), so a tol-sized dip is noise, not a collapse."""
+    if not vp:
+        return []
+    b = vp[-1]
+    drs = [p["dr"] for p in vp]
+    out = list(broken_reasons(b, a))
+    rise = max(drs) - min(drs)
+    if rise >= 2.0 * tol and (max(drs) - b["dr"]) >= a.break_dr_drop * rise:
+        out.append(f"dr_collapsed({b['dr']:.2f} from peak {max(drs):.2f})")
+    return out
 
 
 def _inactive(vp: List[dict], tol: float) -> bool:
@@ -284,10 +463,20 @@ def _inactive(vp: List[dict], tol: float) -> bool:
 
 
 def bracket(method: str, ev: Evaluator, lam0: float, ceiling: float, tol: float,
-            lam_min_adm: float, max_evals: int,
-            spike_decades: float = SPIKE_DECADES) -> Dict[float, dict]:
+            lam_min_adm: float, max_evals: int, a,
+            spike_decades: float = SPIKE_DECADES) -> tuple:
+    """Returns (points, info). `info` carries what ended the upward walk and, in
+    break mode, where the plateau began (`lam_knee`) -- which is the value the
+    default mode would have stopped at, kept so the two modes stay comparable."""
     points: Dict[float, dict] = {}
+    info: Dict[str, object] = dict(up_stop=[], up_stop_lam=None, lam_knee=None, knee_reasons=[])
     n = 0
+    break_mode = a.high_stop == "break"
+    # In break mode the upward step is configurable: x10 walks past the plateau
+    # fast but lands the last point up to a decade beyond where the image broke,
+    # which is a whole decade of grid the sweep then cannot use. x sqrt(10) halves
+    # that at the cost of ~2 extra evaluations per decade.
+    step = a.up_step if break_mode else 10.0
 
     def run(lam):
         nonlocal n
@@ -303,14 +492,31 @@ def bracket(method: str, ev: Evaluator, lam0: float, ceiling: float, tol: float,
 
     lam0 = max(lam0, lam_min_adm)
     run(lam0)
-    # ── upward: until saturated ──────────────────────────────────────────
+    # ── upward: until saturated (default) or until it breaks (break mode) ─
     lam = lam0
-    while n < max_evals and lam * 10 <= LAM_ABS_MAX:
+    while n < max_evals and lam * step <= LAM_ABS_MAX:
         vp = _valid(points)
-        if _saturated(vp, ceiling, tol):
+        # The knee is deliberately judged at the DEFAULT ceiling fraction even in
+        # break mode (where the ceiling stop is off): its job is to record where
+        # the plateau-mode run would have stopped, so the two modes stay
+        # comparable on the same cell.
+        knee = saturation_reasons(vp, ceiling, tol,
+                                  CEILING_STOP_FRAC if break_mode else a.ceiling_stop_frac)
+        if knee and info["lam_knee"] is None and vp:
+            # Record the plateau onset whether or not we stop on it.
+            info["lam_knee"] = vp[-1]["lam"]
+            info["knee_reasons"] = knee
+        stop = break_stop_reasons(vp, tol, a) if break_mode else knee
+        if stop:
+            info["up_stop"], info["up_stop_lam"] = stop, (vp[-1]["lam"] if vp else None)
+            if break_mode and vp:
+                vp[-1]["broken"] = ";".join(stop)
             break
-        lam *= 10
+        lam *= step
         run(lam)
+    if not info["up_stop"]:
+        info["up_stop"] = ["budget_or_box"]
+        info["up_stop_lam"] = max((p["lam"] for p in _valid(points)), default=None)
     # ── downward: until inactive (or admissible floor) ───────────────────
     lam = lam0
     while n < max_evals and lam / 10 >= max(LAM_ABS_MIN, lam_min_adm):
@@ -319,7 +525,7 @@ def bracket(method: str, ev: Evaluator, lam0: float, ceiling: float, tol: float,
             break
         lam /= 10
         run(lam)
-    return points
+    return points, info
 
 
 def fit_logistic(vp: List[dict], ceiling: float):
@@ -342,13 +548,49 @@ def fit_logistic(vp: List[dict], ceiling: float):
     return dict(m=float(m), k=float(k), A=float(A), r2=1.0 - err / ss_tot)
 
 
-def quantile_grid(fit, n_grid: int, lo: float, hi: float) -> List[float]:
-    """lambda values where the fitted curve reaches equally spaced fractions of its rise."""
-    qs = np.linspace(0.08, 0.92, n_grid)
+def quantile_grid(fit, n_grid: int, lo: float, hi: float,
+                  q_lo: float = 0.08, q_hi: float = 0.92) -> List[float]:
+    """lambda values where the fitted curve reaches equally spaced fractions of its rise.
+
+    q_hi is the top of that range. At 0.92 the emitted grid stops where the fitted
+    rise is 92% done, which on MPC/pickscore cells sat 1-2 decades below the
+    measured active region -- grid top lam=21 against an active region to 279,
+    where the sweep later measured delta_r=13.0 on an intact image.
+
+    RAISING q_hi IS THE WRONG FIX for that (tried 2026-09-23, 0.995): the offset
+    from the fitted midpoint is ln(q/(1-q))/k decades, so the top quantile shoots
+    up the tail -- on clip/cat (k=2.2) it jumped from 660 to 13000 and left a
+    2-decade hole between it and the next point down. Use --n_high, which fills
+    the range from the top quantile to `hi` uniformly in log lambda, and leave
+    q_hi where it is."""
+    qs = np.linspace(q_lo, q_hi, n_grid)
     xs = [fit["m"] + math.log(q / (1 - q)) / fit["k"] for q in qs]
     lams = [10 ** x for x in xs]
     lams = [min(max(l, lo), hi) for l in lams]
     return sorted({float(f"{l:.2g}") for l in lams})
+
+
+def extend_high(grid: List[float], hi: float, n_high: int) -> List[float]:
+    """Resolve the top of the range: make sure `hi` is on the grid and put
+    n_high log-spaced points between it and the rest of the grid.
+
+    Needed because above the knee the logistic is flat, so no quantile of the FIT
+    can place a point there -- the information at the top of the curve is in the
+    energy and in the image, not in the reward. This is what actually delivers
+    "keep going until it breaks" as grid points rather than as a wider bracket.
+
+    The anchor is the highest grid point that is not already at the top, because
+    a high --q_hi tends to clip its last quantile to `hi` and leave one huge gap
+    below it (measured: 18 -> 280, a factor 15). Filling that gap is the point;
+    appending above `hi` is not, so the result never exceeds `hi`."""
+    if n_high <= 0 or not grid:
+        return grid
+    g = sorted(set(grid))
+    below = [l for l in g if l < hi / 1.25]
+    if not below:
+        return g                      # the grid already sits at the top of the range
+    xs = np.linspace(math.log10(max(below)), math.log10(hi), n_high + 2)[1:]   # drop the anchor, keep hi
+    return sorted(set(g) | {float(f"{10 ** x:.2g}") for x in xs})
 
 
 def shared_grid(results: List[dict], n_max: int, min_ratio: float) -> dict:
@@ -402,29 +644,51 @@ def autorange(method: str, ev: Evaluator, a, pr: dict, ceiling: float, lam_floor
     print(f"\n== {method}: prior lam0={lam0:.3g}  ceiling(dr_max)={ceiling:.3f}  tol={tol:.3f}"
           f"{f'  admissible floor lam>={lam_floor_probe:.3g} (probe N), >={lam_floor_target:.3g} (target N)' if lam_floor_probe else ''}")
     t0 = time.perf_counter()
-    pts = bracket(method, ev, lam0, ceiling, tol, lam_floor_probe, a.max_evals, a.spike_decades)
+    pts, binfo = bracket(method, ev, lam0, ceiling, tol, lam_floor_probe, a.max_evals, a, a.spike_decades)
     # Final pass over the whole set: a point that was the last one during
     # bracketing (and so unflaggable) may now have a neighbour above it.
     mark_suspects(pts, a.spike_decades)
     vp = _valid(pts)
     out = dict(method=method, prior_lam0=lam0, tol=tol, ceiling=ceiling,
-               lam_floor_probe_N=lam_floor_probe, lam_floor_target_N=lam_floor_target)
+               lam_floor_probe_N=lam_floor_probe, lam_floor_target_N=lam_floor_target,
+               high_stop=a.high_stop, up_stop=binfo["up_stop"], up_stop_lam=binfo["up_stop_lam"],
+               lam_knee=binfo["lam_knee"], knee_reasons=binfo["knee_reasons"])
     if len(vp) < 2:
         out.update(status="insufficient", grid=[], points=list(pts.values()))
         return out
     # active region: from the last point that is still inactive (or the lowest) to the first saturated
     lo_pts = [p for p in vp if p["dr"] <= tol]
     lo = lo_pts[-1]["lam"] if lo_pts else vp[0]["lam"]
-    sat_idx = next((i for i in range(1, len(vp)) if _saturated(vp[:i + 1], ceiling, tol)), len(vp) - 1)
-    hi = vp[sat_idx]["lam"]
+    # (2026-09-23) A point whose image broke is a real measurement -- it stays in
+    # `points`, in the CSV and in the plot -- but it must not shape the grid: its
+    # reward has usually collapsed, which drags the logistic, and no grid should
+    # ship the run that destroyed the image. Same treatment as energy spikes.
+    vp_fit = [p for p in vp if not p.get("broken")] or vp
+    sat_idx = next((i for i in range(1, len(vp_fit))
+                    if _saturated(vp_fit[:i + 1], ceiling, tol, a.ceiling_stop_frac)), len(vp_fit) - 1)
+    hi = vp_fit[sat_idx]["lam"]
+    # In break mode the active region runs to the EDGE -- the highest lambda that
+    # is neither broken nor collapsed -- rather than to the plateau onset, since
+    # walking past the plateau is the whole point of the mode.
+    lam_edge = None
+    if a.high_stop == "break":
+        lam_edge = vp_fit[-1]["lam"]
+        hi = lam_edge
     if hi <= lo:
-        lo, hi = vp[0]["lam"], vp[-1]["lam"]
-    fit = fit_logistic(vp, ceiling)
-    grid = quantile_grid(fit, a.n_grid, lo, hi) if fit and fit["r2"] > 0.5 else loguniform_grid(a.n_grid, lo, hi)
+        lo, hi = vp_fit[0]["lam"], vp_fit[-1]["lam"]
+    fit = fit_logistic(vp_fit, ceiling)
+    grid = (quantile_grid(fit, a.n_grid, lo, hi, q_hi=a.q_hi) if fit and fit["r2"] > 0.5
+            else loguniform_grid(a.n_grid, lo, hi))
     # quantiles collapsed (flat or nearly flat curve) or produced near-duplicates
     # after rounding: spread log-uniformly over the active region instead.
     if len(grid) < max(3, a.n_grid // 2) or any(b / a_ < 1.25 for a_, b in zip(grid, grid[1:])):
         grid = loguniform_grid(a.n_grid, lo, hi)
+    # (2026-09-23) Extend the grid above the knee, up to the top of the active
+    # region (= the break edge in break mode). Adds points, so the grid can be
+    # n_grid + n_high long; that is deliberate -- these are the aggressive
+    # operating points, and dropping a transition point to pay for one would
+    # defeat the quantile placement.
+    grid = extend_high(grid, hi, a.n_high)
     # HardFlow special case: if the lowest ADMISSIBLE point is already on the
     # plateau, the transition lies below the lr*reg >= 1 floor and no grid above
     # it can measure it. Say so instead of handing back six plateau points.
@@ -436,9 +700,23 @@ def autorange(method: str, ev: Evaluator, a, pr: dict, ceiling: float, lam_floor
         for lam in grid:
             if float(f"{lam:.3g}") not in pts and len(pts) < a.max_evals + a.n_grid:
                 pts[float(f"{lam:.3g}")] = ev(method, lam)
+        # (2026-09-23) Refined points get the break test too. Only the bracket's
+        # stop sets `broken` otherwise, so without this a grid point that broke
+        # the image would be reported as an ordinary operating point.
+        if a.high_stop == "break":
+            for p in pts.values():
+                if p["ok"] and not p.get("broken"):
+                    rs_ = broken_reasons(p, a)
+                    if rs_:
+                        p["broken"] = ";".join(rs_)
+            # and then they leave the grid: the whole grid is one lambda coarser
+            # than the walk, so a point can only be tested after it is proposed.
+            grid = [l for l in grid if not pts.get(float(f"{l:.3g}"), {}).get("broken")]
         mark_suspects(pts, a.spike_decades)
         vp = _valid(pts)
-        fit = fit_logistic(vp, ceiling) or fit
+        # refinement can add points above the knee in break mode; keep the fit on
+        # the unbroken ones, as above
+        fit = fit_logistic([p for p in vp if not p.get("broken")] or vp, ceiling) or fit
     # HardFlow: the target-N floor may cut the grid; report rather than silently shift
     clipped = [l for l in grid if l < lam_floor_target] if lam_floor_target else []
     grid_target = [l for l in grid if l >= lam_floor_target] if lam_floor_target else grid
@@ -447,7 +725,13 @@ def autorange(method: str, ev: Evaluator, a, pr: dict, ceiling: float, lam_floor
         print(f"    [suspect] energy spikes at lam {', '.join(f'{l:g}' for l in suspects)} "
               f"(>{a.spike_decades:g} decades above both neighbours) -- excluded from the fit, "
               f"the active region and the grid; still in evaluations.csv")
-    out.update(suspect_lams=suspects,
+    broken_lams = sorted(p["lam"] for p in pts.values() if p.get("broken"))
+    if a.high_stop == "break":
+        _fmt = lambda v: "none" if v is None else f"{v:g}"
+        print(f"    [high end] stopped on {';'.join(binfo['up_stop'])} at lam={_fmt(binfo['up_stop_lam'])}"
+              f"   plateau began at lam={_fmt(binfo['lam_knee'])}"
+              f" ({','.join(binfo['knee_reasons']) or '-'})   grid edge lam={_fmt(lam_edge)}")
+    out.update(suspect_lams=suspects, lam_edge=lam_edge, broken_lams=broken_lams,
                status="saturated_at_admissible_floor" if floor_saturated else "ok",
                dr_plateau_observed=dr_top, active_lo=lo, active_hi=hi, fit=fit, grid=grid,
                grid_for_target_N=grid_target, clipped_by_target_floor=clipped,
@@ -482,6 +766,12 @@ def plot(results: List[dict], out: Path, reward: str):
             ax.semilogx(xs, ys, "-", alpha=.6, label=f"logistic fit (R²={f['r2']:.2f})")
         for l in r.get("grid", []):
             ax.axvline(l, color="green", alpha=.5)
+        # (2026-09-23) knee vs break: in break mode the grid deliberately runs
+        # past the plateau, so the plot has to show both or it looks like a bug.
+        if r.get("lam_knee"):
+            ax.axvline(r["lam_knee"], color="tab:blue", ls="-.", alpha=.7, label="plateau onset")
+        for l in r.get("broken_lams", []):
+            ax.axvline(l, color="black", ls="--", alpha=.8, label="image broke")
         ax.axhline(r["ceiling"], color="gray", ls="--", alpha=.5, label="ceiling est.")
         if r.get("lam_floor_target_N"):
             ax.axvline(r["lam_floor_target_N"], color="orange", ls="--", label="HardFlow floor @ target N")
@@ -499,7 +789,45 @@ def main():
     p.add_argument("--probe_N", type=int, default=4, help="cheap N used for range finding")
     p.add_argument("--target_N", type=int, default=10, help="N of the sweep you will run with the grid")
     p.add_argument("--n_grid", type=int, default=6, help="lambda points in the recommended grid")
-    p.add_argument("--max_evals", type=int, default=10, help="bracketing budget per method (refinement adds n_grid)")
+    p.add_argument("--max_evals", type=int, default=None,
+                   help="bracketing budget per method (refinement adds n_grid). "
+                        "Default 10, or 14 with --high_stop break, which walks further up.")
+    # ── permissive high end (2026-09-23) ──────────────────────────────────
+    # One switch, --high_stop break, with the other knobs resolved from it below
+    # so the mode cannot be half-applied. Every default with high_stop=plateau is
+    # the pre-2026-09-23 value, so the old behaviour is bit-for-bit reachable.
+    p.add_argument("--high_stop", choices=["plateau", "break"], default="plateau",
+                   help="where the upward walk stops. plateau (default): as soon as the reward "
+                        "curve flattens. break: keep climbing until the IMAGE breaks or the reward "
+                        "collapses, recording the plateau onset as lam_knee on the way past. Use "
+                        "break when you want the aggressive end of the frontier; the plateau is "
+                        "where reward stops paying, not where the edit stops getting stronger.")
+    p.add_argument("--ceiling_stop_frac", type=float, default=None,
+                   help="stop when delta_r reaches this fraction of the ceiling estimate. Default "
+                        "0.9 (plateau) / disabled (break). The ceiling comes from "
+                        "REWARD_OBSERVED_RANGE, which for pickscore is an n=4 measurement that "
+                        "MPC overshoots, so this is the first thing to loosen.")
+    p.add_argument("--q_hi", type=float, default=None,
+                   help="top logistic quantile for grid placement. Default 0.92 (plateau) / 0.995 "
+                        "(break); the offset from the fitted midpoint is log10(q/(1-q))/k decades.")
+    p.add_argument("--n_high", type=int, default=None,
+                   help="extra log-spaced grid points between the top quantile and the top of the "
+                        "active region. Default 0 (plateau) / 2 (break). Above the knee the fitted "
+                        "logistic is flat, so no quantile can place a point there.")
+    p.add_argument("--up_step", type=float, default=None,
+                   help="multiplicative step of the upward walk. Default 10 (plateau) / 3.1623 "
+                        "(break), which halves how far past the break point the last eval lands.")
+    p.add_argument("--break_clip_excess", type=float, default=BREAK_CLIP_EXCESS)
+    p.add_argument("--break_tv_ratio", type=float, default=BREAK_TV_RATIO)
+    p.add_argument("--break_std_ratio", type=float, default=BREAK_STD_RATIO)
+    p.add_argument("--break_pix_l2", type=float, default=BREAK_PIX_L2)
+    p.add_argument("--break_dr_drop", type=float, default=BREAK_DR_DROP,
+                   help="reward collapse, as a fraction of the observed rise; larger than "
+                        "`falling`'s tol because FMRG's response bifurcates near its knee")
+    p.add_argument("--save_images", type=lambda x: x.lower() != "false", default=None,
+                   help="write the decoded image for every lambda to <out_dir>/images/. Default "
+                        "off (plateau) / on (break): the break thresholds are calibrated on one "
+                        "cell, so the operator should be able to look.")
     p.add_argument("--tol", type=float, default=0.05, help="flatness tolerance as a fraction of the reward ceiling")
     p.add_argument("--tol_abs", type=float, default=0.0, help="absolute floor for the tolerance")
     p.add_argument("--spike_decades", type=float, default=SPIKE_DECADES,
@@ -530,6 +858,25 @@ def main():
     p.add_argument("--lora_path", default=None)
     p.add_argument("--out_dir", required=True)
     a = p.parse_args()
+    # (2026-09-23) Resolve the mode-dependent defaults in ONE place, and print
+    # them, so a run's high-end behaviour is never half-configured and the json's
+    # `args` block records what actually applied rather than a pile of Nones.
+    _MODE_DEFAULTS = {"plateau": dict(max_evals=10, ceiling_stop_frac=CEILING_STOP_FRAC, q_hi=0.92,
+                                      n_high=0, up_step=10.0, save_images=False),
+                      # q_hi stays at 0.92 in break mode on purpose -- see
+                      # quantile_grid: the top end is opened up with n_high, not
+                      # by pushing one quantile out onto the logistic's tail.
+                      "break":   dict(max_evals=14, ceiling_stop_frac=1e9, q_hi=0.92,
+                                      n_high=2, up_step=math.sqrt(10.0), save_images=True)}
+    for k, v in _MODE_DEFAULTS[a.high_stop].items():
+        if getattr(a, k) is None:
+            setattr(a, k, v)
+    if not 0.5 < a.q_hi < 1.0:
+        raise ValueError(f"--q_hi must be in (0.5, 1.0), got {a.q_hi}")
+    print(f"high end: --high_stop {a.high_stop}  ceiling_stop_frac="
+          f"{'disabled' if a.ceiling_stop_frac > 1 else f'{a.ceiling_stop_frac:g}'}  q_hi={a.q_hi:g}  "
+          f"n_high={a.n_high}  up_step={a.up_step:.4g}  max_evals={a.max_evals}  "
+          f"save_images={a.save_images}", flush=True)
 
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     flux_device, reward_device = rs._resolve_devices(a.flux_device, a.reward_device)
@@ -584,6 +931,20 @@ def main():
         lines.append(f"{'':8} # active region lam in [{r['active_lo']:g}, {r['active_hi']:g}], "
                      f"{r['n_evals']} evals, {r['wall_s']:.0f}s"
                      + (f", logistic R2={r['fit']['r2']:.2f}" if r.get('fit') else ""))
+        # (2026-09-23) In break mode say, per method, where the plateau began and
+        # what ended the walk -- the whole point of the mode is that the grid now
+        # extends past the knee, so the knee has to stay visible.
+        if r.get("high_stop") == "break":
+            knee = "none" if r.get("lam_knee") is None else f"{r['lam_knee']:g}"
+            edge = "none" if r.get("lam_edge") is None else f"{r['lam_edge']:g}"
+            lines.append(f"{'':8} # plateau began at lam={knee}"
+                         f" ({','.join(r.get('knee_reasons') or []) or '-'}), walked to lam="
+                         f"{r['up_stop_lam']:g}, stopped on {';'.join(r['up_stop'])}; "
+                         f"grid edge lam={edge}")
+            if r.get("broken_lams"):
+                lines.append(f"{'':8} # BROKEN (excluded from the grid) at lam "
+                             f"{' '.join(f'{l:g}' for l in r['broken_lams'])} "
+                             f"-- look at images/ before trusting the top of this grid")
     sh = shared_grid(results, a.n_grid_shared, a.shared_min_ratio)
     summary["shared"] = sh
     lines.append("")

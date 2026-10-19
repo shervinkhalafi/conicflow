@@ -191,6 +191,43 @@ def load_autorange(paths: List[str]) -> List[dict]:
 # ═════════════════════════════════════════════════════════════════════════════
 # Selection
 # ═════════════════════════════════════════════════════════════════════════════
+def pareto_front(runs: List[dict], log=print) -> List[dict]:
+    """Keep only each method's reward/energy Pareto-efficient runs.
+
+    A run is dropped when the SAME method has another run that is at least as
+    good on both axes -- reward no lower, energy no higher. Those runs are
+    never the right way to represent a method: something it also ran is better
+    in every respect.
+
+    This exists because the matcher picks a method's representative purely by
+    proximity in the matched key, and a non-monotone reward curve gives a
+    method two runs at the same reward with wildly different energy. On the
+    2026-09-22 abstract-human-form cell, FMRG's row was filled by lam=140000
+    (reward 22.79, energy 2.3e7 -- visually pure noise) when lam=2.1 sat right
+    there at reward 22.42 and energy 0.37. Same reward, 6e7 times the energy.
+    That is a strawman of the baseline, not a comparison, and it is exactly the
+    principle select_configs already applies across configs: show the method at
+    its strongest, not at whichever run happened to match best.
+
+    Dropped runs stay in summary.csv; this only governs what the figure may
+    choose from.
+    """
+    out: List[dict] = []
+    for m in METHODS:
+        mine = [r for r in runs if r["method"] == m
+                and math.isfinite(r["r_ctrl"]) and math.isfinite(r["E"])]
+        keep = [r for r in mine
+                if not any(o is not r and o["r_ctrl"] >= r["r_ctrl"] and o["E"] <= r["E"]
+                           and (o["r_ctrl"] > r["r_ctrl"] or o["E"] < r["E"])
+                           for o in mine)]
+        if len(keep) < len(mine):
+            dropped = sorted(r["lam"] for r in mine if r not in keep)
+            log(f"    pareto {m}: {len(keep)}/{len(mine)} kept, dropped lam "
+                f"{['%g' % d for d in dropped]}")
+        out.extend(keep)
+    return out
+
+
 def closest_triple(runs: List[dict], key: str) -> Optional[dict]:
     """Narrowest window over `key` that contains all three methods.
 
@@ -373,6 +410,21 @@ def main():
                          "of the previous rows' runs: the chosen triple is removed from the pool "
                          "and the match is repeated. Stops early if the remaining runs no longer "
                          "cover all three methods.")
+    ap.add_argument("--pareto_only", action="store_true",
+                    help="before matching, drop runs a method's own other runs dominate on "
+                         "both reward and energy. Prevents a non-monotone baseline being "
+                         "represented at a pathological lambda when a far cheaper run of "
+                         "its own reaches the same reward. Off by default: it changes which "
+                         "runs existing figures select.")
+    ap.add_argument("--min_dr", type=float, default=None, metavar="X",
+                    help="drop runs whose reward gain over uncontrolled (r_ctrl - r_unc) is "
+                         "below X before matching. select_rows takes the TIGHTEST match first, "
+                         "and the tightest matches sit at the low-lambda end where no method has "
+                         "moved the image yet -- so the default figure fills up with rows that "
+                         "are visually identical to the uncontrolled column. Pruning the dead "
+                         "zone first makes the rows land where the methods actually separate. "
+                         "Purely a selection filter: nothing is recomputed and every run stays "
+                         "in summary.csv.")
     ap.add_argument("--out_dir", default=".")
     ap.add_argument("--dry_run", "--dry-run", action="store_true", dest="dry_run",
                     help="print the chosen triples, draw nothing")
@@ -405,6 +457,24 @@ def main():
         if a.configs == "best" and any(len({r["cfg"] for r in grp if r["method"] == m}) > 1 for m in METHODS):
             print(f"\n  config selection for {gkey[0]} N={gkey[3]} seed={gkey[4]}:")
             grp = select_configs(grp)
+        # Applied after config selection so a method is still represented by its
+        # best config, and per group so the threshold is read against this
+        # cell's own r_unc. Loud if it empties a method out: a silently
+        # three-method-short group would look identical to a failed sweep.
+        # Before --min_dr: a dominated run must not be able to satisfy the
+        # reward-gain floor and so keep a method alive in the pool.
+        if a.pareto_only:
+            grp = pareto_front(grp)
+        if a.min_dr is not None:
+            kept = [r for r in grp if r["r_ctrl"] - r["r_unc"] >= a.min_dr]
+            left = {r["method"] for r in kept}
+            if len(left) < len(METHODS):
+                print(f"  SKIP {gkey}: --min_dr {a.min_dr} leaves only {sorted(left)} "
+                      f"(of {len(grp)} runs, {len(kept)} pass)")
+                continue
+            print(f"  --min_dr {a.min_dr}: {len(kept)}/{len(grp)} runs kept for {gkey[0]} "
+                  f"seed={gkey[4]}")
+            grp = kept
         for mode in modes:
             key = "r_ctrl" if mode == "reward" else "E"
             sels = select_rows(grp, key, a.num_rows)
