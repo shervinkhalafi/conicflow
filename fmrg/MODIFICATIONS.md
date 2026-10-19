@@ -32,4 +32,7 @@ the ImageReward/HPSv2 install downgrades.
 `--cache-dir "$HF_HOME"`, so the weights land where `FluxFlowMapSampler` loads
 them from (`from_pretrained(..., cache_dir=$HF_HOME)`). Upstream downloads to
 the default `$HF_HOME/hub`, which the sampler does not read, so the 32 GB model
-was fetched twice.
+was fetched twice. For the same reason the `snapshot_download` pre-warm of
+PickScore and CLIP-ViT-H-14 is removed: it fetched every weight format (~24 GB)
+into `$HF_HOME/hub`, none of which the reward wrappers load; they download what
+they need into `$HF_HOME` on first use.

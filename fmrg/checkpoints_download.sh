@@ -37,9 +37,8 @@ try: import hpsv2
 except Exception: pass
 try: import ImageReward
 except Exception: pass
-try:
-    from huggingface_hub import snapshot_download
-    snapshot_download("yuvalkirstain/PickScore_v1")
-    snapshot_download("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
-except Exception: pass
+# MODIFIED (see MODIFICATIONS.md): the snapshot_download pre-warm of PickScore and
+# CLIP-ViT-H-14 is removed. It fetched every weight format (~24 GB) into
+# $HF_HOME/hub, while the reward wrappers load with cache_dir=$HF_HOME, so none of
+# it was used; they download what they need on first use.
 PY
