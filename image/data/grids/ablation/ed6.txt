@@ -1,0 +1,14 @@
+# ed6: "a portrait of a clean-shaven man" -> "a portrait of a man with a mustache"   (reward: pickscore, N=8)
+# Frozen lambda grid written by lambda_autorange.py; the ablation reads it
+# instead of re-range-finding, so every arm runs at the lambdas the paper used.
+conicflow --sweep_lam 0.52 1.4 2.5 4.1 7.2 19
+         # active region lam in [0.0562, 562], 11 evals, 359s, logistic R2=0.99
+hardflow --sweep_lam 5.6 8.9 14 22 35 56
+         # active region lam in [5.62, 56.2], 8 evals, 205s, logistic R2=0.62
+fmrg     --sweep_lam 0.98 2.2 3.6 5.5 8.9 20
+         # active region lam in [0.112, 1120], 11 evals, 267s, logistic R2=0.96
+
+shared   --sweep_lam 0.52 0.98 2.3 8.9 20 56
+         # conicflow: 6 of 6 shared points inside its active region [0.0562, 562]
+         # hardflow: 3 of 6 shared points inside its active region [5.62, 56.2]
+         # fmrg: 6 of 6 shared points inside its active region [0.112, 1120]
