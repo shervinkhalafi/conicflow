@@ -1,7 +1,7 @@
 [project]
-name = "fmocc"
+name = "conicflow"
 version = "0.1.0"
-description = "Optimization-based control for FLUX flow-map image generation (MPC / HardFlow / FMRG)"
+description = "ConicFlow: constrained inference-time optimal control for flow matching models (code for the paper)"
 requires-python = "==3.10.*"
 
 # Mirrors the `flowmaps` conda env. Only DIRECT dependencies are listed; uv.lock

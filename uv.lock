@@ -419,6 +419,106 @@ wheels = [
 ]
 
 [[package]]
+name = "conicflow"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "accelerate" },
+    { name = "bitsandbytes" },
+    { name = "clip" },
+    { name = "diffusers" },
+    { name = "einops" },
+    { name = "fairscale" },
+    { name = "ftfy" },
+    { name = "hpsv2" },
+    { name = "huggingface-hub" },
+    { name = "image-reward" },
+    { name = "lpips" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "peft" },
+    { name = "pillow" },
+    { name = "protobuf" },
+    { name = "pyyaml" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "safetensors" },
+    { name = "scikit-image" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "sentencepiece" },
+    { name = "setuptools" },
+    { name = "timm" },
+    { name = "torch" },
+    { name = "torchao" },
+    { name = "torchvision" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+]
+lowdim = [
+    { name = "pytorch-lightning" },
+    { name = "seaborn" },
+    { name = "torchcfm" },
+    { name = "torchmetrics" },
+    { name = "wandb" },
+]
+notebooks = [
+    { name = "ipykernel" },
+    { name = "ipywidgets" },
+    { name = "jupyterlab" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", specifier = ">=1.0" },
+    { name = "bitsandbytes", specifier = ">=0.45" },
+    { name = "clip", git = "https://github.com/openai/CLIP.git?rev=d05afc436d78f1c48dc0dbf8e5980a9d471f35f6" },
+    { name = "diffusers", specifier = "==0.34.0" },
+    { name = "einops", specifier = ">=0.8" },
+    { name = "fairscale", specifier = ">=0.4" },
+    { name = "ftfy", specifier = ">=6" },
+    { name = "hpsv2", specifier = "==1.2.0" },
+    { name = "huggingface-hub", specifier = ">=0.30" },
+    { name = "image-reward", specifier = "==1.5" },
+    { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6" },
+    { name = "ipywidgets", marker = "extra == 'notebooks'", specifier = ">=8" },
+    { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
+    { name = "lpips", specifier = ">=0.1.4" },
+    { name = "matplotlib", specifier = ">=3.9" },
+    { name = "numpy", specifier = ">=2.0,<3" },
+    { name = "peft", specifier = ">=0.15.0,<0.18" },
+    { name = "pillow", specifier = ">=10" },
+    { name = "protobuf", specifier = ">=5" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
+    { name = "pytorch-lightning", marker = "extra == 'lowdim'", specifier = ">=2.0" },
+    { name = "pyyaml", specifier = ">=6" },
+    { name = "regex" },
+    { name = "requests", specifier = ">=2.31" },
+    { name = "safetensors", specifier = ">=0.4" },
+    { name = "scikit-image", specifier = ">=0.24" },
+    { name = "scikit-learn", specifier = ">=1.3" },
+    { name = "scipy", specifier = ">=1.15" },
+    { name = "seaborn", marker = "extra == 'lowdim'", specifier = ">=0.13" },
+    { name = "sentencepiece", specifier = ">=0.2" },
+    { name = "setuptools", specifier = ">=68" },
+    { name = "timm", specifier = ">=1.0" },
+    { name = "torch", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" },
+    { name = "torchao", specifier = "==0.9.0" },
+    { name = "torchcfm", marker = "extra == 'lowdim'", specifier = "==1.0.7" },
+    { name = "torchmetrics", marker = "extra == 'lowdim'", specifier = ">=1.0" },
+    { name = "torchvision", specifier = "==0.20.1", index = "https://download.pytorch.org/whl/cu121" },
+    { name = "tqdm", specifier = ">=4.66" },
+    { name = "transformers", specifier = "==4.53.3" },
+    { name = "wandb", marker = "extra == 'lowdim'", specifier = ">=0.16.5" },
+]
+provides-extras = ["lowdim", "notebooks", "dev"]
+
+[[package]]
 name = "contourpy"
 version = "1.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -592,106 +692,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/5e/ac/8c98b17ee3900147b
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/fb/0e4489505dac46a0487ba925ea4b046612f1a40f432d63a000421de78549/filelock-4.0.0-py3-none-any.whl", hash = "sha256:a850aa9ec2acba8db9ca2e9fcf8a327fbc2f85e432725715b37bd76b7dd1f798", size = 106036, upload-time = "2026-09-17T03:59:01.336Z" },
 ]
-
-[[package]]
-name = "fmocc"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "accelerate" },
-    { name = "bitsandbytes" },
-    { name = "clip" },
-    { name = "diffusers" },
-    { name = "einops" },
-    { name = "fairscale" },
-    { name = "ftfy" },
-    { name = "hpsv2" },
-    { name = "huggingface-hub" },
-    { name = "image-reward" },
-    { name = "lpips" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "peft" },
-    { name = "pillow" },
-    { name = "protobuf" },
-    { name = "pyyaml" },
-    { name = "regex" },
-    { name = "requests" },
-    { name = "safetensors" },
-    { name = "scikit-image" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "sentencepiece" },
-    { name = "setuptools" },
-    { name = "timm" },
-    { name = "torch" },
-    { name = "torchao" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-    { name = "transformers" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-]
-lowdim = [
-    { name = "pytorch-lightning" },
-    { name = "seaborn" },
-    { name = "torchcfm" },
-    { name = "torchmetrics" },
-    { name = "wandb" },
-]
-notebooks = [
-    { name = "ipykernel" },
-    { name = "ipywidgets" },
-    { name = "jupyterlab" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=1.0" },
-    { name = "bitsandbytes", specifier = ">=0.45" },
-    { name = "clip", git = "https://github.com/openai/CLIP.git?rev=d05afc436d78f1c48dc0dbf8e5980a9d471f35f6" },
-    { name = "diffusers", specifier = "==0.34.0" },
-    { name = "einops", specifier = ">=0.8" },
-    { name = "fairscale", specifier = ">=0.4" },
-    { name = "ftfy", specifier = ">=6" },
-    { name = "hpsv2", specifier = "==1.2.0" },
-    { name = "huggingface-hub", specifier = ">=0.30" },
-    { name = "image-reward", specifier = "==1.5" },
-    { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6" },
-    { name = "ipywidgets", marker = "extra == 'notebooks'", specifier = ">=8" },
-    { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
-    { name = "lpips", specifier = ">=0.1.4" },
-    { name = "matplotlib", specifier = ">=3.9" },
-    { name = "numpy", specifier = ">=2.0,<3" },
-    { name = "peft", specifier = ">=0.15.0,<0.18" },
-    { name = "pillow", specifier = ">=10" },
-    { name = "protobuf", specifier = ">=5" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
-    { name = "pytorch-lightning", marker = "extra == 'lowdim'", specifier = ">=2.0" },
-    { name = "pyyaml", specifier = ">=6" },
-    { name = "regex" },
-    { name = "requests", specifier = ">=2.31" },
-    { name = "safetensors", specifier = ">=0.4" },
-    { name = "scikit-image", specifier = ">=0.24" },
-    { name = "scikit-learn", specifier = ">=1.3" },
-    { name = "scipy", specifier = ">=1.15" },
-    { name = "seaborn", marker = "extra == 'lowdim'", specifier = ">=0.13" },
-    { name = "sentencepiece", specifier = ">=0.2" },
-    { name = "setuptools", specifier = ">=68" },
-    { name = "timm", specifier = ">=1.0" },
-    { name = "torch", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" },
-    { name = "torchao", specifier = "==0.9.0" },
-    { name = "torchcfm", marker = "extra == 'lowdim'", specifier = "==1.0.7" },
-    { name = "torchmetrics", marker = "extra == 'lowdim'", specifier = ">=1.0" },
-    { name = "torchvision", specifier = "==0.20.1", index = "https://download.pytorch.org/whl/cu121" },
-    { name = "tqdm", specifier = ">=4.66" },
-    { name = "transformers", specifier = "==4.53.3" },
-    { name = "wandb", marker = "extra == 'lowdim'", specifier = ">=0.16.5" },
-]
-provides-extras = ["lowdim", "notebooks", "dev"]
 
 [[package]]
 name = "fonttools"
