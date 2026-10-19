@@ -1,0 +1,16 @@
+# Frozen lambda grid for the unconstrained image experiment (Table 1 / Fig. 2).
+# Written by lambda_autorange.py (probe N=4, --n_grid_shared 6) for reward=clip,
+# cell a_field_of_green_grass__a_field_of_red_poppies. run_table1.sh uses the 'shared' line only;
+# the per-method lines are the range finder's own grids, kept for reference.
+# Method label 'mpc' in the original file is renamed 'conicflow'.
+conicflow --sweep_lam 1.5 4.7 9.1 16 31 98
+         # active region lam in [1.11, 1110], 10 evals, 351s, logistic R2=0.99
+hardflow --sweep_lam 3.9 12 23 42 81 250
+         # active region lam in [1.11, 11100], 11 evals, 304s, logistic R2=0.98
+fmrg     --sweep_lam 11 18 24 31 41 69
+         # active region lam in [2.22, 2220], 10 evals, 265s, logistic R2=0.89
+
+shared   --sweep_lam 1.5 4.3 11 39 86 250
+         # conicflow: 6 of 6 shared points inside its active region [1.11, 1110]
+         # hardflow: 6 of 6 shared points inside its active region [1.11, 11100]
+         # fmrg: 5 of 6 shared points inside its active region [2.22, 2220]

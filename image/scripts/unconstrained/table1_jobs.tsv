@@ -1,0 +1,20 @@
+# The 12 problems behind Table 1 and Figure 2 (left): 3 rewards x 4 (prompt, seed) instances.
+# Columns (tab-separated): reward  seed  prompt  edit_prompt  densify_lams
+# The lambda grid for each row is the `shared` line of
+#   image/data/grids/unconstrained/<reward>__<slug>.txt
+# where <slug> is "<prompt>__<edit_prompt>" with every non-alphanumeric character
+# replaced by '_' and cut to 60 characters (the same rule as auto_sweep.sh).
+# densify_lams ("-" for none) are extra log-midpoints added on the three
+# frontiers drawn in the paper, so those curves have 11 points instead of 6.
+clip	42	a portrait of a man	a smiling face	-
+clip	7	a portrait of a man	a smiling face	-
+clip	42	a photo of a sleeping cat	a photo of a cat with wide open eyes	-
+clip	42	a field of green grass	a field of red poppies	-
+imagereward	42	a portrait of a man	a smiling face	-
+imagereward	7	a portrait of a man	a smiling face	-
+imagereward	42	a photo of a sleeping cat	a photo of a cat with wide open eyes	-
+imagereward	42	a field of green grass	a field of red poppies	3.4 22 170 2900 46000
+pickscore	42	a portrait of a man	a smiling face	1.5 4.9 15 38 130
+pickscore	7	a portrait of a man	a smiling face	1.5 4.9 15 38 130
+pickscore	42	a photo of a sleeping cat	a photo of a cat with wide open eyes	-
+pickscore	42	a field of green grass	a field of red poppies	-
