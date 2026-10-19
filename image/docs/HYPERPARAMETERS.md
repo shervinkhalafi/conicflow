@@ -1,5 +1,21 @@
 # Hyperparameters, and why they are what they are
 
+> **How the numbering below maps onto the paper and this repository.** This
+> file numbers the image experiments 1–5, from an earlier layout of the code.
+> - **Experiment 1** (PickScore editing, `jump`, edits ed1–ed4): its seed-317
+>   and seed-1289 runs are part of the ablation's core arms
+>   (`scripts/ablation/run_ablation.sh <gpu> --arms core --tags "ed1 ed2 ed3 ed4" --seeds "317 1289"`),
+>   and they supply Fig. 2 (right) rows 2–3 and the appendix image rows u01–u04.
+>   Its seed-4703 runs are not used in the paper.
+> - **Experiments 2–4** are the appendix ablations: matched wall clock, planning
+>   horizon `H`, and objective evaluation point. They were later extended to
+>   8 edits × 4–6 seeds; `scripts/ablation/README.md` has the final design.
+> - **Experiment 5** is the constrained experiment (Fig. 3):
+>   `scripts/constrained/run_suite.sh`.
+> - **Not covered here:** the Table 1 / Fig. 2 (left) runs use
+>   `endpoint_surrogate = rollout` and are documented in
+>   `scripts/unconstrained/README.md`.
+
 Every number the released unconstrained experiments use, in one place. The
 scripts in `scripts/` are the authority; this file explains them.
 
@@ -186,7 +202,7 @@ Note `MiB = GB × 953.674`, not `GB × 1024`.
 No reward (`--reward none`); every attribute prompt is one PickScore
 constraint `h_i = tau_i - s_i <= 0` at the endpoint, and each method's
 objective is its control energy alone. All values below are what
-`scripts/exp5_constrained_suite.sh` passes; `compare_constrained.py`'s
+`scripts/constrained/run_suite.sh` passes; `compare_constrained.py`'s
 defaults are the same numbers.
 
 | | value | why |

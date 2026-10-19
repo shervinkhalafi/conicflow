@@ -38,7 +38,7 @@ baseline is negative (ImageReward's z-score often is) or the direction is "le",
 where a plain multiple would loosen the constraint. Each point runs in
 <out_dir>/m<mult>/, so the same directory names line up across seeds even
 though the absolute thresholds differ; <out_dir>/auto_threshold.json records
-the actual values. This is the layout scripts/exp5_constrained_suite.sh
+the actual values. This is the layout scripts/constrained/run_suite.sh
 produces and plot_constrained_suite.py reads.
 
 DUAL VARIABLES. Each arm has its own multiplier settings, because the two

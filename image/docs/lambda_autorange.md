@@ -1,18 +1,10 @@
 # λ auto-ranging: how it works
 
 **`src/lambda_autorange.py` — ConicFlow / HardFlow / FMRG on FLUX.1-dev**
-Written 2026-09-23. Describes commit `738a748` (2026-09-17) plus the
-uncommitted `--high_stop break` work of 2026-09-23 (§11).
-
-> **Relationship to `docs/lambda_autorange_report.html`.** That report (dated
-> 2026-09-16) was committed with the *first* autorange commit, `4d5177a`, and
-> was never updated for the second one, `738a748`, so it does not describe the
-> shared grid, HardFlow floor lifting, or energy-spike rejection — all three of
-> which are in the code and were used for every sweep on disk. It also states
-> the prior as `Δr_max/‖∇r‖²` in §02 while its own §07 gives the (correct)
-> `Δr_max/‖∇r‖`. This document supersedes it on mechanism. Its measured
-> N-transfer study (§05) is not repeated here and is still the evidence for the
-> proxy-N assumption.
+Describes the range finder as used for every sweep in the paper, including
+the `--high_stop break` mode (§11). An earlier HTML report that this document
+superseded is not part of the release; references to its sections (§05 etc.)
+are historical.
 
 ---
 
