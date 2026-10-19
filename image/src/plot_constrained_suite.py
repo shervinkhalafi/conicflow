@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""
+r"""
 plot_constrained_suite.py -- control energy and feasibility against constraint
 tightness, across a constrained prompt suite.
 
-Reads the tree scripts/exp5_constrained_suite.sh writes:
+Reads the tree scripts/constrained/run_suite.sh writes:
 
     <root>/<tag>_seed<seed>/auto_threshold.json
     <root>/<tag>_seed<seed>/m<mult>/{conicflow,hardflow}/summary.csv
@@ -29,6 +29,8 @@ CSV's h_i, i.e. the constraint values on the final latent as decoded in the
 control loop.
 
     python plot_constrained_suite.py --root results/constrained_suite
+    python plot_constrained_suite.py --root results/constrained_suite --paper_style \
+        --out figures/con_main_plot.png          # Figure 3 (left)
     python plot_constrained_suite.py --root results/constrained_suite \
         --prompts p01_smile p09_curly_old --out figs/suite_subset.png
 """
@@ -49,6 +51,12 @@ ARMS = [  # (dir name, legend label, colour, marker)
 # Older trees from the development copy named the ConicFlow arm directory
 # `mpc`; read those too so the script can be checked against them.
 LEGACY_ARM_DIRS = {"conicflow": ("conicflow", "mpc")}
+
+# Text sizes. The default is sized for reading the figure on its own;
+# --paper_style uses the larger axis labels, ticks and legend of the paper's
+# Figure 3 (left), which is printed at a third of the text width.
+FONTS = dict(label=11, title=10.5, legend=11, tick=None, top=0.92)
+PAPER_FONTS = dict(label=20, title=10.65, legend=18, tick=12, top=0.875)
 
 
 def _arm_dir(cell: Path, arm: str) -> Path:
@@ -108,11 +116,12 @@ def load_suite(root: Path, prompts, seeds, mults, near: float, n2: bool):
     return E, feas, onb
 
 
-def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int):
+def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int, fonts=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    fs = fonts or FONTS
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(7.8, 9.4), sharex=True,
                                  gridspec_kw={"height_ratios": [1.25, 1.0], "hspace": 0.16})
     x = np.array(mults)
@@ -136,11 +145,11 @@ def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int):
                 a1.scatter([x[i]] * over[i].sum(), [ymax * 0.94] * over[i].sum(),
                            marker="^", s=26, color=col, alpha=0.75, zorder=6)
     a1.set_yscale("log"); a1.set_ylim(ymin, ymax)
-    a1.set_ylabel(r"control energy  $\sum_j \|u_j\|^2 \Delta t$", fontsize=11)
-    a1.grid(alpha=0.25, which="both"); a1.legend(fontsize=11, loc="upper left")
+    a1.set_ylabel(r"control energy  $\sum_j \|u_j\|^2 \Delta t$", fontsize=fs["label"])
+    a1.grid(alpha=0.25, which="both"); a1.legend(fontsize=fs["legend"], loc="upper left")
     a1.set_title("Control energy — median across (prompt, seed), IQR shaded\n"
                  r"dots are individual runs (hollow = infeasible);  $\blacktriangle$ = above the axis cap",
-                 fontsize=10.5, pad=9)
+                 fontsize=fs["title"], pad=9)
 
     # ---- bottom: feasibility -----------------------------------------------
     for arm, label, col, mk in ARMS:
@@ -150,13 +159,15 @@ def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int):
         a2.plot(x, pct, "-", color=col, marker=mk, lw=2.4, ms=8, label=label, zorder=4)
         a2.plot(x, pctb, ":", color=col, lw=1.4, alpha=0.8, zorder=3)
         a2.fill_between(x, pct, pctb, color=col, alpha=0.15, lw=0, zorder=2)
-    a2.set_xlabel("threshold multiplier  m", fontsize=11)
-    a2.set_ylabel("feasible runs  (%)", fontsize=11)
+    a2.set_xlabel("threshold multiplier  m", fontsize=fs["label"])
+    a2.set_ylabel("feasible runs  (%)", fontsize=fs["label"])
     a2.set_xticks(x); a2.set_ylim(-4, 104); a2.set_yticks([0, 25, 50, 75, 100])
-    a2.grid(alpha=0.25); a2.legend(fontsize=11, loc="lower left")
+    a2.grid(alpha=0.25); a2.legend(fontsize=fs["legend"], loc="lower left")
     a2.set_title(r"Feasibility — solid: all $h_i \leq 0$;  dotted/shaded: also counting "
-                 f"misses within {near} of the boundary", fontsize=10.5, pad=9)
-    fig.subplots_adjust(top=0.92)
+                 f"misses within {near} of the boundary", fontsize=fs["title"], pad=9)
+    if fs["tick"]:
+        a1.tick_params(labelsize=fs["tick"]); a2.tick_params(labelsize=fs["tick"])
+    fig.subplots_adjust(top=fs["top"])
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -201,6 +212,8 @@ def main(argv=None) -> int:
                    help="plot summary.csv's ctrl_energy as stored, without the N^2 factor "
                         "(then also lower --ymin/--ymax by 64)")
     p.add_argument("--dpi", type=int, default=150)
+    p.add_argument("--paper_style", action="store_true",
+                   help="the paper's text sizes (axis labels 20, legend 18, ticks 12)")
     a = p.parse_args(argv)
 
     root = Path(a.root)
@@ -217,7 +230,8 @@ def main(argv=None) -> int:
 
     E, feas, onb = load_suite(root, prompts, seeds, mults, a.near, not a.raw_energy)
     out = Path(a.out) if a.out else root / "suite_energy_feasibility_stacked.png"
-    plot(E, feas, onb, mults, a.near, a.ymin, a.ymax, out, a.dpi)
+    plot(E, feas, onb, mults, a.near, a.ymin, a.ymax, out, a.dpi,
+         PAPER_FONTS if a.paper_style else FONTS)
     t = table(E, feas, onb, mults, a.ymax)
     t.to_csv(out.with_suffix(".csv"), index=False)
     with pd.option_context("display.width", 200, "display.max_columns", 20):

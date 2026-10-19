@@ -1,0 +1,27 @@
+# suite.tsv -- the one/two-constraint instances of the constrained ConicFlow /
+# HardFlow comparison (Figure 3).  One line = one instance; run_suite.sh runs
+# every line at every seed in SEEDS and every point of the threshold grid.
+#
+# Fields are TAB separated:
+#   tag          short name; the run directory is <tag>_seed<seed>
+#   prompt       generation prompt (the base image)
+#   edit_prompt  short label of the edit, recorded as run_sweep's edit_prompt
+#   attribute_1 [attribute_2 ...]
+#                one PickScore constraint per remaining field:
+#                  PickScore(image, attribute_i) >= m * PickScore(uncontrolled, attribute_i)
+#
+# All constraints are PickScore, direction ge.  The base prompts are written so
+# the attribute is plausibly absent from the uncontrolled image (PickScore does
+# not read negation, so "no beard" scores like "beard"; use a base that simply
+# lacks the attribute instead).
+#
+# -- one constraint --------------------------------------------------------
+p01_smile	a portrait of a man	a smiling face	a smiling face
+p02_sunglasses	a photo of a golden retriever	a dog wearing sunglasses	a dog wearing sunglasses
+p04_night	a city street at noon	a city street at night	a city street at night
+p05a_redhair	a portrait of a woman	a woman with bright red hair	a woman with bright red hair
+p05b_sad	a portrait of a woman	sad frowning woman	sad frowning woman
+# -- two constraints -------------------------------------------------------
+p09_curly_old	portrait of a young man with straight hair	curly hair, very old	man with curly hair	photo of very old man
+p10_glass_blonde	a portrait of a woman	glasses, short blonde hair	a woman wearing glasses	a woman with short blonde hair
+p11_cabin_fog	a house by a lake	log cabin, heavy fog	a wooden log cabin	a house in heavy fog
