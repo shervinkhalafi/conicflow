@@ -2,7 +2,10 @@
 r"""
 constrained_appendix_grids.py -- the appendix grids of the constrained
 comparison: one 3x3 figure per (instance, seed), rows m = 1.1, 1.3, 1.5,
-columns Uncontrolled | ConicFlow | HardFlow.
+columns Uncontrolled | one per method (--arms; default ConicFlow, HardFlow).
+
+h and feasibility are the in-run values, as in constrained_image_rows.py
+(see its docstring for why).
 
 Same drawing code, captions, frames and energy convention as
 constrained_image_rows.py (Figure 3); see its docstring for what each panel
@@ -11,6 +14,7 @@ label is drawn once (on the middle row) instead of per row, and it is drawn at
 full size.
 
     python constrained_appendix_grids.py
+    python constrained_appendix_grids.py --arms conicflow hardflow pflow ldf --out_dir /tmp/appendix
     python constrained_appendix_grids.py --out_dir /tmp/appendix \
         --suite_root ../src/results/constrained_suite --triple_root ../src/results/constrained_triple
 
@@ -25,8 +29,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from constrained_image_rows import (DEFAULT_SUITE, DEFAULT_TRIPLE, FIGURES,  # noqa: E402
-                                    STYLE, draw_stack, harvest)
+from constrained_image_rows import (ALL_ARMS, ARMS, DEFAULT_SUITE,  # noqa: E402
+                                    DEFAULT_TRIPLE, FIGURES, STYLE, draw_stack, harvest)
 
 # (tag, root, short constraint names shown beside the grid)
 INSTANCES = [
@@ -56,6 +60,8 @@ def main(argv=None) -> int:
     p.add_argument("--out_dir", default=str(FIGURES / "constrained_appendix"),
                    help="output directory (default: %(default)s)")
     p.add_argument("--tags", nargs="+", default=None, help="restrict to these instances")
+    p.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ALL_ARMS),
+                   help="method columns, in order (default: %(default)s)")
     p.add_argument("--dpi", type=int, default=STYLE["dpi"])
     a = p.parse_args(argv)
 
@@ -69,7 +75,7 @@ def main(argv=None) -> int:
             folder = f"{tag}_seed{seed}"
             specs = [dict(name=f"{folder}_m{m:g}", root=roots[root], folder=folder, m=m,
                           label=folder, prompts=prompts, group=folder) for m in MS]
-            recs = harvest(specs)
+            recs = harvest(specs, arms=tuple(a.arms))
             allrecs += recs
             fig = draw_stack(recs, stack=GRID_STACK)
             f = out / f"constrained_{folder}.png"
