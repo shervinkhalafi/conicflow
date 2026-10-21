@@ -2,9 +2,11 @@
 # run_suite.sh -- the constrained experiment: ConicFlow vs HardFlow under
 # PickScore CONSTRAINTS and no reward, over a grid of constraint tightness.
 # This is the run behind Figure 3 and the constrained image grids in the
-# appendix.
+# appendix. The constrained baselines Projected Flow (PDM) and LDF run on the
+# same grid via ARMS (below).
 #
 #   bash run_suite.sh <gpu> [suite|triple] [--dry_run]
+#   ARMS="pflow ldf" bash run_suite.sh <gpu> [suite|triple]   # the baselines
 #
 #   suite   (default) the 8 one/two-constraint instances in jobs/suite.tsv,
 #           m = 1.1 1.2 1.3 1.4 1.5, written to results/constrained_suite/.
@@ -18,7 +20,8 @@
 #   with CUDA_VISIBLE_DEVICES; every process sees it as cuda:0. Run ONE
 #   instance per card. Peak memory grows with the number of constraint heads
 #   resident next to the transformer: 16.2 GB with one, 19.2 GB with two,
-#   22.2 GB with three (both methods, within 0.3 GB).
+#   22.2 GB with three (ConicFlow and HardFlow, within 0.3 GB). Projected Flow
+#   peaks at 19.8 GB with two and 22.8 GB with three; LDF at 21.9 GB with three.
 #
 # THE PROBLEM. Each line of the job file is a base prompt plus one to three
 # attribute prompts. There is no reward; each attribute prompt c_i is a
@@ -31,18 +34,28 @@
 #      prompt -> baselines s0_i;
 #   2. a grid of multipliers m from AUTO_LO to AUTO_HI, each setting EVERY
 #      threshold of the instance at once: tau_i(m) = m * s0_i;
-#   3. at each m, ConicFlow then HardFlow, as separate run_sweep.py processes
-#      on the same seed, lambda and thresholds (their uncontrolled images are
-#      checked to be byte-identical);
-#   4. every saved image re-scored with the same PickScore code the control
-#      loop enforced, and a three-panel compare.png per m.
+#   3. at each m, every arm in ARMS in turn, as separate run_sweep.py
+#      processes on the same seed, lambda and thresholds (their uncontrolled
+#      images are checked to be byte-identical);
+#   4. every saved image re-scored from its PNG with the same PickScore code,
+#      for compare.png / comparison.json. Feasibility in the paper's figures
+#      is the in-run value in each arm's summary.csv, not this re-score
+#      (saving to an 8-bit PNG lowers PickScore by a median 0.01-0.04).
 #   Output per cell: $OUT_ROOT/<tag>_seed<seed>/
 #     auto_threshold.json        baselines, every point's thresholds
 #     uncontrolled/              the probe run
-#     m1.10/ ... m1.50/          conicflow/ and hardflow/ (run_sweep.py output
-#                                dirs), compare.png, comparison.json
+#     m1.10/ ... m1.50/          one run_sweep.py output dir per arm
+#                                (conicflow/, hardflow/, pflow/, ldf/),
+#                                compare.png, comparison.json
 #
-# SETTINGS (the paper's; see docs/HYPERPARAMETERS.md section 8)
+# ARMS (default "conicflow hardflow", the paper's Figure 3). The constrained
+# baselines are two more arms, run into the SAME tree so every method shares
+# the probe and thresholds: ARMS="pflow ldf" bash run_suite.sh <gpu> [suite|
+# triple]. Arms already in a cell are kept (comparison.json and
+# auto_threshold.json are extended, not replaced). Each ARMS set has its own
+# done-file, so adding arms to finished cells is not skipped.
+#
+# SETTINGS (the paper's; see docs/HYPERPARAMETERS.md sections 8 and 9)
 #   lambda = 20 for both arms; HardFlow's reg = N/(2*lambda) = 0.2.
 #   ConicFlow  N=8 H=2 n_inner=24 lr=1e-2, jump surrogate, drift detached,
 #              mu_init=0.5, dual step 0.5
@@ -51,12 +64,20 @@
 #   HardFlow's lr 0.5 (instead of its released 2.5) and fixed rho (instead of
 #   doubling) are stability settings: at lambda=20 the released values diverge
 #   at the tighter thresholds. Both are recorded per row.
+#   Projected Flow  N=8, Gauss-Newton projection of the state onto
+#              {h(X(z)) <= 0} after every step, at most 10 updates per step
+#              and 50 at the last, margin 0 (compare_constrained.py defaults)
+#   LDF        N=8, penalty 5, gain 1, p=1, 64 substeps per sampling step,
+#              initial multiplier 0 (compare_constrained.py defaults)
+#   Neither baseline uses lambda or a horizon.
 #
 # COST (A5000, recorded): ~43 min per (instance, seed) on the 5-point grid,
 # ~11.5 GPU-h for the 8-instance x 2-seed suite; ~20 min per seed for the
-# 3-point triple (~0.7 GPU-h).
+# 3-point triple (~0.7 GPU-h). ARMS="pflow ldf" adds ~6 GPU-h for the suite
+# and ~0.7 for the triple (Projected Flow 80-140 s per run with one or two
+# constraints, 190 s with three; LDF 45-70 s).
 #
-# RESUMABLE. A cell is recorded in $OUT_ROOT/.done.txt only on a zero exit,
+# RESUMABLE. A cell is recorded in $OUT_ROOT/.done_<arms>.txt only on a zero exit,
 # and compare_constrained.py --skip_existing skips any probe or arm that
 # already has a run_ok=True row, so an interrupted cell resumes at the arm that
 # did not finish. Every setting below can be overridden from the environment.
@@ -85,6 +106,7 @@ else
 fi
 case "$JOBS" in /*) ;; *) JOBS="$PWD/$JOBS" ;; esac      # pin before the cd below
 
+ARMS="${ARMS:-conicflow hardflow}"
 SEEDS="${SEEDS:-310 698}"
 LAM="${LAM:-20}"
 AUTO_LO="${AUTO_LO:-1.1}"
@@ -101,9 +123,17 @@ HF_RHO_MULT="${HF_RHO_MULT:-1.0}"
 HF_ALPHA="${HF_ALPHA:-0.1}"            # forwarded; inert unless lr*reg would reach 1
 
 cd "$HERE/../../src" || exit 3
-DONE="${DONE:-$OUT_ROOT/.done.txt}"
+# One done-file per ARMS set: a cell finished for ConicFlow/HardFlow must still
+# be visited when the baselines are added. The paper's own runs used .done.txt.
+if [ "$ARMS" = "conicflow hardflow" ]; then
+    DONE="${DONE:-$OUT_ROOT/.done.txt}"
+else
+    DONE="${DONE:-$OUT_ROOT/.done_${ARMS// /_}.txt}"
+fi
+# shellcheck disable=SC2206 -- ARMS is a list on purpose
+arms=($ARMS)
 if [ "$DRY_RUN" != 1 ]; then mkdir -p "$(dirname "$DONE")"; touch "$DONE"; fi
-echo "[constrained] $WHICH  gpu=$GPU  jobs=$JOBS  out=$OUT_ROOT  seeds=[$SEEDS]  lam=$LAM  grid=$N_GRID pts $AUTO_LO..$AUTO_HI"
+echo "[constrained] $WHICH  gpu=$GPU  arms=[$ARMS]  jobs=$JOBS  out=$OUT_ROOT  seeds=[$SEEDS]  lam=$LAM  grid=$N_GRID pts $AUTO_LO..$AUTO_HI"
 while IFS=$'\t' read -r tag prompt edit rest; do
     case "$tag" in ''|'#'*) continue ;; esac
     # The remaining fields are the attribute prompts, one constraint each.
@@ -120,6 +150,7 @@ while IFS=$'\t' read -r tag prompt edit rest; do
         fi
         cmd=(python -u compare_constrained.py
              --prompt "$prompt" --edit_prompt "$edit"
+             --arms "${arms[@]}"
              --constraint_types "${types[@]}"
              --constraint_args "${attrs[@]}"
              --constraint_directions "${dirs[@]}"

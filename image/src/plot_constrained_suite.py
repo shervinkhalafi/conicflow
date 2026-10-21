@@ -6,7 +6,7 @@ tightness, across a constrained prompt suite.
 Reads the tree scripts/constrained/run_suite.sh writes:
 
     <root>/<tag>_seed<seed>/auto_threshold.json
-    <root>/<tag>_seed<seed>/m<mult>/{conicflow,hardflow}/summary.csv
+    <root>/<tag>_seed<seed>/m<mult>/{conicflow,hardflow,pflow,ldf}/summary.csv
 
 and draws two stacked panels against the threshold multiplier m:
 
@@ -16,9 +16,11 @@ and draws two stacked panels against the threshold multiplier m:
     bottom  feasibility rate (all h_i <= 0), with a dotted line and band that
             also count near-misses within --near of the boundary
 
-Both arms of one (prompt, seed, m) cell share the seed, lambda and thresholds,
+Every arm of one (prompt, seed, m) cell shares the seed, lambda and thresholds,
 so m is the only axis. Prompts, seeds and multipliers are discovered from the
-directory names; --prompts / --seeds / --mults restrict them.
+directory names; --prompts / --seeds / --mults restrict them, and --arms
+restricts or reorders the arms (default: every registered arm with at least
+one run in the tree, in registry order).
 
 ENERGY UNITS. summary.csv's `ctrl_energy` is the displacement residual
 sum_k ||x_{k+1} - x_k - dt v||^2 * dt. The paper reports the control energy
@@ -36,7 +38,6 @@ control loop.
 """
 import argparse
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -44,13 +45,26 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ARMS = [  # (dir name, legend label, colour, marker)
-    ("conicflow", "ConicFlow", "#0d9488", "o"),   # teal
-    ("hardflow",  "HardFlow",  "#c2410c", "s"),   # deep orange
-]
-# Older trees from the development copy named the ConicFlow arm directory
-# `mpc`; read those too so the script can be checked against them.
-LEGACY_ARM_DIRS = {"conicflow": ("conicflow", "mpc")}
+# arm (run_sweep control type = directory name) -> (legend label, colour,
+# marker, median-line style). ConicFlow and HardFlow keep the paper's colours
+# and solid lines. A new constrained baseline needs an entry here before it can
+# be plotted; arms present in the tree without one are reported, not silently
+# dropped.
+#
+# PROVISIONAL: pflow / ldf take categorical slots 4 (yellow) and 5 (magenta) of
+# the reference palette -- slot 3 (aqua) stays FMRG's, as in the unconstrained
+# figures, so no colour means two methods across figures. Their pairing with
+# teal/orange has not been run through a palette validator yet, so they also
+# carry secondary encoding: their own marker and a dashed / dash-dot median line.
+ARM_STYLE = {
+    "conicflow": ("ConicFlow",     "#0d9488", "o", "-"),    # teal
+    "hardflow": ("HardFlow",       "#c2410c", "s", "-"),    # deep orange
+    "pflow":    ("Projected Flow", "#eda100", "^", "--"),   # palette slot 4, provisional
+    "ldf":      ("LDF",            "#e87ba4", "D", "-."),   # palette slot 5, provisional
+}
+# Directory names each arm may have been written under: older result trees
+# name the ConicFlow arm `mpc`.
+ARM_DIR_ALIASES = {"conicflow": ("conicflow", "mpc")}
 
 # Text sizes. The default is sized for reading the figure on its own;
 # --paper_style uses the larger axis labels, ticks and legend of the paper's
@@ -60,15 +74,15 @@ PAPER_FONTS = dict(label=20, title=10.65, legend=18, tick=12, top=0.875)
 
 
 def _arm_dir(cell: Path, arm: str) -> Path:
-    for name in LEGACY_ARM_DIRS.get(arm, (arm,)):
+    for name in ARM_DIR_ALIASES.get(arm, (arm,)):
         if (cell / name / "summary.csv").is_file():
             return cell / name
     return cell / arm
 
 
 def discover(root: Path):
-    """(prompt tags, seeds, multipliers) present under root."""
-    tags, seeds, mults = set(), set(), set()
+    """(prompt tags, seeds, multipliers, arm directory names) present under root."""
+    tags, seeds, mults, arm_dirs = set(), set(), set(), set()
     for man in root.glob("*_seed*/auto_threshold.json"):
         m = re.match(r"(.+)_seed(\d+)$", man.parent.name)
         if not m:
@@ -76,16 +90,23 @@ def discover(root: Path):
         tags.add(m.group(1)); seeds.add(int(m.group(2)))
         for pt in json.loads(man.read_text()).get("points", []):
             mults.add(round(float(pt["multiplier"]), 2))
-    return sorted(tags), sorted(seeds), sorted(mults)
+        for f in man.parent.glob("m*/*/summary.csv"):
+            arm_dirs.add(f.parent.name)
+    return sorted(tags), sorted(seeds), sorted(mults), arm_dirs
 
 
-def load_suite(root: Path, prompts, seeds, mults, near: float, n2: bool):
-    """Energy / feasible / on-boundary arrays of shape (n_mult, n_prompt*n_seed)."""
+def _arms_present(arm_dirs: set) -> list:
+    """Registered arms with at least one run, in registry order."""
+    return [a for a in ARM_STYLE if any(d in arm_dirs for d in ARM_DIR_ALIASES.get(a, (a,)))]
+
+
+def load_suite(root: Path, prompts, seeds, mults, arms, near: float, n2: bool):
+    """Energy / feasible / on-boundary arrays of shape (n_mult, n_prompt*n_seed), per arm."""
     units = [(p, s) for p in prompts for s in seeds]
     shape = (len(mults), len(units))
-    E    = {a: np.full(shape, np.nan) for a, *_ in ARMS}
-    feas = {a: np.zeros(shape, bool)  for a, *_ in ARMS}
-    onb  = {a: np.zeros(shape, bool)  for a, *_ in ARMS}
+    E    = {a: np.full(shape, np.nan) for a in arms}
+    feas = {a: np.zeros(shape, bool)  for a in arms}
+    onb  = {a: np.zeros(shape, bool)  for a in arms}
     missing = []
     for u, (prompt, seed) in enumerate(units):
         base = root / f"{prompt}_seed{seed}"
@@ -95,7 +116,7 @@ def load_suite(root: Path, prompts, seeds, mults, near: float, n2: bool):
         n_con = len(json.loads(man.read_text())["constraints"])
         for i, m in enumerate(mults):
             cell = base / f"m{m:.2f}"
-            for arm, *_ in ARMS:
+            for arm in arms:
                 f = _arm_dir(cell, arm) / "summary.csv"
                 if not f.is_file():
                     continue
@@ -116,7 +137,7 @@ def load_suite(root: Path, prompts, seeds, mults, near: float, n2: bool):
     return E, feas, onb
 
 
-def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int, fonts=None):
+def plot(E, feas, onb, mults, arms, near, ymin, ymax, out: Path, dpi: int, fonts=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -127,8 +148,9 @@ def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int, fonts=None)
     x = np.array(mults)
 
     # ---- top: energy -------------------------------------------------------
-    for arm, label, col, mk in ARMS:
-        a1.plot(x, np.nanmedian(E[arm], axis=1), "-", color=col, marker=mk, lw=2.4, ms=8,
+    for arm in arms:
+        label, col, mk, ls = ARM_STYLE[arm]
+        a1.plot(x, np.nanmedian(E[arm], axis=1), ls, color=col, marker=mk, lw=2.4, ms=8,
                 label=label, zorder=4)
         a1.fill_between(x, np.nanpercentile(E[arm], 25, axis=1),
                         np.minimum(np.nanpercentile(E[arm], 75, axis=1), ymax),
@@ -152,11 +174,12 @@ def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int, fonts=None)
                  fontsize=fs["title"], pad=9)
 
     # ---- bottom: feasibility -----------------------------------------------
-    for arm, label, col, mk in ARMS:
+    for arm in arms:
+        label, col, mk, ls = ARM_STYLE[arm]
         n_run = np.maximum((~np.isnan(E[arm])).sum(axis=1), 1)
         pct   = 100 * feas[arm].sum(axis=1) / n_run
         pctb  = 100 * onb[arm].sum(axis=1)  / n_run
-        a2.plot(x, pct, "-", color=col, marker=mk, lw=2.4, ms=8, label=label, zorder=4)
+        a2.plot(x, pct, ls, color=col, marker=mk, lw=2.4, ms=8, label=label, zorder=4)
         a2.plot(x, pctb, ":", color=col, lw=1.4, alpha=0.8, zorder=3)
         a2.fill_between(x, pct, pctb, color=col, alpha=0.15, lw=0, zorder=2)
     a2.set_xlabel("threshold multiplier  m", fontsize=fs["label"])
@@ -173,23 +196,26 @@ def plot(E, feas, onb, mults, near, ymin, ymax, out: Path, dpi: int, fonts=None)
     plt.close(fig)
 
 
-def table(E, feas, onb, mults, ymax) -> pd.DataFrame:
-    """The numbers behind the figure, so caption claims can be checked."""
+def table(E, feas, onb, mults, arms, ymax) -> pd.DataFrame:
+    """The numbers behind the figure, so caption claims can be checked. Energy
+    ratios are each later arm against the first (HardFlow / ConicFlow with the
+    default arms)."""
     rows = []
-    cf, hf = ARMS[0][0], ARMS[1][0]
+    ref = arms[0]
     for i, m in enumerate(mults):
-        n_cf = int((~np.isnan(E[cf][i])).sum()); n_hf = int((~np.isnan(E[hf][i])).sum())
-        rows.append({
-            "m": m,
-            "ConicFlow feasible": f"{int(feas[cf][i].sum())}/{n_cf}",
-            "ConicFlow near-boundary": int(onb[cf][i].sum()),
-            "HardFlow feasible": f"{int(feas[hf][i].sum())}/{n_hf}",
-            "HardFlow near-boundary": int(onb[hf][i].sum()),
-            "ConicFlow median E": round(float(np.nanmedian(E[cf][i])), 3),
-            "HardFlow median E": round(float(np.nanmedian(E[hf][i])), 3),
-            "E ratio HF/CF": round(float(np.nanmedian(E[hf][i]) / np.nanmedian(E[cf][i])), 2),
-            "above cap": int((E[cf][i] > ymax).sum() + (E[hf][i] > ymax).sum()),
-        })
+        row = {"m": m}
+        for arm in arms:
+            label = ARM_STYLE[arm][0]
+            n_run = int((~np.isnan(E[arm][i])).sum())
+            row[f"{label} feasible"] = f"{int(feas[arm][i].sum())}/{n_run}"
+            row[f"{label} near-boundary"] = int(onb[arm][i].sum())
+        for arm in arms:
+            row[f"{ARM_STYLE[arm][0]} median E"] = round(float(np.nanmedian(E[arm][i])), 3)
+        for arm in arms[1:]:
+            row[f"E ratio {ARM_STYLE[arm][0]}/{ARM_STYLE[ref][0]}"] = round(
+                float(np.nanmedian(E[arm][i]) / np.nanmedian(E[ref][i])), 2)
+        row["above cap"] = int(sum((E[arm][i] > ymax).sum() for arm in arms))
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -203,6 +229,9 @@ def main(argv=None) -> int:
     p.add_argument("--prompts", nargs="+", default=None, help="restrict to these <tag>s")
     p.add_argument("--seeds", nargs="+", type=int, default=None)
     p.add_argument("--mults", nargs="+", type=float, default=None)
+    p.add_argument("--arms", nargs="+", default=None, choices=list(ARM_STYLE), metavar="ARM",
+                   help=f"arms to plot, in order, from {list(ARM_STYLE)} (default: every one "
+                        f"with at least one run in the tree)")
     p.add_argument("--near", type=float, default=0.2,
                    help="a miss within this of the boundary counts as near-boundary (default 0.2)")
     p.add_argument("--ymin", type=float, default=44.8, help="energy-axis floor (default 0.7 x 64)")
@@ -217,24 +246,31 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
 
     root = Path(a.root)
-    tags, seeds, mults = discover(root)
+    tags, seeds, mults, arm_dirs = discover(root)
     if not tags:
         print(f"no <tag>_seed<seed>/auto_threshold.json under {root}", file=sys.stderr); return 1
+    known = {d for arm in ARM_STYLE for d in ARM_DIR_ALIASES.get(arm, (arm,))}
+    unstyled = sorted(arm_dirs - known)
+    if unstyled:
+        print(f"  note: arm directories with no ARM_STYLE entry, not plotted: {unstyled}")
+    arms = a.arms or _arms_present(arm_dirs)
+    if not arms:
+        print(f"no registered arm ({list(ARM_STYLE)}) has a run under {root}", file=sys.stderr); return 1
     prompts = a.prompts or tags
     seeds   = a.seeds or seeds
     mults   = [round(m, 2) for m in (a.mults or mults)]
     unknown = [t for t in prompts if t not in tags]
     if unknown:
         print(f"--prompts not found under {root}: {unknown}\n  available: {tags}", file=sys.stderr); return 1
-    print(f"{len(prompts)} prompts x {len(seeds)} seeds, m = {mults}")
+    print(f"{len(prompts)} prompts x {len(seeds)} seeds, m = {mults}, arms = {arms}")
 
-    E, feas, onb = load_suite(root, prompts, seeds, mults, a.near, not a.raw_energy)
+    E, feas, onb = load_suite(root, prompts, seeds, mults, arms, a.near, not a.raw_energy)
     out = Path(a.out) if a.out else root / "suite_energy_feasibility_stacked.png"
-    plot(E, feas, onb, mults, a.near, a.ymin, a.ymax, out, a.dpi,
+    plot(E, feas, onb, mults, arms, a.near, a.ymin, a.ymax, out, a.dpi,
          PAPER_FONTS if a.paper_style else FONTS)
-    t = table(E, feas, onb, mults, a.ymax)
+    t = table(E, feas, onb, mults, arms, a.ymax)
     t.to_csv(out.with_suffix(".csv"), index=False)
-    with pd.option_context("display.width", 200, "display.max_columns", 20):
+    with pd.option_context("display.width", 200, "display.max_columns", 30):
         print(t.to_string(index=False))
     print(f"\nfigure : {out}\ntable  : {out.with_suffix('.csv')}")
     return 0
