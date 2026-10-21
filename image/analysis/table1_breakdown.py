@@ -57,10 +57,15 @@ LABEL = {"ConicFlow": "ConicFlow", "HardFlow": "HardFlow", "FMRG": "FMRG",
 REWARDS = ("clip", "imagereward", "pickscore")
 CONICFLOW_TYPES = ("conicflow", "mpc")   # the method's CSV label; older runs say "mpc"
 
-# Table 1 as printed in the paper (mean, s.e.), for --check_paper.
-PAPER = {"clip":        {"ConicFlow": (0.130, 0.018), "HardFlow": (0.118, 0.021), "FMRG": (0.065, 0.008)},
-         "imagereward": {"ConicFlow": (2.048, 0.455), "HardFlow": (1.279, 0.374), "FMRG": (1.278, 0.504)},
-         "pickscore":   {"ConicFlow": (6.158, 0.728), "HardFlow": (1.736, 0.472), "FMRG": (2.670, 0.073)}}
+# Table 1 as printed in the paper (mean, s.e.), for --check_paper. The
+# gradient-guidance and FlowChef rows were added for the rebuttal (draft of
+# 2026-10-21); they are checked only with --baselines.
+PAPER = {"clip":        {"ConicFlow": (0.130, 0.018), "HardFlow": (0.118, 0.021), "FMRG": (0.065, 0.008),
+                         "GradientGuidance": (0.013, 0.005), "FlowChef": (0.030, 0.007)},
+         "imagereward": {"ConicFlow": (2.048, 0.455), "HardFlow": (1.279, 0.374), "FMRG": (1.278, 0.504),
+                         "GradientGuidance": (0.376, 0.169), "FlowChef": (0.427, 0.109)},
+         "pickscore":   {"ConicFlow": (6.158, 0.728), "HardFlow": (1.736, 0.472), "FMRG": (2.670, 0.073),
+                         "GradientGuidance": (0.790, 0.195), "FlowChef": (1.516, 0.168)}}
 REWARD_TEX = {"clip": "CLIP", "imagereward": "ImageReward", "pickscore": "PickScore"}
 INSTANCE_TEX = {("a portrait of a man", 42): r"man $\to$ smiling, 42",
                 ("a portrait of a man", 7): r"man $\to$ smiling, 7",
@@ -248,12 +253,14 @@ def main():
     for m in methods:
         print(f"{LABEL[m][:17]:17s}" + "".join(f"{agg[rw][m][0]:7.3f} +/- {agg[rw][m][1]:.3f}       " for rw in REWARDS))
     print(f"{'(paper)':12s}")
-    for m in METHODS:
-        print(f"{m:12s}" + "".join(f"{PAPER[rw][m][0]:12.3f} +/- {PAPER[rw][m][1]:.3f}  " for rw in REWARDS))
+    for m in methods:
+        print(f"{LABEL[m][:17]:17s}" + "".join(f"{PAPER[rw][m][0]:7.3f} +/- {PAPER[rw][m][1]:.3f}       " for rw in REWARDS))
 
     if a.check_paper:
         for rw, per in PAPER.items():
             for m, (mu, se) in per.items():
+                if m not in methods:
+                    continue
                 got_mu, got_se = agg[rw][m]
                 if round(got_mu, 3) != mu or round(got_se, 3) != se:
                     raise RuntimeError(f"{rw}/{m}: recomputed {got_mu:.3f}+-{got_se:.3f}, paper {mu}+-{se}")
