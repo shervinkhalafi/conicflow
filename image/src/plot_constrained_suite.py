@@ -51,16 +51,18 @@ import pandas as pd
 # be plotted; arms present in the tree without one are reported, not silently
 # dropped.
 #
-# PROVISIONAL: pflow / ldf take categorical slots 4 (yellow) and 5 (magenta) of
-# the reference palette -- slot 3 (aqua) stays FMRG's, as in the unconstrained
-# figures, so no colour means two methods across figures. Their pairing with
-# teal/orange has not been run through a palette validator yet, so they also
-# carry secondary encoding: their own marker and a dashed / dash-dot median line.
+# pflow / ldf: Tailwind fuchsia-700 / pink-500, the ramps the paper's colours
+# come from, chosen so that no colour means two methods across the paper's
+# figures (FMRG purple, gradient-guidance blue, FlowChef gold elsewhere).
+# Validated as one all-pairs categorical set with ConicFlow and HardFlow on
+# white: normal-vision dE >= 18.0, every colour >= 3:1; the worst CVD pair
+# (LDF vs ConicFlow, deutan dE 6.9) is in the band that requires secondary
+# encoding, hence their own marker and a dashed / dash-dot median line.
 ARM_STYLE = {
     "conicflow": ("ConicFlow",     "#0d9488", "o", "-"),    # teal
     "hardflow": ("HardFlow",       "#c2410c", "s", "-"),    # deep orange
-    "pflow":    ("Projected Flow", "#eda100", "^", "--"),   # palette slot 4, provisional
-    "ldf":      ("LDF",            "#e87ba4", "D", "-."),   # palette slot 5, provisional
+    "pflow":    ("Projected Flow", "#a21caf", "^", "--"),   # fuchsia-700
+    "ldf":      ("LDF",            "#ec4899", "D", "-."),   # pink-500
 }
 # Directory names each arm may have been written under: older result trees
 # name the ConicFlow arm `mpc`.
@@ -168,7 +170,17 @@ def plot(E, feas, onb, mults, arms, near, ymin, ymax, out: Path, dpi: int, fonts
                            marker="^", s=26, color=col, alpha=0.75, zorder=6)
     a1.set_yscale("log"); a1.set_ylim(ymin, ymax)
     a1.set_ylabel(r"control energy  $\sum_j \|u_j\|^2 \Delta t$", fontsize=fs["label"])
-    a1.grid(alpha=0.25, which="both"); a1.legend(fontsize=fs["legend"], loc="upper left")
+    # With the two paper arms the legends sit where the paper has them. With
+    # more arms a taller legend would cover data there: the energy panel's
+    # goes to its empty lower right and the feasibility panel's (same entries)
+    # is dropped.
+    many = len(arms) > 2
+    a1.grid(alpha=0.25, which="both")
+    if many:
+        a1.legend(fontsize=0.85 * fs["legend"], loc="lower right", ncol=2, columnspacing=0.6,
+                  handlelength=1.4, handletextpad=0.4, borderaxespad=0.3)
+    else:
+        a1.legend(fontsize=fs["legend"], loc="upper left")
     a1.set_title("Control energy — median across (prompt, seed), IQR shaded\n"
                  r"dots are individual runs (hollow = infeasible);  $\blacktriangle$ = above the axis cap",
                  fontsize=fs["title"], pad=9)
@@ -185,7 +197,9 @@ def plot(E, feas, onb, mults, arms, near, ymin, ymax, out: Path, dpi: int, fonts
     a2.set_xlabel("threshold multiplier  m", fontsize=fs["label"])
     a2.set_ylabel("feasible runs  (%)", fontsize=fs["label"])
     a2.set_xticks(x); a2.set_ylim(-4, 104); a2.set_yticks([0, 25, 50, 75, 100])
-    a2.grid(alpha=0.25); a2.legend(fontsize=fs["legend"], loc="lower left")
+    a2.grid(alpha=0.25)
+    if not many:
+        a2.legend(fontsize=fs["legend"], loc="lower left")
     a2.set_title(r"Feasibility — solid: all $h_i \leq 0$;  dotted/shaded: also counting "
                  f"misses within {near} of the boundary", fontsize=fs["title"], pad=9)
     if fs["tick"]:

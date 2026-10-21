@@ -161,13 +161,19 @@ def e_tex(v):
 def breakdown_tex(t, G, methods=METHODS):
     # Wrapper and spacing as typeset in the paper's appendix.
     others = [m for m in methods if m != "ConicFlow"]
+    wide = len(methods) > 3          # the paper's three keep their original layout
     ncol = 3 + len(methods)
     lines = [r"\begin{table}[h]",
              r"\caption{Per-problem breakdown of Table~\ref{tab:objective-improvement}.}",
-             r"  \centering", r"  \footnotesize", r"  \setlength{\tabcolsep}{2.5pt}",
+             # Five method columns need the stacked Budget header and 2pt spacing
+             # to fit the text width (checked by compiling the paper).
+             r"  \centering", r"  \footnotesize",
+             r"  \setlength{\tabcolsep}{2pt}" if wide else r"  \setlength{\tabcolsep}{2.5pt}",
              r"  \begin{tabular}{@{}lrr" + "c" * len(methods) + r"@{}}", r"    \toprule",
-             r"    Instance (prompt $\to$ edit, seed) & $r_{\mathrm{unc}}$ & Budget $[E_1,E_2]$ & "
-             + " & ".join(LABEL[m] for m in methods) + r" \\",
+             r"    Instance (prompt $\to$ edit, seed) & $r_{\mathrm{unc}}$ & "
+             + (r"\shortstack{Budget\\$[E_1,E_2]$}" if wide else r"Budget $[E_1,E_2]$") + " & "
+             + " & ".join((r"\shortstack{Gradient\\guidance}" if wide and m == "GradientGuidance"
+                           else LABEL[m]) for m in methods) + r" \\",
              r"    \midrule"]
     for rw in REWARDS:
         sub = t[t.reward == rw]
@@ -182,9 +188,18 @@ def breakdown_tex(t, G, methods=METHODS):
         mean = {m: sub[f"G_{m}"].mean() for m in methods}
         se = {m: sub[f"G_{m}"].std(ddof=1) / np.sqrt(n) for m in methods}
         top = max(mean.values())
-        lines.append(r"    \quad \textit{mean} $\pm$ s.e. & & & " +
-                     " & ".join((rf"$\mathbf{{{mean[m]:.3f}}} \pm {se[m]:.3f}$" if mean[m] == top
-                                 else rf"${mean[m]:.3f} \pm {se[m]:.3f}$") for m in methods) + r" \\")
+        if wide:
+            # Five "mean +/- s.e." cells do not fit the text width: mean and s.e.
+            # get a row each, so every method column is one number wide.
+            lines.append(r"    \quad \textit{mean} & & & " +
+                         " & ".join((rf"$\mathbf{{{mean[m]:.3f}}}$" if mean[m] == top
+                                     else rf"${mean[m]:.3f}$") for m in methods) + r" \\")
+            lines.append(r"    \quad \textit{s.e.} & & & " +
+                         " & ".join(rf"${se[m]:.3f}$" for m in methods) + r" \\")
+        else:
+            lines.append(r"    \quad \textit{mean} $\pm$ s.e. & & & " +
+                         " & ".join((rf"$\mathbf{{{mean[m]:.3f}}} \pm {se[m]:.3f}$" if mean[m] == top
+                                     else rf"${mean[m]:.3f} \pm {se[m]:.3f}$") for m in methods) + r" \\")
         wins = {m: int((sub.G_ConicFlow > sub[f"G_{m}"]).sum()) for m in others}
         lines.append(r"    \quad \textit{ConicFlow wins} & & & -- & "
                      + " & ".join(f"${wins[m]}/{n}$" for m in others) + r" \\")

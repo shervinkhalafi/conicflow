@@ -11,12 +11,15 @@ Draws, from run_table1.sh's results tree:
 One point per lambda per method, each annotated with its lambda; the grey
 dashed line is the uncontrolled sample's reward. ConicFlow is shown at
 n_inner=24 (H=2), HardFlow at n_inner=40, FMRG-J at 3 guidance steps.
+--baselines adds gradient guidance (3 guidance steps) and FlowChef (5), from
+run_table1.sh's METHODS="gg flowchef" runs; several --results roots are pooled.
 
 Energy is the paper's E = sum_k dt*||u_k||^2. summary.csv stores it divided by
 N^2, so every row is rescaled by its own N^2 on load (64 at N=8).
 
   python fig2_pareto.py                                 # reads ../src/results/unconstrained
   python fig2_pareto.py --results <root> --out_dir <dir>
+  python fig2_pareto.py --baselines                     # + gradient guidance, FlowChef
 """
 import argparse
 import glob
@@ -70,10 +73,22 @@ IMG_STYLE = dict(
     xlabel=r"Total control energy  $\sum_j \|u_j\|^2 \Delta t$",
     ylabel=r"Terminal reward  r$(x_N)$",
 )
-METHOD_COLORS = dict(conicflow="#0d9488", hardflow="#c2410c", fmrg="#6b21a8")
+METHOD_COLORS = dict(conicflow="#0d9488", hardflow="#c2410c", fmrg="#6b21a8",
+                     # Rebuttal baselines (Tailwind blue-600 / yellow-600, the ramps the
+                     # paper's three colours come from). Validated with the five as one
+                     # all-pairs categorical set on white: worst CVD dE 12.3, normal-vision
+                     # 16.5; yellow-600 is 2.94:1, so it also has its own marker.
+                     gg="#2563eb", flowchef="#ca8a04")
 
 # (output file, reward, prompt, edit_prompt, seed, ylim, save dpi). The main
 # panel was exported at 100 dpi, the two appendix panels at 150.
+# With --baselines the six-entry legend would cover data in the default upper
+# left; each panel gets the placement that is clear of its points.
+BASELINE_LEGEND = {
+    "uncon_main_pareto.png": dict(legend_loc="upper left", legend_scale=0.75),
+    "pareto__imagereward__a_photo_of_a_sleeping_cat__a_photo_of___seed42.png": dict(legend_loc="upper left", legend_scale=0.75),
+    "pareto__clip__a_portrait_of_a_man__a_smiling_face__seed7.png": dict(legend_loc="upper right"),
+}
 PANELS = [
     ("uncon_main_pareto.png", "pickscore", "a portrait of a man", "a smiling face", 42, None, 100),
     ("pareto__imagereward__a_photo_of_a_sleeping_cat__a_photo_of___seed42.png", "imagereward",
@@ -88,12 +103,13 @@ def slug_of(prompt, edit):
     return "".join(c if c.isascii() and c.isalnum() else "_" for c in s)[:60]
 
 
-def load_problem(root, reward, prompt, edit, seed):
-    """Every run_ok row of one problem, renamed to the plotting schema."""
-    d = Path(root) / reward / slug_of(prompt, edit)
-    files = sorted(glob.glob(str(d / f"*_seed{seed}" / "summary.csv")))
+def load_problem(roots, reward, prompt, edit, seed):
+    """Every run_ok row of one problem across the given root(s), renamed to the plotting schema."""
+    roots = [roots] if isinstance(roots, (str, Path)) else roots
+    dirs = [Path(r) / reward / slug_of(prompt, edit) for r in roots]
+    files = sorted(f for d in dirs for f in glob.glob(str(d / f"*_seed{seed}" / "summary.csv")))
     if not files:
-        raise FileNotFoundError(f"no runs for {reward}/{prompt} -> {edit} seed {seed} under {d}")
+        raise FileNotFoundError(f"no runs for {reward}/{prompt} -> {edit} seed {seed} under {[str(d) for d in dirs]}")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     df = df[(df.run_ok.astype(str).str.lower() == "true") & (df.seed == seed)
             & (df.prompt == prompt) & (df.edit_prompt == edit)].copy()
@@ -143,17 +159,21 @@ def plot_pareto(series, baseline=None, xscale="linear", yscale="linear", xlim=No
     if st["grid"]:
         ax.grid(alpha=st["grid_alpha"], zorder=0)
     if st.get("legend", True):
-        ax.legend(fontsize=st["legend_fontsize"], loc=st["legend_loc"])
+        ax.legend(fontsize=st["legend_fontsize"] * st.get("legend_scale", 1.0), loc=st["legend_loc"],
+                  ncol=st.get("legend_ncol", 1))
     fig.tight_layout()
     return fig, ax
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results", default=str(IMAGE / "src" / "results" / "unconstrained"))
-    ap.add_argument("--out_dir", default=None, help="default: <results>/figures")
+    ap.add_argument("--results", nargs="+", default=[str(IMAGE / "src" / "results" / "unconstrained")],
+                    help="results root(s); runs from every root are pooled")
+    ap.add_argument("--baselines", action="store_true",
+                    help="add gradient guidance and FlowChef (run_table1.sh METHODS='gg flowchef')")
+    ap.add_argument("--out_dir", default=None, help="default: <first results root>/figures")
     a = ap.parse_args()
-    out = Path(a.out_dir or Path(a.results) / "figures")
+    out = Path(a.out_dir or Path(a.results[0]) / "figures")
     out.mkdir(parents=True, exist_ok=True)
 
     for fname, reward, prompt, edit, seed, ylim, dpi in PANELS:
@@ -165,7 +185,16 @@ def main():
             "HardFlow": (df[df.control_type == "hardflow"], dict(color=METHOD_COLORS["hardflow"], marker="s")),
             "FMRG": (df[df.control_type == "fmrg"], dict(color=METHOD_COLORS["fmrg"], marker="^")),
         }
-        fig, _ = plot_pareto(series, baseline=baseline, xscale="log", ylim=ylim, style=IMG_STYLE)
+        if a.baselines:
+            series["Gradient guidance"] = (df[(df.control_type == "gg") & (df.n_inner == 3)],
+                                           dict(color=METHOD_COLORS["gg"], marker="D"))
+            series["FlowChef"] = (df[(df.control_type == "flowchef") & (df.n_inner == 5)],
+                                  dict(color=METHOD_COLORS["flowchef"], marker="v"))
+            missing = [k for k, (sub, _) in series.items() if not len(sub)]
+            if missing:
+                raise RuntimeError(f"{reward} {prompt} seed {seed}: no runs for {missing}")
+        style = {**IMG_STYLE, **(BASELINE_LEGEND.get(fname, {}) if a.baselines else {})}
+        fig, _ = plot_pareto(series, baseline=baseline, xscale="log", ylim=ylim, style=style)
         fig.savefig(out / fname, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
         print(f"{reward:12s} {prompt} -> {edit}, seed {seed}: {len(df)} runs, r_unc={baseline:.4f} -> {out / fname}")

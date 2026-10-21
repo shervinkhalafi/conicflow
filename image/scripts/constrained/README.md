@@ -66,18 +66,24 @@ ARMS="pflow ldf" bash image/scripts/constrained/run_suite.sh 1 triple
 
 # 2. the figures (CPU, seconds)
 cd image/src
-python plot_constrained_suite.py --root results/constrained_suite --paper_style \
-    --out ../figures/constrained/con_main_plot.png          # Figure 3, left
+python plot_constrained_suite.py --root results/constrained_suite --paper_style --dpi 100 \
+    --out ../figures/constrained/con_main_plot.png          # Figure 3, left: every arm in the tree
 python ../analysis/constrained_image_rows.py                # Figure 3, middle and right
 python ../analysis/constrained_appendix_grids.py            # appendix, 18 grids
-# with the baselines (the plot picks up every arm present in the tree)
-python plot_constrained_suite.py --root results/constrained_suite --paper_style \
-    --out ../figures/constrained/con_main_plot_4arms.png
+# the image panels and grids with the baselines' columns too (not in the paper)
 python ../analysis/constrained_image_rows.py --arms conicflow hardflow pflow ldf \
     --out_dir ../figures/constrained_4arms
 python ../analysis/constrained_appendix_grids.py --arms conicflow hardflow pflow ldf \
     --out_dir ../figures/constrained_appendix_4arms
+# the submitted paper's two-arm Figure 3 (left)
+python plot_constrained_suite.py --root results/constrained_suite --arms conicflow hardflow \
+    --paper_style --dpi 100 --out ../figures/constrained/con_main_plot_2arms.png
 ```
+
+The current draft's Figure 3 (left) has all four arms (run `ARMS="pflow ldf"`
+first); its image panels and grids still show ConicFlow and HardFlow only. With
+more than two arms the plot keeps one legend, in the energy panel's lower
+right, so it covers no data.
 
 `plot_constrained_suite.py` prints the numbers behind the plot and saves them
 as a `.csv` next to the figure. The two image scripts write a `.csv` with

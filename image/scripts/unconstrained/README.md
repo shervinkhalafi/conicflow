@@ -49,8 +49,15 @@ METHODS="gg flowchef" bash image/scripts/unconstrained/run_table1.sh 0     # the
 # the image-row cells of Fig. 2 (right) rows B/C and Fig. 5 (a)-(d):
 METHODS="gg flowchef" JOBS=image_rows_jobs.tsv RESULTS_ROOT=results/ablation/baselines \
     bash image/scripts/unconstrained/run_table1.sh 1
-cd image/analysis && python table1_breakdown.py --baselines             # Table 1 with both rows
+cd image/analysis
+python table1_breakdown.py --baselines   # Table 1 and the per-problem breakdown, five methods
+python fig2_pareto.py --baselines        # Fig. 2 (left) and the two Fig. 4 frontiers, five methods
 ```
+
+These are the current draft's versions of Table 1, the breakdown table, Fig. 2
+(left) and Fig. 4; without `--baselines` the scripts reproduce the submitted
+three-method ones. Several `--results` roots are pooled, if the baseline runs
+live in their own tree.
 
 About 2.6 GPU-hours for the Table 1 problems and 1.1 for the image-row cells
 (~50 s per λ for gradient guidance and ~30 s for FlowChef, model load
