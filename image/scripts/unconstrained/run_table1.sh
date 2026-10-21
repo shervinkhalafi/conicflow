@@ -22,6 +22,13 @@
 #   HardFlow   n_inner 40, lr 2.5, --hardflow_lr_alpha 0.5 (lr -> 0.5/reg where
 #              lr*reg >= 1); reg = N/(2*lam) is derived per run, never passed
 #   FMRG       n_opt 3 (the J variant)
+# The unconstrained baselines (opt-in via METHODS, same problems, same lambda):
+#   gg         gradient guidance, 3 guidance steps per sampling step (FMRG-J's 3)
+#   flowchef   FlowChef, 5 (the FMRG authors' setting)
+#
+#   METHODS="gg flowchef" bash run_table1.sh <gpu>      # Table 1 problems
+#   METHODS="gg flowchef" JOBS=image_rows_jobs.tsv RESULTS_ROOT=results/ablation/baselines \
+#       bash run_table1.sh <gpu>                          # Fig 2 (right) / Fig 5 image-row cells
 #
 # The GPU is pinned with CUDA_VISIBLE_DEVICES and both devices are cuda:0
 # in-process. Run one instance per card (ConicFlow peaks at 15-19 GB).
@@ -33,8 +40,11 @@
 #   CONICFLOW_NI="12 24"   ConicFlow inner-iteration counts. Table 1 and every
 #                          figure use 24 only; CONICFLOW_NI=24 skips the n_inner=12
 #                          configuration and saves roughly a quarter of the cost.
-#   METHODS="conicflow hardflow fmrg"
+#   METHODS="conicflow hardflow fmrg"   (also gg, flowchef)
 #   JOBS=table1_jobs.tsv   RESULTS_ROOT=results/unconstrained   PYTHON=python
+#   A job line's optional 6th column names its frozen grid file relative to
+#   image/data/grids/ (image_rows_jobs.tsv uses the ablation's edN.txt);
+#   without it the grid is grids/unconstrained/<reward>__<slug>.txt.
 #   ONLY_REWARD=pickscore  run one reward's rows only
 set -u
 GPU="${1:?usage: run_table1.sh <gpu> [--dry_run]}"
@@ -43,6 +53,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(cd "$HERE/../../src" && pwd)"
 GRIDS="$(cd "$HERE/../../data/grids/unconstrained" && pwd)"
 JOBS="${JOBS:-$HERE/table1_jobs.tsv}"
+# A relative JOBS is taken from the caller's directory, else from this one
+# (JOBS=image_rows_jobs.tsv); pinned before the cd below.
+case "$JOBS" in /*) ;; *) if [ -f "$JOBS" ]; then JOBS="$PWD/$JOBS"; else JOBS="$HERE/$JOBS"; fi ;; esac
 RESULTS_ROOT="${RESULTS_ROOT:-results/unconstrained}"
 CONICFLOW_NI="${CONICFLOW_NI:-12 24}"
 METHODS="${METHODS:-conicflow hardflow fmrg}"
@@ -53,11 +66,12 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 cd "$SRC" || exit 3
 
 n_fail=0
-while IFS=$'\t' read -r reward seed prompt edit densify; do
+while IFS=$'\t' read -r reward seed prompt edit densify gridf; do
     case "$reward" in ''|'#'*) continue ;; esac
     [ -n "$ONLY_REWARD" ] && [ "$reward" != "$ONLY_REWARD" ] && continue
     slug="$(printf '%s__%s' "$prompt" "$edit" | tr -c 'A-Za-z0-9' '_' | cut -c1-60)"
     grid_file="$GRIDS/${reward}__${slug}.txt"
+    [ -n "${gridf:-}" ] && grid_file="$GRIDS/../$gridf"
     [ -s "$grid_file" ] || { echo "[table1] missing grid $grid_file"; exit 1; }
     lams="$(awk '$1=="shared" && $2=="--sweep_lam" {$1="";$2="";print}' "$grid_file")"
     [ -n "$lams" ] || { echo "[table1] no shared line in $grid_file"; exit 1; }
@@ -69,6 +83,8 @@ while IFS=$'\t' read -r reward seed prompt edit densify; do
             conicflow) extra=(--sweep_H 2 --sweep_n_inner $CONICFLOW_NI --sweep_lr_inner 1e-2) ;;
             hardflow)  extra=(--sweep_H 2 --sweep_n_inner 40 --sweep_lr_inner 2.5 --hardflow_lr_alpha 0.5) ;;
             fmrg)      extra=(--sweep_n_inner 3) ;;
+            gg)        extra=(--sweep_n_inner 3) ;;
+            flowchef)  extra=(--sweep_n_inner 5) ;;
             *) echo "[table1] unknown method $method"; exit 1 ;;
         esac
         out="$RESULTS_ROOT/$reward/$slug/${method}_seed${seed}"

@@ -1,0 +1,10 @@
+# image_rows_jobs.tsv -- the PickScore editing cells behind Figure 2 (right) rows
+# B/C and Figure 5 (a)-(d), for running the unconstrained baselines on them
+# (see run_table1.sh). Columns as table1_jobs.tsv, plus the frozen grid: the
+# ablation's 'shared' line, the lambdas every other method ran on these cells.
+pickscore	317	a portrait of a young man	a portrait of an old man	-	ablation/ed3.txt
+pickscore	1289	a portrait of a young man	a portrait of an old man	-	ablation/ed3.txt
+pickscore	317	a portrait of a woman with straight hair	a portrait of a woman with curly hair	-	ablation/ed1.txt
+pickscore	1289	a portrait of a woman with straight hair	a portrait of a woman with curly hair	-	ablation/ed1.txt
+pickscore	317	a portrait of a smiling man	a portrait of an angry man	-	ablation/ed4.txt
+pickscore	1289	a portrait of a smiling man	a portrait of an angry man	-	ablation/ed4.txt
