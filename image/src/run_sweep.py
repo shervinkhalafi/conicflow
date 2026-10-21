@@ -82,6 +82,12 @@ from image_conicflow import (
 # module docstring for the full list of divergences. Every other import above
 # still comes from image_conicflow.py unmodified.
 from control_loops import receding_horizon_flow_control, hardflow_image
+# Unconstrained baselines, dispatched as control types gg / flowchef. They live
+# next to hardflow_image; each docstring says what it is and how lam maps onto it.
+from control_loops import gradient_guidance_image, flowchef_image
+# Constrained baselines, dispatched as control types pflow / ldf; see their
+# docstrings in control_loops.py.
+from control_loops import projected_flow_image, ldf_image
 
 
 def stack_constraints(fns):
@@ -145,7 +151,22 @@ MAX_CONSTRAINTS = 4
 # "boffi_fmrg" are unconstrained methods and are deliberately NOT in this set:
 # requesting constraints with them raises in _validate_constraint_cfg rather
 # than silently running unconstrained.
-CONSTRAINED_CONTROL_TYPES = frozenset({"conicflow", "hardflow"})
+CONSTRAINED_CONTROL_TYPES = frozenset({"conicflow", "hardflow", "pflow", "ldf"})
+
+# Constrained baselines added for the rebuttal's constrained table: Projected
+# Flow (PDM-style projection) and Lagrangian Dual Flows. They take constraints
+# and NO reward, and their constraint handling is not the sum_i mu_i h_i term
+# the conicflow/hardflow guards are written for (pflow has no multipliers;
+# ldf's evolve by their own dynamics) -- see _validate_constraint_cfg (ii) and
+# _validate_constraint_only_cfg.
+CONSTRAINT_ONLY_TYPES = frozenset({"pflow", "ldf"})
+
+# Unconstrained baselines added for the rebuttal: gradient guidance (HardFlow's
+# soft baseline) and FlowChef (FMRG's baseline). Like fmrg they take a reward and
+# no constraints, so they are NOT in CONSTRAINED_CONTROL_TYPES. One set, so the
+# dispatch, the preflight guard and main()'s --reward none check cannot disagree
+# about which types these are.
+UNCONSTRAINED_BASELINE_TYPES = frozenset({"gg", "flowchef"})
 
 # Settings the design plan ("Locked decisions -- do not re-litigate") fixes,
 # not merely defaults.
@@ -494,10 +515,14 @@ class RunConfig:
     edit_prompt:  Optional[str] = None  # reward-model target prompt; falls back to `prompt` if None
     N:            int   = 4       # total denoising steps
     H:            int   = 2       # ConicFlow planning horizon (ignored for fmrg/boffi_fmrg)
-    control_type: str   = "conicflow"   # "conicflow" | "fmrg" | "boffi_fmrg" | "hardflow" | "none"
-    lam:          float = 10.0    # control / guidance strength (== upstream step_size for boffi_fmrg)
-    n_inner:      int   = 5       # inner iters (ConicFlow), n_opt (fmrg), or num_optim_iters (boffi_fmrg)
-    lr_inner:     float = 1e-2    # inner Adam lr (ConicFlow only)
+    control_type: str   = "conicflow"   # "conicflow" | "fmrg" | "boffi_fmrg" | "hardflow" | "gg" | "flowchef" | "pflow" | "ldf" | "none"
+    # lam: control / guidance strength (== upstream step_size for boffi_fmrg).
+    # For gg / flowchef it is a guidance GAIN, as for fmrg (step = lam*dt/n_inner).
+    lam:          float = 10.0
+    # n_inner: inner iters (ConicFlow), n_opt (fmrg), num_optim_iters
+    # (boffi_fmrg), or guidance steps per sampling step (gg, flowchef).
+    n_inner:      int   = 5
+    lr_inner:     float = 1e-2    # inner Adam lr (ConicFlow), inner lr (hardflow); unused by fmrg / gg / flowchef
     sample_mode:  str   = "flow_map2"
     guidance_scale: float = 3.5
     height:       int   = 256
@@ -703,6 +728,17 @@ class RunConfig:
     # the final step). None = off: the guard raises exactly as before. The
     # EFFECTIVE lr is recorded per row in `hardflow_lr_eff`.
     hardflow_lr_alpha: Optional[float] = None
+    # ── Constrained baselines (2026-10-09); inert on every other control type,
+    # recorded on every row like the hardflow_* fields. See projected_flow_image
+    # / ldf_image in control_loops.py for what each knob is.
+    pflow_max_iters:  int   = 10     # Gauss-Newton updates per projection (cap)
+    pflow_final_iters: int  = 50     # cap for the LAST step's projection (decoder+scorer only; 2026-10-11)
+    pflow_activation: float = 0.0    # fraction of steps before projecting starts (0 = PDM: every step)
+    pflow_margin:     float = 0.0    # project onto h + margin <= 0
+    ldf_penalty:      float = 5.0    # LDF penalty_weight (their default): g = weight * h
+    ldf_rescale:      float = 1.0    # LDF multiplier gain; 0 = their pure-quadratic-penalty limit
+    ldf_p:            float = 1.0    # exponent of the 1/(1-s)^p gain (their inequality code's 1)
+    ldf_substeps:     int   = 64     # correction/multiplier substeps per sampling step (16 -> 64 on 2026-10-11, see ldf_image)
     # style reward only (reward_model=="style") -- one or more reference image
     # paths; Gram matrices are averaged across references when >1 (style
     # mixing). Neither the FMRG paper nor MPGD specify multi-reference
@@ -1605,7 +1641,12 @@ def _validate_constraint_cfg(cfg) -> int:
     # (ii) The silent no-op (see the design plan): lr_dual and mu_init BOTH default to
     # 0.0, which makes sum_i mu_i h_i identically zero for the whole run. The
     # constraint is then a no-op with no error anywhere.
-    if cfg.lr_dual == 0.0 and cfg.mu_init == 0.0:
+    # Not applied to the constraint-only baselines (2026-10-09): pflow has no
+    # mu_i h_i term at all (it projects), and ldf's multipliers start at mu_init
+    # but are driven by their own dynamics (ldf_rescale), so 0/0 is their normal
+    # setting, not a no-op. _validate_constraint_only_cfg guards those instead.
+    if (cfg.control_type not in CONSTRAINT_ONLY_TYPES
+            and cfg.lr_dual == 0.0 and cfg.mu_init == 0.0):
         raise ValueError(
             f"constraints requested ({n_constraints}) but "
             f"lr_dual=0.0 AND mu_init=0.0. The constraint term sum_i mu_i h_i "
@@ -1785,6 +1826,71 @@ def _validate_dual_options_cfg(cfg, n_constraints: int) -> None:
         )
 
 
+def _validate_unconstrained_baseline_cfg(cfg) -> None:
+    """Guards for the gg / flowchef control types.
+
+    An EARLIER copy of the guards inside gradient_guidance_image /
+    flowchef_image (same reason _validate_dual_options_cfg
+    duplicates receding_horizon_flow_control's): routed through run_preflight,
+    a bad sweep fails before the FLUX load instead of minutes into each config.
+    All of these would otherwise be silent no-ops or wrong-sign runs, not
+    crashes. The --reward none case is checked in main() instead, because the
+    reward is a CLI-global and not a RunConfig field.
+    """
+    if cfg.control_type not in UNCONSTRAINED_BASELINE_TYPES:
+        return
+    if not cfg.lam > 0.0:
+        raise ValueError(
+            f"{cfg.control_type} with lam={cfg.lam!r}: lam must be > 0. lam = 0 "
+            f"is the uncontrolled rollout, and lam < 0 descends the reward."
+        )
+    if cfg.n_inner < 1:
+        raise ValueError(
+            f"{cfg.control_type} with n_inner={cfg.n_inner!r}: needs >= 1 "
+            f"guidance step / iteration, or the run is the uncontrolled rollout."
+        )
+
+
+def _validate_constraint_only_cfg(cfg, n_constraints: int) -> None:
+    """Guards for the pflow / ldf control types (2026-10-09).
+
+    An EARLIER copy of the guards inside projected_flow_image / ldf_image, so a
+    bad sweep fails before the FLUX load. The --reward-must-be-none check is in
+    main(), because the reward is a CLI-global rather than a RunConfig field.
+    """
+    if cfg.control_type not in CONSTRAINT_ONLY_TYPES:
+        return
+    if n_constraints < 1:
+        raise ValueError(
+            f"{cfg.control_type} needs at least one constraint: it is a "
+            f"constraint-only baseline, and with none it is the uncontrolled "
+            f"rollout. Pass --constraint_types/--constraint_args/... ."
+        )
+    if cfg.control_type == "pflow":
+        if cfg.pflow_max_iters < 1:
+            raise ValueError(f"pflow_max_iters must be >= 1, got {cfg.pflow_max_iters}.")
+        if cfg.pflow_final_iters < 1:
+            raise ValueError(f"pflow_final_iters must be >= 1, got {cfg.pflow_final_iters}.")
+        if not 0.0 <= cfg.pflow_activation < 1.0:
+            raise ValueError(
+                f"pflow_activation must be in [0, 1), got {cfg.pflow_activation} "
+                f"(at 1.0 no step is ever projected).")
+        if cfg.pflow_margin < 0.0:
+            raise ValueError(f"pflow_margin must be >= 0, got {cfg.pflow_margin}.")
+    else:
+        if not cfg.ldf_penalty > 0.0:
+            raise ValueError(f"ldf_penalty must be > 0, got {cfg.ldf_penalty}.")
+        if cfg.ldf_rescale < 0.0:
+            raise ValueError(f"ldf_rescale must be >= 0, got {cfg.ldf_rescale}.")
+        if not cfg.ldf_p > 0.0:
+            raise ValueError(f"ldf_p must be > 0, got {cfg.ldf_p}.")
+        if cfg.ldf_substeps < 1:
+            raise ValueError(f"ldf_substeps must be >= 1, got {cfg.ldf_substeps}.")
+        if cfg.mu_init < 0.0:
+            raise ValueError(f"ldf uses mu_init as its initial multiplier; must be >= 0, "
+                             f"got {cfg.mu_init}.")
+
+
 def run_preflight(
     cfg: RunConfig,
     *,
@@ -1822,6 +1928,10 @@ def run_preflight(
         guards that also live inside receding_horizon_flow_control, so a bad
         Step 5/7 sweep fails before the FLUX load rather than minutes into
         each config; see that function's docstring for why both exist)
+      - _validate_unconstrained_baseline_cfg (gg / flowchef: lam > 0,
+        n_inner >= 1)
+      - _validate_constraint_only_cfg (pflow / ldf: at least one
+        constraint, knob ranges)
 
     Opt-in, via an explicit parameter rather than an implicit omission at the
     call site (per instruction: "if some check genuinely doesn't apply... make
@@ -1841,6 +1951,8 @@ def run_preflight(
     _assert_locked_defaults(cfg, log=log)
     n_constraints = _validate_constraint_cfg(cfg)
     _validate_dual_options_cfg(cfg, n_constraints)
+    _validate_unconstrained_baseline_cfg(cfg)   # 2026-10-09; no-op for other types
+    _validate_constraint_only_cfg(cfg, n_constraints)   # 2026-10-09; likewise
     if check_boffi_rng:
         _assert_boffi_rng_reachability_closed(cfg, latent)
     # Deliberately NOT routed through `log`: every sweep launcher passes
@@ -2592,6 +2704,85 @@ def _run_one(
                 sampler, boffi_reward, z0, cfg, device,
             )
             del boffi_reward
+        # Unconstrained baselines (2026-10-09). Same call shape and return
+        # contract as the fmrg branch above, (z_N, traj, controls), so
+        # everything downstream (energy from traj, rewards, CSV) is shared.
+        # Each takes the shared nominal step, which is what makes the generic
+        # _ctrl_norms_from_traj energy comparable with the other arms.
+        elif cfg.control_type == "gg":
+            # Gradient guidance, HardFlow's DPS-style soft baseline. lam = gain.
+            z_ctrl, traj_ctrl, _ = gradient_guidance_image(
+                sampler, r_image, z0,
+                N=cfg.N,
+                n_inner=cfg.n_inner,
+                lam=cfg.lam,
+                guidance_scale=cfg.guidance_scale,
+                sample_mode=cfg.sample_mode,
+                verbose=not quiet,
+                show_progress=not quiet,
+                low_memory=low_memory,
+            )
+        elif cfg.control_type == "flowchef":
+            # FlowChef, FMRG's baseline (gradient skipping). lam = gain.
+            z_ctrl, traj_ctrl, _ = flowchef_image(
+                sampler, r_image, z0,
+                N=cfg.N,
+                n_inner=cfg.n_inner,
+                lam=cfg.lam,
+                guidance_scale=cfg.guidance_scale,
+                sample_mode=cfg.sample_mode,
+                verbose=not quiet,
+                show_progress=not quiet,
+                low_memory=low_memory,
+            )
+        # Constrained baselines. hardflow's return contract, so
+        # mu_final / mu_hist / h_dual_hist feed the constraint bookkeeping
+        # unchanged (pflow has no multipliers and returns None for both, which
+        # every consumer already handles). Constraint-only: run with --reward
+        # none (main() enforces it), so r_image is not passed.
+        elif cfg.control_type == "pflow":
+            # Projected Flow: PDM-style projection of the state each step.
+            z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = projected_flow_image(
+                sampler, z0,
+                h=h_fn,
+                N=cfg.N,
+                max_iters=cfg.pflow_max_iters,
+                final_iters=cfg.pflow_final_iters,
+                activation_frac=cfg.pflow_activation,
+                margin=cfg.pflow_margin,
+                guidance_scale=cfg.guidance_scale,
+                sample_mode=cfg.sample_mode,
+                return_dual_h=True,
+                verbose=not quiet,
+                show_progress=not quiet,
+                low_memory=low_memory,
+            )
+        elif cfg.control_type == "ldf":
+            # Lagrangian Dual Flows; mu_init is its initial multiplier.
+            z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = ldf_image(
+                sampler, z0,
+                h=h_fn,
+                N=cfg.N,
+                penalty_weight=cfg.ldf_penalty,
+                rescale=cfg.ldf_rescale,
+                p=cfg.ldf_p,
+                substeps=cfg.ldf_substeps,
+                lam_init=cfg.mu_init,
+                guidance_scale=cfg.guidance_scale,
+                sample_mode=cfg.sample_mode,
+                return_dual_h=True,
+                verbose=not quiet,
+                show_progress=not quiet,
+                low_memory=low_memory,
+            )
+        else:
+            # Without this, a type that is in the argparse choices
+            # but has no branch here ran on with z_ctrl=None and died later as
+            # an AttributeError far from the cause.
+            raise ValueError(
+                f"_run_one: no dispatch branch for control_type="
+                f"{cfg.control_type!r}. Add one alongside conicflow/hardflow/fmrg."
+            )
 
         time_ctrl = time.perf_counter() - t0
 
@@ -2722,13 +2913,22 @@ def _run_one(
         s_grid = torch.linspace(0.0, 1.0, n_pts)
         raw_vals, eval_vals = [], []
         use_endpoint = (cfg.constraint_on == "endpoint" and endpoint_map is not None)
+        # Steps whose realized latent IS (bitwise) the endpoint predicted from
+        # the previous state -- see the stale-decode guard below (2026-10-11).
+        _same_latent_as_prev_endpoint = set()
+        _ep_prev = None
         with torch.no_grad():
             for t_idx in range(n_pts):
                 zt = traj_ctrl[t_idx].to(device=device, dtype=dtype)
                 raw_vals.append(h_fn(zt).mean(0).cpu())          # (C,)
                 if use_endpoint:
                     s_t = s_grid[t_idx].to(device).expand(zt.shape[0])
-                    eval_vals.append(h_fn(endpoint_map(s_t, zt)).mean(0).cpu())
+                    _ep = endpoint_map(s_t, zt)
+                    eval_vals.append(h_fn(_ep).mean(0).cpu())
+                    if _ep_prev is not None and torch.equal(zt, _ep_prev):
+                        _same_latent_as_prev_endpoint.add(t_idx)
+                    _ep_prev = _ep
+        del _ep_prev
         constraint_traj_raw = torch.stack(raw_vals, dim=0).float().numpy()
         constraint_traj = (
             torch.stack(eval_vals, dim=0).float().numpy() if use_endpoint
@@ -2789,9 +2989,20 @@ def _run_one(
         # because the failure was silent for a whole grid: 28 of 240 step
         # evaluations in 20260904_231018_lpr2c were corrupted and only the 3
         # that landed on the final row were ever flagged.
+        #
+        # EXCEPT when the two latents are themselves bit-identical (2026-10-11).
+        # "Cannot happen by chance" is false at the last step: the nominal step
+        # t -> 0 is the same flow-map jump as endpoint_map, so a method that
+        # applies ZERO correction there (constraint already satisfied) ends on
+        # exactly the previous endpoint, and equal h is then correct, not a
+        # stale decode. It failed a valid LDF run on the 10-11 smoke and two
+        # HardFlow rows in the paper's constrained runs (p04_night seed 698 m1.10 and
+        # the three-constraint cell). Exempting only bit-identical LATENTS keeps
+        # the guard exact: equal h from different latents is still flagged.
         if use_endpoint and len(constraint_traj) > 1:
             _stale = [k for k in range(1, len(constraint_traj))
-                      if np.array_equal(constraint_traj_raw[k], constraint_traj[k - 1])]
+                      if k not in _same_latent_as_prev_endpoint
+                      and np.array_equal(constraint_traj_raw[k], constraint_traj[k - 1])]
             if _stale:
                 run_ok_stale = True
                 print(
@@ -3049,6 +3260,14 @@ def _run_one(
         hardflow_endpoint_mode = cfg.hardflow_endpoint_mode,
         hardflow_lr_alpha     = "" if cfg.hardflow_lr_alpha is None else cfg.hardflow_lr_alpha,
         hardflow_lr_eff       = hardflow_lr_eff,
+        pflow_max_iters       = cfg.pflow_max_iters,
+        pflow_final_iters     = cfg.pflow_final_iters,
+        pflow_activation      = cfg.pflow_activation,
+        pflow_margin          = cfg.pflow_margin,
+        ldf_penalty           = cfg.ldf_penalty,
+        ldf_rescale           = cfg.ldf_rescale,
+        ldf_p                 = cfg.ldf_p,
+        ldf_substeps          = cfg.ldf_substeps,
         lpips_net     = cfg.lpips_net,
         r_unc         = r_unc_final,
         r_ctrl        = r_ctrl_final,
@@ -3571,6 +3790,10 @@ CSV_KEYS = [
     "hardflow_endpoint_mode",
     # (2026-09-17) the floor-lifting alpha and the lr the run ACTUALLY used.
     "hardflow_lr_alpha", "hardflow_lr_eff",
+    # (2026-10-09) constrained baselines pflow / ldf; default values on every
+    # other control type, recorded anyway for the same self-describing reason.
+    "pflow_max_iters", "pflow_final_iters", "pflow_activation", "pflow_margin",
+    "ldf_penalty", "ldf_rescale", "ldf_p", "ldf_substeps",
     "lpips_net", "r_unc", "r_ctrl",
     "r_ctrl_independent", "delta_r",
     "ctrl_energy", "ctrl_norm_mean", "ctrl_norm_max", "objective", "time_unc_s", "time_ctrl_s",
@@ -3611,6 +3834,14 @@ _RESUME_KEY_FIELDS = [
     "hardflow_endpoint_mode", "hardflow_lr_alpha",
     "seed", "lr_dual", "mu_init", "lpips_net",
     "dual_adaptive",
+    # (2026-10-09) they are sweep axes, so they must distinguish rows. Like
+    # every earlier schema addition this makes a pre-2026-10-09 summary.csv
+    # unresumable ("predates the current CSV schema" -- resume into a fresh
+    # --out_dir), which is the safe direction: the resume branch appends rows
+    # with the CURRENT CSV_KEYS, so letting an old header through would shift
+    # every column after the first new one.
+    "pflow_max_iters", "pflow_final_iters", "pflow_activation", "pflow_margin",
+    "ldf_penalty", "ldf_rescale", "ldf_p", "ldf_substeps",
 ]
 
 # Sweep axes that do NOT round-trip through the CSV. If a resumed sweep varies
@@ -3808,6 +4039,9 @@ def _build_configs_from_args(args) -> List[RunConfig]:
         "endpoint_surrogate",
         # dual_adaptive (2026-09-20) APPENDED for the same reason.
         "dual_adaptive",
+        # constrained-baseline knobs (2026-10-09) APPENDED for the same reason.
+        "pflow_max_iters", "pflow_final_iters", "pflow_activation", "pflow_margin",
+        "ldf_penalty", "ldf_rescale", "ldf_p", "ldf_substeps",
     ]
     for f in sweep_fields:
         val = getattr(args, f"sweep_{f}", None)
@@ -3868,6 +4102,15 @@ Sweep via CLI (cartesian product of all provided lists):
       --sweep_edit_prompt "a smiling face" \\
       --sweep_control_type conicflow fmrg \\
       --sweep_lam 5.0 50.0 200.0
+
+  # unconstrained baselines: gradient guidance (3 guidance steps per sampling
+  # step) and FlowChef (5) take lam as a gain, like fmrg:
+  python run_sweep.py --reward pickscore \\
+      --sweep_prompt "a portrait of a man" --sweep_edit_prompt "a smiling face" \\
+      --sweep_N 8 --sweep_control_type gg --sweep_n_inner 3 --sweep_lam 5.0 50.0
+  python run_sweep.py --reward pickscore \\
+      --sweep_prompt "a portrait of a man" --sweep_edit_prompt "a smiling face" \\
+      --sweep_N 8 --sweep_control_type flowchef --sweep_n_inner 5 --sweep_lam 5.0 50.0
 
   # CLIP as constraint only (r = zero):
   python run_sweep.py \\
@@ -4080,7 +4323,8 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     parser.add_argument("--sweep_N",             nargs="+", type=int,   metavar="N")
     parser.add_argument("--sweep_H",             nargs="+", type=int,   metavar="H")
     parser.add_argument("--sweep_control_type",  nargs="+",
-                        choices=["conicflow", "fmrg", "boffi_fmrg", "hardflow", "none"],
+                        choices=["conicflow", "fmrg", "boffi_fmrg", "hardflow",
+                                 "gg", "flowchef", "pflow", "ldf", "none"],
                         metavar="TYPE")
     parser.add_argument("--sweep_lam",           nargs="+", type=float, metavar="LAM")
     parser.add_argument("--sweep_n_inner",       nargs="+", type=int,   metavar="N_INNER")
@@ -4148,6 +4392,34 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "estimator ablation: run HardFlow on ConicFlow's full "
                              "endpoint_map rollout, so a head-to-head no longer "
                              "confounds the algorithm with the endpoint estimate.")
+    # Constrained baselines (2026-10-09); see RunConfig's pflow_* / ldf_* fields.
+    parser.add_argument("--sweep_pflow_max_iters", nargs="+", type=int, metavar="K",
+                        help="pflow only. Gauss-Newton updates per projection (cap; "
+                             "default 10). A step still infeasible at the cap is "
+                             "reported, not hidden.")
+    parser.add_argument("--sweep_pflow_final_iters", nargs="+", type=int, metavar="K",
+                        help="pflow only. Gauss-Newton cap for the LAST step's "
+                             "projection, which acts on the output latent through "
+                             "the decoder and scorer only (cheap; default 50).")
+    parser.add_argument("--sweep_pflow_activation", nargs="+", type=float, metavar="FRAC",
+                        help="pflow only. Fraction of sampling steps before projecting "
+                             "starts. 0 (default) projects every step, as PDM does; "
+                             "e.g. 0.5 is the 'project late' variant.")
+    parser.add_argument("--sweep_pflow_margin", nargs="+", type=float, metavar="M",
+                        help="pflow only. Project onto h + margin <= 0 (default 0).")
+    parser.add_argument("--sweep_ldf_penalty", nargs="+", type=float, metavar="W",
+                        help="ldf only. LDF's penalty_weight: the dynamics see "
+                             "g = W * h (default 5.0, their code's).")
+    parser.add_argument("--sweep_ldf_rescale", nargs="+", type=float, metavar="C",
+                        help="ldf only. Multiplier gain (default 1.0); 0 is LDF's "
+                             "pure-quadratic-penalty limit.")
+    parser.add_argument("--sweep_ldf_p", nargs="+", type=float, metavar="P",
+                        help="ldf only. Exponent of the 1/(1-s)^p multiplier gain "
+                             "(default 1, their inequality code's).")
+    parser.add_argument("--sweep_ldf_substeps", nargs="+", type=int, metavar="M",
+                        help="ldf only. Correction/multiplier substeps per sampling "
+                             "step (default 64; 16 was too coarse for the hard "
+                             "asks, see ldf_image).")
     parser.add_argument("--sweep_guidance_scale",nargs="+", type=float, metavar="CFG")
     parser.add_argument("--sweep_height",        nargs="+", type=int,   metavar="H_PX")
     parser.add_argument("--sweep_width",         nargs="+", type=int,   metavar="W_PX")
@@ -4395,6 +4667,22 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
 
     if args.reward == "style" and not args.style_ref_paths:
         parser.error("--reward style requires --style_ref_paths (one or more image paths)")
+
+    # 2026-10-09: the unconstrained baselines optimize the reward and nothing
+    # else; with --reward none they have no objective at all. Checked here, not
+    # in run_preflight, because the reward is a CLI-global rather than a
+    # RunConfig field. (The methods also raise on a graph-less reward, but only
+    # after the FLUX load.)
+    _baselines = sorted({c.control_type for c in configs} & UNCONSTRAINED_BASELINE_TYPES)
+    if args.reward == "none" and _baselines:
+        parser.error(f"--sweep_control_type {' '.join(_baselines)} needs a reward; "
+                     f"--reward none leaves it nothing to optimize")
+    # And the converse for the constraint-only baselines (2026-10-09): they take
+    # no reward, so one passed to them would be silently ignored.
+    _con_only = sorted({c.control_type for c in configs} & CONSTRAINT_ONLY_TYPES)
+    if args.reward != "none" and _con_only:
+        parser.error(f"--sweep_control_type {' '.join(_con_only)} is constraint-only "
+                     f"and would ignore --reward {args.reward}; use --reward none")
 
     # Validate every config's constraint settings BEFORE loading FLUX -- a bad
     # sweep should fail in seconds, not after a multi-minute model load. The

@@ -7,7 +7,7 @@ its lambda range hand-tuned for every reward/prompt combination.
 WHY THIS EXISTS (2026-09-16). `lam` means a different thing in each method --
 a Lagrange weight the optimiser solves against (ConicFlow), the same quantity via
 reg = N/(2*lam) (HardFlow), and an open-loop gain on the reward gradient
-(FMRG) -- and its useful range also moves with the reward's scale (switching
+(FMRG, gradient guidance and FlowChef) -- and its useful range also moves with the reward's scale (switching
 LPIPS -> ImageReward de-regularises by ~200x at fixed lam). A fixed grid such
 as {0.1 .. 10000} therefore spends most of its points where nothing happens:
 for ImageReward, ConicFlow is already 79% saturated at lam=1 and fully saturated by
@@ -201,7 +201,11 @@ def scale_prior(method: str, pr: dict, dr_max: float, N: int) -> float:
     with c ~ 1, which is what is used. FMRG's knee was ~2x ConicFlow's on both.
     """
     g = max(pr["grad_norm"], 1e-12)
-    c = {"conicflow": 1.0, "hardflow": 1.0, "fmrg": 2.0}[method]
+    # gg / flowchef take lam as a gain on grad r exactly as FMRG does (step =
+    # lam*dt/n_inner), so they start from FMRG's constant. Unmeasured priors --
+    # bracketing corrects them, as it does for the original three.
+    c = {"conicflow": 1.0, "hardflow": 1.0, "fmrg": 2.0,
+         "gg": 2.0, "flowchef": 2.0}[method]
     lam = c * dr_max / g
     return float(min(max(lam, LAM_ABS_MIN), LAM_ABS_MAX))
 
@@ -282,6 +286,11 @@ def make_cfg(method: str, a, lam: float) -> rs.RunConfig:
                            **common)
     elif method == "fmrg":
         cfg = rs.RunConfig(control_type="fmrg", n_inner=a.fmrg_n_opt, **common)
+    # Unconstrained baselines; see run_sweep.UNCONSTRAINED_BASELINE_TYPES.
+    elif method == "gg":
+        cfg = rs.RunConfig(control_type="gg", n_inner=a.gg_n_inner, **common)
+    elif method == "flowchef":
+        cfg = rs.RunConfig(control_type="flowchef", n_inner=a.flowchef_n_inner, **common)
     else:
         raise ValueError(method)
     rs._resolve_hardflow_reg(cfg)
@@ -785,7 +794,10 @@ def main():
     p.add_argument("--reward", required=True, choices=rs.REWARD_CHOICES)
     p.add_argument("--prompt", required=True)
     p.add_argument("--edit_prompt", default=None)
-    p.add_argument("--methods", nargs="+", default=["conicflow", "hardflow", "fmrg"], choices=["conicflow", "hardflow", "fmrg"])
+    # gg / flowchef are opt-in; the default stays the paper's three so
+    # existing invocations (auto_sweep.sh) are unchanged.
+    p.add_argument("--methods", nargs="+", default=["conicflow", "hardflow", "fmrg"],
+                   choices=["conicflow", "hardflow", "fmrg", "gg", "flowchef"])
     p.add_argument("--probe_N", type=int, default=4, help="cheap N used for range finding")
     p.add_argument("--target_N", type=int, default=10, help="N of the sweep you will run with the grid")
     p.add_argument("--n_grid", type=int, default=6, help="lambda points in the recommended grid")
@@ -851,6 +863,10 @@ def main():
     p.add_argument("--shared_min_ratio", type=float, default=1.4,
                    help="neighbouring shared-grid points closer than this ratio are merged")
     p.add_argument("--fmrg_n_opt", type=int, default=3)
+    # Baselines. Defaults: gg matches FMRG-J's 3 guidance steps, flowchef the
+    # FMRG authors' n_opt=5.
+    p.add_argument("--gg_n_inner", type=int, default=3)
+    p.add_argument("--flowchef_n_inner", type=int, default=5)
     p.add_argument("--reward_dtype", default="fp32", choices=list(rs._REWARD_DTYPES))
     p.add_argument("--fast", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--flux_device", default="cuda:0"); p.add_argument("--reward_device", default="cuda:0")

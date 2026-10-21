@@ -94,6 +94,38 @@
 #     n_inner -- but it is an expectation, not a measurement.
 # Re-derive from the probe's own peak_reserved_flux_gb and update HERE.
 
+# Unconstrained baselines gg / flowchef, added 2026-10-09 (see
+# run_sweep.UNCONSTRAINED_BASELINE_TYPES). MEASURED in
+# results/baselines_smoke_20261009 (N=8, 256^2, int8, one card, per-run logs'
+# "peak GPU mem" line), each arm on all three paper rewards:
+#
+#                 pickscore   clip      imagereward
+#     gg          16.29 GB    18.77 GB  15.38 GB
+#     flowchef    16.23 GB    18.77 GB  15.10 GB
+#
+# Worst config is CLIP for both, and it is the same 18.77 GB every other arm
+# shows with CLIP -- scorer-dominated, not method-dominated (each method holds
+# at most one transformer graph at a time). 18.77 GB = 17901 MiB; +3% and
+# rounded up: 18500 MiB for each. Peak is flat in n_inner (no graph is carried
+# across guidance steps), so the n_inner=1 CLIP rows hold.
+: "${NEED_MIB_GG:=18500}"
+: "${NEED_MIB_FLOWCHEF:=18500}"
+
+# Constrained baselines pflow / ldf, added 2026-10-11. MEASURED in
+# results/cb_smoke_20261011 (N=8, 256^2, int8), PickScore constraints, peak by
+# number of constraints (the constraint heads dominate, as for every arm):
+#
+#                 1          2          3
+#     pflow       16.37 GB   19.82 GB   22.78 GB
+#     ldf         16.23 GB   18.96 GB   21.92 GB
+#
+# Worst = three constraints: pflow 22.78 GB = 21725 MiB -> +3%, rounded up:
+# 22400; ldf 21.92 GB = 20905 MiB -> 21600. pflow sits ~0.6 GB above the
+# others because its projection holds one transformer graph while it takes a
+# backward per active constraint (retain_graph). Flat in max_iters / substeps.
+: "${NEED_MIB_PFLOW:=22400}"
+: "${NEED_MIB_LDF:=21600}"
+
 # ── Polling / retry ─────────────────────────────────────────────────────────
 # STABLE_POLLS: a single free-memory sample happily grabs a transient dip while
 # some other process is between allocations. FLUX spends ~90 s loading, so the
@@ -246,6 +278,10 @@ need_mib_for() {
     conicflow)       echo "$NEED_MIB_CONICFLOW" ;;
     hardflow)  echo "$NEED_MIB_HF" ;;
     fmrg)      echo "$NEED_MIB_FMRG" ;;
+    gg)        echo "$NEED_MIB_GG" ;;        # 2026-10-09, measured above
+    flowchef)  echo "$NEED_MIB_FLOWCHEF" ;;  # 2026-10-09, measured above
+    pflow)     echo "$NEED_MIB_PFLOW" ;;     # 2026-10-11, measured above
+    ldf)       echo "$NEED_MIB_LDF" ;;       # 2026-10-11, measured above
     *) gpu_die "need_mib_for: no measured gate for control_type '$1'. Measure it
        (run once on an empty card, read peak_reserved_flux_gb from summary.csv)
        and add it to gpu_lib.sh -- do not substitute another arm's number." ;;

@@ -11,6 +11,12 @@ step. `run_sweep.py` imports both from here:
     alongside this file), with the additions listed below.
   * `hardflow_image` — a port of HardFlow (Li, Alim & Azizan, TPAMI 2026) to
     FLUX latents, used as a baseline. It has no counterpart in `image_conicflow.py`.
+  * The baselines added for the rebuttal, none with a counterpart in
+    `image_conicflow.py`: `gradient_guidance_image` and `flowchef_image`
+    (unconstrained, control types `gg` / `flowchef`), and
+    `projected_flow_image` and `ldf_image` (constrained, control types
+    `pflow` / `ldf`). Each docstring names its source code and lists its
+    deviations from it.
 
 The remaining helpers `run_sweep.py` needs (`make_flux_wrappers`,
 `fmrg_j_image`, `trajectory_rewards`, `tune_sampler_speed`) are imported from
@@ -28,6 +34,9 @@ DIVERGENCES FROM `image_conicflow.py` (every other function here is identical to
      deviations from the authors' released implementation
      (`github.com/azizanlab/HardFlow`), the more important being the sign of
      the control-effort regularizer.
+  4. The baseline functions above and their helpers (`_baseline_step_fns`,
+     `_check_baseline_args`, `_require_graph`, `_gauss_newton_project`,
+     `_check_constrained_args`, `_endpoint_fn`) are new.
 
 Two sections:
   1. Core ConicFlow engine  (generic, works for any state shape)
@@ -1801,6 +1810,741 @@ def hardflow_image(
     # Opt-in 6th element so every existing 5-tuple call site is untouched --
     # same contract as receding_horizon_flow_control's return_dual_h.
     return out + (h_dual_hist,) if return_dual_h else out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Unconstrained baselines (2026-10-09): gradient guidance, FlowChef
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Added for the rebuttal, as two more rows of the unconstrained editing table
+# (Table 1). They sit next to hardflow_image and share fmrg_j_image's calling
+# convention and return contract, so run_sweep dispatches them as
+# --sweep_control_type gg / flowchef with no other change to the pipeline.
+# Neither takes constraints.
+#
+# ONE NOMINAL STEP FOR ALL OF THEM. Every method here advances with
+# z - dt * v_flux(z, t -> _t_next_advance(t)), the same rule as fmrg_j_image,
+# hardflow_image and make_flux_wrappers. run_sweep._ctrl_norms_from_traj books
+# control energy as the residual against exactly that step, so any other base
+# step (e.g. the originals' Euler step on the instantaneous velocity) would be
+# counted as control and inflate these arms' energy.
+#
+# WHAT lam MEANS: gg and flowchef take lam as a guidance GAIN, fmrg_j_image's
+# convention (step = lam * dt / n_inner).
+
+
+def _baseline_step_fns(sampler, N: int, sample_mode: str, guidance_scale: float):
+    """The advance rule and velocity call shared by the baselines (unconstrained and constrained).
+
+    Same ``_t_next_advance`` as fmrg_j_image / hardflow_image /
+    make_flux_wrappers' ``_t_next_for_mode``; see the block comment above for
+    why it must not differ.
+    """
+    if sample_mode not in ("flow_map2", "flow_map1", "flow_matching"):
+        raise ValueError(f"Unsupported sample_mode: {sample_mode}")
+    pe = sampler.cached_prompt_embeds
+    ppe = sampler.cached_pooled_prompt_embeds
+    dt_flux = 1.0 / N  # nominal spacing, only for flow_map2's lookahead
+
+    def _t_next_advance(t_cur: float) -> float:
+        if sample_mode == "flow_map2":
+            return max(0.0, t_cur - dt_flux)
+        elif sample_mode == "flow_map1":
+            return 0.0
+        return t_cur
+
+    def _v(z, t_cur: float, t_next: float):
+        return sampler.predict_vector(
+            z, t_cur,
+            prompt_embeds=pe, pooled_prompt_embeds=ppe,
+            guidance_scale=guidance_scale, t_next=t_next,
+        )
+
+    return _t_next_advance, _v
+
+
+def _check_baseline_args(name: str, r, N: int, n_inner: int, lam: float) -> None:
+    """Loud-fail guards shared by the three baselines (no silent no-ops)."""
+    if r is None:
+        raise ValueError(
+            f"{name}: r is None. This is an unconstrained baseline; without a "
+            f"reward there is nothing to optimize."
+        )
+    if N < 1:
+        raise ValueError(f"{name}: N must be >= 1, got {N}.")
+    if n_inner < 1:
+        raise ValueError(f"{name}: n_inner must be >= 1, got {n_inner}.")
+    if not lam > 0.0:
+        raise ValueError(
+            f"{name}: lam must be > 0, got {lam}. lam = 0 is a silent no-op "
+            f"(the uncontrolled rollout) and lam < 0 descends the reward."
+        )
+
+
+def _require_graph(name: str, obj: torch.Tensor) -> None:
+    # run_sweep's reward="none" closure returns z.new_zeros(B) with no graph, on
+    # which .backward() raises a generic "does not require grad". Say why.
+    if not obj.requires_grad:
+        raise ValueError(
+            f"{name}: the reward has no autograd graph (is --reward none?). "
+            f"This baseline needs a differentiable reward."
+        )
+
+
+def gradient_guidance_image(
+    sampler,
+    r: Callable[[torch.Tensor], torch.Tensor],
+    z0: torch.Tensor,
+    *,
+    N: int = 8,
+    n_inner: int = 3,
+    lam: float = 1.0,
+    guidance_scale: float = 3.5,
+    sample_mode: str = "flow_map2",
+    verbose: bool = False,
+    show_progress: bool = True,
+    low_memory: bool = True,
+) -> tuple:
+    """Gradient guidance: the DPS-style soft baseline HardFlow compares against.
+
+    Port of ``gradient_guidance_optimization`` / ``generate_traj_with_guidance``
+    from the HardFlow authors' code (github.com/azizanlab/HardFlow, branch
+    ``image``, commit ``016adb2``, ``utils/methods.py:210-241`` and
+    ``utils/method_utils.py:70-105``; local clone at /home/sungcho/HardFlow).
+    Their paper cites Guo et al. 2024, Pandey et al. 2025 and Feng et al. 2025
+    for it.
+
+    At each step k (FLUX t_k -> t_{k+1}), guide FIRST, then advance:
+
+        repeat n_inner times:
+            x_hat = z - t_k * v_flux(z, t_k -> t_k)       # one-step clean estimate
+            z    <- z + (dt / n_inner) * lam * grad_z r(x_hat)
+        z <- z - dt * v_flux(z, t_k -> t_next_advance)    # nominal step
+
+    The gradient goes through the transformer (the Jacobian of x_hat w.r.t.
+    z), as in theirs: one grad forward+backward per inner step, so
+    N * (n_inner + 1) transformer calls in all.
+
+    The clean estimate uses the INSTANTANEOUS velocity v(z, t -> t) of the
+    flow-map net, not the flow-map jump to t=0. That is the method as
+    published, and how the FMRG paper ran its DPS-type baselines on this same
+    LoRA; with the jump it would be fmrg_j_image with guide and advance swapped.
+
+    DEVIATIONS from their code, each forced by our pipeline or by comparability:
+      * Step size.  Theirs is a raw lr (2.5) on a cost; here the step is
+        lam * dt / n_inner on the reward (fmrg_j_image's gain convention), so
+        lam is the frontier axis for this arm as it is for FMRG. A constant
+        re-parametrization; the update itself is unchanged.
+      * Base step.  Theirs is an Euler step on the instantaneous velocity on a
+        100-step grid; here it is the shared nominal step (see the block
+        comment above) on our N-step grid.
+      * Reward.  Theirs is -CLIP averaged over 20 DiffAugment copies plus an
+        LPIPS hinge penalty; here it is our reward closure, unaugmented. The
+        LPIPS penalty was their constraint, which an unconstrained baseline
+        does not have.
+
+    Returns:
+        z_N:      final latent,                              (B, C, H_l, W_l).
+        traj:     trajectory,                                (N+1, B, C, H_l, W_l).
+        controls: guidance displacement at each step, before the advance,
+                                                             (N, B, C, H_l, W_l).
+                  run_sweep recomputes energy from traj, not from this.
+    """
+    _check_baseline_args("gradient_guidance_image", r, N, n_inner, lam)
+    _t_next_advance, _v = _baseline_step_fns(sampler, N, sample_mode, guidance_scale)
+    device, dtype = z0.device, z0.dtype
+    # Same grid construction as fmrg_j_image / hardflow_image; dt is read off it.
+    ts_flux = torch.linspace(1.0, 0.0, N + 1, device=device, dtype=dtype)
+
+    z = z0.detach().clone()
+    traj = [z.clone()]
+    controls = []
+    pbar = tqdm(total=N * n_inner, desc="GG", disable=not show_progress)
+
+    for k in range(N):
+        t_cur = ts_flux[k].item()
+        t_next = ts_flux[k + 1].item()
+        dt = t_cur - t_next
+        step = (dt / n_inner) * lam
+
+        z_before = z.detach().clone()
+        for _ in range(n_inner):
+            z_in = z.detach().requires_grad_(True)
+            x_hat = z_in - t_cur * _v(z_in, t_cur, t_cur)
+            r_val = r(x_hat)
+            obj = r_val.sum()
+            _require_graph("gradient_guidance_image", obj)
+            # .backward() rather than autograd.grad(): see fmrg_j_image.
+            obj.backward()
+            g = z_in.grad
+            with torch.no_grad():
+                z = z.detach() + step * g
+                if pbar is not None:
+                    pbar.set_postfix(_pbar_postfix(
+                        k + 1, N, r_val.detach().mean().item(), _flat_norm_mean(g),
+                    ))
+                    pbar.update(1)
+            del z_in, x_hat, r_val, obj, g
+
+        with torch.no_grad():
+            controls.append((z - z_before).detach().clone())
+            z = z - dt * _v(z, t_cur, _t_next_advance(t_cur))
+        traj.append(z.detach().clone())
+
+        if verbose:
+            print(f"step {k+1:3d}/{N}  |guidance| = {_flat_norm_mean(controls[-1]):.4e}")
+        del z_before
+        _maybe_free_memory(low_memory)
+
+    if pbar is not None:
+        pbar.close()
+    return z.detach(), torch.stack(traj, dim=0), torch.stack(controls, dim=0)
+
+
+def flowchef_image(
+    sampler,
+    r: Callable[[torch.Tensor], torch.Tensor],
+    z0: torch.Tensor,
+    *,
+    N: int = 8,
+    n_inner: int = 5,
+    lam: float = 1.0,
+    guidance_scale: float = 3.5,
+    sample_mode: str = "flow_map2",
+    verbose: bool = False,
+    show_progress: bool = True,
+    low_memory: bool = True,
+) -> tuple:
+    """FlowChef (Patel et al., ICCV 2025): the baseline the FMRG paper uses.
+
+    Port of ``FluxFlowChef.sample_flowchef`` / ``data_consistency_flowchef``,
+    the FMRG authors' port of FlowChef to this same FLUX flow-map LoRA
+    (/home/shervink/flow_matching/fmrg/fluxfm_sampler_ip.py:736-828), with the
+    inverse-problem data-consistency loss replaced by the reward.
+
+    At each step k (FLUX t_k -> t_{k+1}):
+
+        x_hat0 = z - t_k * v_flux(z, t_k -> t_k)                (no grad)
+        repeat n_inner times:
+            x_hat <- x_hat + (dt / n_inner) * lam * grad_{x_hat} r(x_hat)
+        z <- [z - dt * v_flux(z, t_k -> t_next_advance)] + (x_hat - x_hat0)
+
+    "Gradient skipping": the gradient is taken w.r.t. the clean estimate and
+    flows through the VAE decoder and the reward only, never the transformer,
+    and the resulting displacement is added to the state with weight 1. That
+    makes this the cheapest arm: 2 no-grad transformer calls per step (1 if
+    sample_mode == "flow_matching", where the two velocities coincide).
+
+    DEVIATIONS from the FMRG authors' port:
+      * Step size.  Theirs is a constant stepsize (FMRG paper: eta = 1-50 for
+        inverse problems); here it is lam * dt / n_inner, constant within a run
+        (fmrg_j_image's gain convention), so lam is the frontier axis.
+      * Base step.  Theirs is an Euler step on the instantaneous velocity on
+        FLUX's mu-shifted sigma schedule; here it is the shared nominal step on
+        our uniform grid (see the block comment above).
+      * Objective.  Theirs minimizes ||A^+(y) - A^+(A x)||_2 on decode(x_hat);
+        here it ascends the reward closure, which decodes internally.
+
+    Returns:
+        z_N:      final latent,                              (B, C, H_l, W_l).
+        traj:     trajectory,                                (N+1, B, C, H_l, W_l).
+        controls: x_hat - x_hat0 per step, which is exactly the residual against
+                  the nominal step that run_sweep books as control energy.
+    """
+    _check_baseline_args("flowchef_image", r, N, n_inner, lam)
+    _t_next_advance, _v = _baseline_step_fns(sampler, N, sample_mode, guidance_scale)
+    device, dtype = z0.device, z0.dtype
+    ts_flux = torch.linspace(1.0, 0.0, N + 1, device=device, dtype=dtype)
+
+    z = z0.detach().clone()
+    traj = [z.clone()]
+    controls = []
+    pbar = tqdm(total=N * n_inner, desc="FlowChef", disable=not show_progress)
+
+    for k in range(N):
+        t_cur = ts_flux[k].item()
+        t_next = ts_flux[k + 1].item()
+        dt = t_cur - t_next
+        step = (dt / n_inner) * lam
+
+        with torch.no_grad():
+            v_inst = _v(z, t_cur, t_cur)
+            x_hat0 = z - t_cur * v_inst
+            t_adv = _t_next_advance(t_cur)
+            v_adv = v_inst if t_adv == t_cur else _v(z, t_cur, t_adv)
+            z_nom = z - dt * v_adv
+            del v_inst, v_adv
+
+        x_hat = x_hat0.clone()
+        for _ in range(n_inner):
+            x_in = x_hat.detach().requires_grad_(True)
+            r_val = r(x_in)
+            obj = r_val.sum()
+            _require_graph("flowchef_image", obj)
+            obj.backward()
+            g = x_in.grad
+            with torch.no_grad():
+                x_hat = x_hat.detach() + step * g
+                if pbar is not None:
+                    pbar.set_postfix(_pbar_postfix(
+                        k + 1, N, r_val.detach().mean().item(), _flat_norm_mean(g),
+                    ))
+                    pbar.update(1)
+            del x_in, r_val, obj, g
+
+        with torch.no_grad():
+            delta = x_hat - x_hat0
+            controls.append(delta.detach().clone())
+            z = z_nom + delta
+        traj.append(z.detach().clone())
+
+        if verbose:
+            print(f"step {k+1:3d}/{N}  |delta x_hat| = {_flat_norm_mean(delta):.4e}")
+        del x_hat0, x_hat, z_nom, delta
+        _maybe_free_memory(low_memory)
+
+    if pbar is not None:
+        pbar.close()
+    return z.detach(), torch.stack(traj, dim=0), torch.stack(controls, dim=0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Constrained baselines (2026-10-09): Projected Flow (PDM-style), LDF
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# For the rebuttal's constrained comparison (Figure 3), one representative from
+# each family in the paper's related work: projection (Christopher et al.,
+# NeurIPS'24 "Projected Diffusion Models"; Zampini et al., NeurIPS'25 for latent
+# models) and dual dynamics (Kurtz & Davydov 2026, "Lagrangian Dual Flows").
+# run_sweep dispatches them as control types pflow / ldf, constraint-only
+# (--reward none), with hardflow_image's return contract so mu traces, h traces,
+# energy and feasibility need no new plumbing.
+#
+# WHERE THE CONSTRAINT IS EVALUATED. h(z) scores the image decoded from z, so
+# on a noisy latent it is meaningless (Zampini et al. had to train per-noise-
+# level classifiers for exactly this). Both methods evaluate h at the flow-map
+# endpoint prediction X(z, t) = z - t * v(z, t -> 0) -- the paper's definition
+# of the constraint, and what ConicFlow and HardFlow do. At the last step t = 0
+# and X(z) = z, so the final correction acts on the actual output latent.
+#
+# Same nominal step as every other arm (_baseline_step_fns), so the
+# displacement each method adds on top of it is exactly the residual
+# run_sweep._ctrl_norms_from_traj books as control energy.
+
+
+def _gauss_newton_project(
+    z: torch.Tensor,
+    h_of: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    max_iters: int,
+    margin: float = 0.0,
+    eps_reg: float = 1e-10,
+) -> tuple:
+    """Project each sample of ``z`` onto {h_of(z) + margin <= 0} by Gauss-Newton.
+
+    Each iteration linearizes the VIOLATED constraints and takes the
+    minimum-norm step onto their linearization,
+
+        z <- z - J^T (J J^T + eps I)^{-1} (h + margin),     rows of J = active constraints,
+
+    i.e. the exact Euclidean projection onto those hyperplanes when h is
+    linear; for nonlinear h it is iterated. Satisfied constraints are left out
+    of the step (LDF's ``project_batch(active_only=True)``, the PyTorch port of
+    which this is; cfm/core/projection.py in vincekurtz/constrained_flow_matching).
+    Stops when every constraint satisfies h + margin <= 0, or after
+    ``max_iters`` updates -- it does NOT clamp or fake feasibility, it reports.
+
+    The Jacobian is formed one backward pass per active constraint off one
+    forward (retain_graph between them), so it is exact through whatever
+    ``h_of`` differentiates -- for projected_flow_image that includes the
+    flow-map jump, i.e. the transformer.
+
+    Returns:
+        z_proj:    projected latent, same dtype as z.
+        h_last:    (B, C) h_of(z_proj) as last evaluated, fp32/fp64, detached.
+        n_updates: int, Gauss-Newton updates taken.
+        converged: (B,) bool, every constraint satisfied at the end.
+    """
+    if max_iters < 0:
+        raise ValueError(f"_gauss_newton_project: max_iters must be >= 0, got {max_iters}.")
+    cdtype = torch.promote_types(z.dtype, torch.float32)   # fp64 stays fp64 (tests)
+    # FP32 MASTER COPY (2026-10-11). The iterate is accumulated in cdtype and
+    # only rounded to z.dtype for evaluation. Found on the first GPU smoke:
+    # with the iterate held in bf16, the last corrections (~0.002 per latent
+    # element, below bf16's spacing of 0.004-0.008 at |z| ~ 0.5-2) were rounded
+    # away, so every step stalled at the 10-update cap a hair short of the
+    # boundary (final h +0.04..+0.05 on 3 of 4 cells). With the master copy the
+    # sub-spacing parts of successive updates add up instead of vanishing.
+    z_master = z.detach().to(cdtype).clone()
+    B = z.shape[0]
+    for it in range(max_iters + 1):
+        z = z_master.to(z.dtype)            # the point actually evaluated / returned
+        z_in = z.detach().requires_grad_(True)
+        hval = h_of(z_in)
+        if hval.dim() == 1:
+            hval = hval.unsqueeze(-1)
+        hm = hval + margin
+        viol = (hm > 0).detach()
+        h_last = hval.detach().to(cdtype)
+        if not viol.any() or it == max_iters:
+            return z.detach(), h_last, it, ~viol.any(dim=1)
+        active_c = [c for c in range(hm.shape[1]) if bool(viol[:, c].any())]
+        rows = []
+        for j, c in enumerate(active_c):
+            z_in.grad = None
+            # .backward() rather than autograd.grad(): see fmrg_j_image. Summing
+            # over the batch gives each sample its own gradient (they are
+            # independent), so one pass per constraint covers every sample.
+            hm[:, c].sum().backward(retain_graph=(j < len(active_c) - 1))
+            rows.append(z_in.grad.detach().to(cdtype).flatten(1))       # (B, D)
+        J_all = torch.stack(rows, dim=1)                                  # (B, a, D)
+        r_all = hm.detach().to(cdtype)[:, active_c]                       # (B, a)
+        with torch.no_grad():
+            for b in range(B):
+                sel = viol[b, active_c]
+                if not bool(sel.any()):
+                    continue
+                J = J_all[b][sel]                                         # (a_b, D)
+                r = r_all[b][sel]                                         # (a_b,)
+                G = J @ J.T + eps_reg * torch.eye(J.shape[0], dtype=cdtype, device=J.device)
+                delta = J.T @ torch.linalg.solve(G, r)
+                # ROUNDING-AWARE STEP LENGTH (2026-10-11). The fp32 master alone
+                # did not fix the smoke's stall: every element starts ON a bf16
+                # value, so it changes only once it moves half a bf16 spacing,
+                # and a min-norm correction for a small violation spreads ~5e-5
+                # per element over 16k elements -- nothing rounds differently and
+                # the evaluated point never moves. So scale the step up (x1.25)
+                # until the step AS IT WILL BE ROUNDED is predicted, to first
+                # order with the J already in hand, to remove >= 95% of every
+                # active violation. No extra model evaluations; overshoot at most
+                # ~25% of the realized step. In fp32/fp64 the rounding is exact,
+                # s = 1, and this is the plain Gauss-Newton step (CPU tests).
+                base = z_master[b]
+                cur = z[b].to(cdtype).flatten()
+                dflat = delta.view(-1)
+                s = 1.0
+                for _ in range(64):
+                    real = (base.flatten() - s * dflat).to(z.dtype).to(cdtype) - cur
+                    if bool((J @ real <= -0.95 * r).all()):
+                        break
+                    s *= 1.25
+                z_master[b] = base - s * delta.view(base.shape)
+        del z_in, hval, hm, J_all, rows
+    raise AssertionError("unreachable")
+
+
+def _check_constrained_args(name: str, h, N: int) -> None:
+    if h is None:
+        raise ValueError(
+            f"{name}: h is None. This is a constraint-only baseline; with no "
+            f"constraint it is the uncontrolled rollout."
+        )
+    if N < 1:
+        raise ValueError(f"{name}: N must be >= 1, got {N}.")
+
+
+def _endpoint_fn(_v):
+    """X(z, t) = z - t * v(z, t -> 0): the flow-map jump to data, differentiable
+    iff z requires grad; X(z, 0) = z (no transformer call at the last step)."""
+    def endpoint(z, t: float):
+        if t <= 0.0:
+            return z
+        return z - t * _v(z, t, 0.0)
+    return endpoint
+
+
+def projected_flow_image(
+    sampler,
+    z0: torch.Tensor,
+    *,
+    h: Callable[[torch.Tensor], torch.Tensor],
+    N: int = 8,
+    max_iters: int = 10,
+    final_iters: int = 50,
+    activation_frac: float = 0.0,
+    margin: float = 0.0,
+    guidance_scale: float = 3.5,
+    sample_mode: str = "flow_map2",
+    verbose: bool = False,
+    show_progress: bool = True,
+    low_memory: bool = True,
+    return_dual_h: bool = False,
+):
+    """Projected Flow: PDM-style per-step projection, adapted to FLUX latents.
+
+    Projected Diffusion Models (Christopher, Baek & Fioretto, NeurIPS 2024;
+    github.com/RAISELab-atUVA/Projected-Diffusion) follow every sampling update
+    with a projection of the iterate onto the feasible set; Zampini et al.
+    (NeurIPS 2025) carry that to latent diffusion with constraints on the
+    decoded image. Here, after each nominal step to t_{k+1}, the STATE is
+    projected:
+
+        z_{k+1} = argmin_z ||z - z_nom||^2   s.t.   h(X(z, t_{k+1})) <= 0,
+
+    solved by _gauss_newton_project with the Jacobian taken THROUGH the
+    flow-map jump X (so one transformer backward per active constraint per
+    iteration), until every constraint holds or ``max_iters`` is reached.
+    The LAST step's projection (t_next = 0, so X(z) = z: decoder and scorer
+    only, no transformer, ~0.2 s per update) gets its own, larger cap
+    ``final_iters`` (2026-10-11): it is the one that acts on the output image,
+    and on the first GPU smoke a hard ask (+9.9 PickScore) was still converging
+    when the shared cap of 10 cut it off.
+
+    Why the state and the true Jacobian. With no reward, HardFlow's per-step
+    problem is already "move the predicted ENDPOINT as little as possible until
+    it is feasible, then map back" (hardflow_image). Projecting the endpoint
+    with dX/dz ~ I would make this a re-solve of HardFlow's subproblem; the
+    PDM-faithful version projects the iterate, which needs the true Jacobian.
+
+    DEVIATIONS from PDM / Zampini et al. (each forced by the setting):
+      * The constraint is evaluated at the endpoint prediction X(z, t), not on
+        the iterate's own decode (meaningless on a noisy latent; Zampini et al.
+        trained noise-aware classifiers instead, which we do not have).
+      * The projection is an iterated Gauss-Newton min-norm step (exact for
+        linear constraints), not their task-specific projectors (closed-form
+        porosity, top-k, PCA-cluster steering) -- ours is generic in h.
+      * Deterministic flow-map steps, not projected Langevin.
+    ``activation_frac`` > 0 projects only from that fraction of the trajectory
+    on ("project late", as in PhysDiff / DDAT); the default 0 projects every
+    step, as PDM does. A step that hits ``max_iters`` still infeasible is
+    reported (verbose) and the run continues; feasibility is judged on the
+    final image as for every arm, never assumed.
+
+    Returns the same tuple as hardflow_image: (z_N, traj (N+1,...), controls
+    (N,...) = projection displacement / dt, mu_final=None, mu_hist=None), plus
+    h_dual_hist (N, B, C) = h at the projected endpoint after each step when
+    return_dual_h.
+    """
+    _check_constrained_args("projected_flow_image", h, N)
+    if max_iters < 1:
+        raise ValueError(f"projected_flow_image: max_iters must be >= 1, got {max_iters}.")
+    if final_iters < 1:
+        raise ValueError(f"projected_flow_image: final_iters must be >= 1, got {final_iters}.")
+    if not 0.0 <= activation_frac < 1.0:
+        raise ValueError(
+            f"projected_flow_image: activation_frac must be in [0, 1), got "
+            f"{activation_frac}. At 1.0 no step is ever projected.")
+    if margin < 0.0:
+        raise ValueError(f"projected_flow_image: margin must be >= 0, got {margin}.")
+    _t_next_advance, _v = _baseline_step_fns(sampler, N, sample_mode, guidance_scale)
+    endpoint = _endpoint_fn(_v)
+    device, dtype = z0.device, z0.dtype
+    ts_flux = torch.linspace(1.0, 0.0, N + 1, device=device, dtype=dtype)
+    activation_step = int(activation_frac * N)
+
+    z = z0.detach().clone()
+    traj = [z.clone()]
+    controls, h_hist = [], []
+    n_failed = 0
+    pbar = tqdm(total=N, desc="ProjectedFlow", disable=not show_progress)
+
+    for k in range(N):
+        t_cur = ts_flux[k].item()
+        t_next = ts_flux[k + 1].item()
+        dt = t_cur - t_next
+        with torch.no_grad():
+            z_nom = z - dt * _v(z, t_cur, _t_next_advance(t_cur))
+
+        def h_of(zz, _t=t_next):
+            return h(endpoint(zz, _t))
+
+        if k >= activation_step:
+            z, h_after, n_upd, conv = _gauss_newton_project(
+                z_nom, h_of, max_iters=(final_iters if t_next <= 0.0 else max_iters),
+                margin=margin)
+            if not bool(conv.all()):
+                n_failed += 1
+        else:
+            with torch.no_grad():
+                h_after = h_of(z_nom)
+                if h_after.dim() == 1:
+                    h_after = h_after.unsqueeze(-1)
+            z, n_upd, conv = z_nom, 0, None
+        with torch.no_grad():
+            controls.append(((z - z_nom) / dt).detach().clone())
+        traj.append(z.detach().clone())
+        h_hist.append(h_after.detach().float())
+
+        if pbar is not None:
+            pbar.set_postfix({"step": f"{k + 1}/{N}", "GN": n_upd,
+                              "h_max": f"{h_after.max().item():+.3e}"})
+            pbar.update(1)
+        if verbose:
+            state = ("not projected" if conv is None else
+                     "feasible" if bool(conv.all()) else "STILL INFEASIBLE")
+            print(f"step {k+1:3d}/{N}  GN updates={n_upd:2d}  "
+                  f"h_max(endpoint)={h_after.max().item():+.4e}  {state}  "
+                  f"|dz|={_flat_norm_mean(z - z_nom):.4e}")
+        del z_nom
+        _maybe_free_memory(low_memory)
+
+    if pbar is not None:
+        pbar.close()
+    if n_failed and verbose:
+        print(f"projected_flow_image: {n_failed}/{N - activation_step} projected steps "
+              f"ended with a constraint still violated at their update cap "
+              f"({max_iters}, {final_iters} on the last step).")
+    out = (z.detach(), torch.stack(traj, dim=0), torch.stack(controls, dim=0), None, None)
+    return out + (torch.stack(h_hist, dim=0),) if return_dual_h else out
+
+
+def ldf_image(
+    sampler,
+    z0: torch.Tensor,
+    *,
+    h: Callable[[torch.Tensor], torch.Tensor],
+    N: int = 8,
+    penalty_weight: float = 5.0,
+    rescale: float = 1.0,
+    p: float = 1.0,
+    substeps: int = 64,
+    lam_init: float = 0.0,
+    guidance_scale: float = 3.5,
+    sample_mode: str = "flow_map2",
+    verbose: bool = False,
+    show_progress: bool = True,
+    low_memory: bool = True,
+    return_dual_h: bool = False,
+):
+    """Lagrangian Dual Flows (Kurtz & Davydov 2026), adapted to FLUX latents.
+
+    Port of the inequality, closed-form-slack flow in the authors' code
+    (github.com/vincekurtz/constrained_flow_matching, cfm/methods/ldf.py,
+    ``_inequality_closed_form_flow``; JAX there). With g_w = penalty_weight * h
+    (their ``wrap_constraint`` weighting) and LDF time s in [0, 1] (s = 1 - t_flux):
+
+        xdot      = v(x, s) - grad g_w(x)^T [ 1(g_w > -lam) * (lam + g) ],
+        lamdot    = rescale * g / (1 - s)^p,          g = max(g_w, -lam).
+
+    The multiplier is a state that grows while the constraint is violated, with
+    a gain that rises toward the end of sampling -- a continuous dual flow with
+    no look-ahead, which is the contrast with ConicFlow's receding-horizon
+    primal-dual scheme.
+
+    SPLIT-STEP DISCRETIZATION (the main adaptation). Their solver takes ~100
+    Euler steps of the whole ODE. We keep the shared nominal flow-map step for
+    the v part, then integrate the correction and multiplier ODE over the same
+    interval in ``substeps`` explicit steps, at the substep midpoints (so the
+    1/(1-s)^p gain is never evaluated at its singularity s = 1). Eight plain
+    steps would overshoot near the end.
+    Default 64 (2026-10-11 GPU smoke): at 16 the hard asks (m = 1.5) failed
+    (+0.71) or cost 3x the energy, and raising the gain instead made the
+    explicit substeps diverge (energy 7e9 at gain 10); at 64, gain 1 was
+    feasible on both at 2-3x lower energy. The
+    multiplier step is projected onto lam >= 0, as in ConicFlow's and HardFlow's
+    dual updates: the continuous dynamics keep lam >= 0 by themselves, and the
+    projection only removes Euler overshoot at the large late-time gains.
+
+    DEVIATIONS from the authors' code:
+      * The constraint is evaluated at the endpoint prediction X(x, t) (see the
+        block comment), with "gradient skipping": grad_x g_w(X(x)) is taken as
+        grad_X g_w(X), i.e. dX/dx ~ I, and X is moved with x within a step. So
+        each substep costs a decode + scorer forward/backward, no transformer.
+        At the last step X(x) = x and this is exact.
+      * Split-step integration as above (theirs: monolithic Euler, dt = 0.01,
+        returning the state at t = 1 - dt; here the whole interval is
+        integrated, at midpoints).
+      * p defaults to 1, their inequality code's (fixed) exponent.
+      * Their optional final Gauss-Newton projection (num_projection_iters,
+        default 0) is not used: it would make any method trivially feasible.
+
+    Returns the same tuple as hardflow_image: (z_N, traj, controls = correction
+    displacement / dt, mu_final = lam (B, C), mu_hist (N, B, C) = lam after each
+    step), plus h_dual_hist (N, B, C) = h at the endpoint after each step's last
+    substep when return_dual_h.
+    """
+    _check_constrained_args("ldf_image", h, N)
+    if substeps < 1:
+        raise ValueError(f"ldf_image: substeps must be >= 1, got {substeps}.")
+    if not penalty_weight > 0.0:
+        raise ValueError(f"ldf_image: penalty_weight must be > 0, got {penalty_weight}.")
+    if rescale < 0.0:
+        raise ValueError(
+            f"ldf_image: rescale must be >= 0, got {rescale} (0 is LDF's pure "
+            f"quadratic-penalty limit; negative would push the multiplier down "
+            f"while the constraint is violated).")
+    if not p > 0.0:
+        raise ValueError(f"ldf_image: p must be > 0, got {p}.")
+    if lam_init < 0.0:
+        raise ValueError(f"ldf_image: lam_init must be >= 0, got {lam_init}.")
+    _t_next_advance, _v = _baseline_step_fns(sampler, N, sample_mode, guidance_scale)
+    endpoint = _endpoint_fn(_v)
+    device, dtype = z0.device, z0.dtype
+    B = z0.shape[0]
+    ts_flux = torch.linspace(1.0, 0.0, N + 1, device=device, dtype=dtype)
+    EPS = 1e-8                                   # their INEQUALITY_EPS
+
+    with torch.no_grad():
+        h0 = h(z0)
+    C = h0.shape[-1] if h0.dim() > 1 else 1
+    del h0
+    lam = torch.full((B, C), float(lam_init), device=device, dtype=torch.float32)
+
+    z = z0.detach().clone()
+    traj = [z.clone()]
+    controls, lam_hist, h_hist = [], [], []
+    pbar = tqdm(total=N, desc="LDF", disable=not show_progress)
+
+    for k in range(N):
+        t_cur = ts_flux[k].item()
+        t_next = ts_flux[k + 1].item()
+        dt = t_cur - t_next
+        ds = dt / substeps
+        with torch.no_grad():
+            z_nom = z - dt * _v(z, t_cur, _t_next_advance(t_cur))
+            x_hat = endpoint(z_nom, t_next)
+        z_new = z_nom.clone()
+        h_last = None
+        for j in range(substeps):
+            t_mid = t_cur - (j + 0.5) * ds             # flux time; 1 - s_mid
+            x_in = x_hat.detach().requires_grad_(True)
+            hval = h(x_in)
+            if hval.dim() == 1:
+                hval = hval.unsqueeze(-1)
+            g_w = penalty_weight * hval
+            with torch.no_grad():
+                g_w_d = g_w.detach().float()
+                g = torch.maximum(g_w_d, -lam)
+                wts = (g_w_d > -lam).float() * (lam + g)        # (B, C), detached
+                h_last = hval.detach().float()
+            if bool((wts != 0).any()):
+                # One backward for all constraints: with the weights detached,
+                # grad of sum_c wts_c * g_w,c is grad g_w^T wts.
+                (wts.to(g_w.dtype) * g_w).sum().backward()
+                with torch.no_grad():
+                    delta = -ds * x_in.grad
+                    x_hat = x_hat + delta
+                    z_new = z_new + delta
+            with torch.no_grad():
+                lam = (lam + ds * rescale * g / (t_mid + EPS) ** p).clamp_min(0.0)
+            del x_in, hval, g_w
+            # Static from here on: nothing active and nothing for lam to do
+            # (g == 0 means lam = 0 with h <= 0), so the remaining substeps
+            # would recompute the same values.
+            if not bool((wts != 0).any()) and bool((g == 0).all()):
+                break
+        with torch.no_grad():
+            controls.append(((z_new - z_nom) / dt).detach().clone())
+        z = z_new.detach()
+        traj.append(z.clone())
+        lam_hist.append(lam.clone())
+        h_hist.append(h_last)
+
+        if pbar is not None:
+            pbar.set_postfix({"step": f"{k + 1}/{N}", "h_max": f"{h_last.max().item():+.3e}",
+                              "lam_max": f"{lam.max().item():.3e}"})
+            pbar.update(1)
+        if verbose:
+            print(f"step {k+1:3d}/{N}  h_max(endpoint)={h_last.max().item():+.4e}  "
+                  f"lam={lam.mean(0).tolist()}  |dz|={_flat_norm_mean(z - z_nom):.4e}")
+        del z_nom, z_new, x_hat
+        _maybe_free_memory(low_memory)
+
+    if pbar is not None:
+        pbar.close()
+    out = (z, torch.stack(traj, dim=0), torch.stack(controls, dim=0),
+           lam, torch.stack(lam_hist, dim=0))
+    return out + (torch.stack(h_hist, dim=0),) if return_dual_h else out
 
 
 def trajectory_rewards(
