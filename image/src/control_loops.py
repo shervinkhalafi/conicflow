@@ -1910,7 +1910,7 @@ def gradient_guidance_image(
     Port of ``gradient_guidance_optimization`` / ``generate_traj_with_guidance``
     from the HardFlow authors' code (github.com/azizanlab/HardFlow, branch
     ``image``, commit ``016adb2``, ``utils/methods.py:210-241`` and
-    ``utils/method_utils.py:70-105``; local clone at /home/sungcho/HardFlow).
+    ``utils/method_utils.py:70-105``).
     Their paper cites Guo et al. 2024, Pandey et al. 2025 and Feng et al. 2025
     for it.
 
@@ -2019,7 +2019,7 @@ def flowchef_image(
 
     Port of ``FluxFlowChef.sample_flowchef`` / ``data_consistency_flowchef``,
     the FMRG authors' port of FlowChef to this same FLUX flow-map LoRA
-    (/home/shervink/flow_matching/fmrg/fluxfm_sampler_ip.py:736-828), with the
+    (vendored here as fmrg/fluxfm_sampler_ip.py:736-828), with the
     inverse-problem data-consistency loss replaced by the reward.
 
     At each step k (FLUX t_k -> t_{k+1}):

@@ -95,8 +95,8 @@
 # Re-derive from the probe's own peak_reserved_flux_gb and update HERE.
 
 # Unconstrained baselines gg / flowchef, added 2026-10-09 (see
-# run_sweep.UNCONSTRAINED_BASELINE_TYPES). MEASURED in
-# results/baselines_smoke_20261009 (N=8, 256^2, int8, one card, per-run logs'
+# run_sweep.UNCONSTRAINED_BASELINE_TYPES). MEASURED on the 2026-10-09 smoke
+# runs (N=8, 256^2, int8, one card, per-run logs'
 # "peak GPU mem" line), each arm on all three paper rewards:
 #
 #                 pickscore   clip      imagereward
@@ -111,8 +111,8 @@
 : "${NEED_MIB_GG:=18500}"
 : "${NEED_MIB_FLOWCHEF:=18500}"
 
-# Constrained baselines pflow / ldf, added 2026-10-11. MEASURED in
-# results/cb_smoke_20261011 (N=8, 256^2, int8), PickScore constraints, peak by
+# Constrained baselines pflow / ldf, added 2026-10-11. MEASURED on the
+# 2026-10-11 smoke runs (N=8, 256^2, int8), PickScore constraints, peak by
 # number of constraints (the constraint heads dominate, as for every arm):
 #
 #                 1          2          3

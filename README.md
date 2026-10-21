@@ -17,7 +17,9 @@ This repository contains the code for every experiment in the paper: a
 two-dimensional flow map (two moons), and FLUX.1-dev image editing, both
 unconstrained and under one to three PickScore constraints. ConicFlow is
 compared against [FMRG](https://github.com/jrrhuang/fmrg) and
-[HardFlow](https://github.com/azizanlab/HardFlow).
+[HardFlow](https://github.com/azizanlab/HardFlow), and against four further
+baselines added for the rebuttal: gradient guidance and FlowChef
+(unconstrained), Projected Flow (PDM) and Lagrangian Dual Flows (constrained).
 
 <p align="center">
   <img src="assets/unconstrained_edits.png" width="49%" alt="Unconstrained edits at matched reward">
@@ -142,7 +144,10 @@ an `uncontrolled | ConicFlow | HardFlow` comparison figure.
 ## Reproducing the paper
 
 Figure and table numbers below refer to
-[arXiv:2610.14307v1](https://arxiv.org/abs/2610.14307v1).
+[arXiv:2610.14307v1](https://arxiv.org/abs/2610.14307v1). The repository is
+kept in step with the paper as it is revised, so it also contains the rebuttal
+baselines (the last two rows of the table) and labels the constrained image
+panels with in-run feasibility (see `image/scripts/constrained/README.md`).
 
 Every experiment has a launcher that runs the paper's exact configurations on
 the frozen λ grids in `image/data/grids/`, and analysis scripts that turn the
@@ -157,6 +162,8 @@ stopped, and accept `--dry_run` to print their commands.
 | Fig. 2 (right) rows 2–3, Fig. 5 rows u01–u04 | [`image/scripts/ablation/run_ablation.sh`](image/scripts/ablation/README.md) `--arms core --tags "ed1 ed2 ed3 ed4" --seeds "317 1289"` (also part of `--preset arxiv_v1`) | ~5 GPU-h | `fig2_image_rows.py` |
 | Fig. 3, Figs. 6–8 | [`image/scripts/constrained/run_suite.sh`](image/scripts/constrained/README.md) (`suite`, then `triple`) | ~12 GPU-h | `../src/plot_constrained_suite.py`, `constrained_image_rows.py`, `constrained_appendix_grids.py` |
 | Appendix D, Tables 7–9: planning horizon, matched wall clock, evaluation point | [`image/scripts/ablation/run_ablation.sh`](image/scripts/ablation/README.md) `--preset arxiv_v1` | ~20 GPU-h | `abl_tables_arxiv_v1.py` |
+| Rebuttal: gradient guidance and FlowChef rows of Table 1 (and their image-row cells) | [`image/scripts/unconstrained/run_table1.sh`](image/scripts/unconstrained/README.md#baselines) with `METHODS="gg flowchef"` (+ `JOBS=image_rows_jobs.tsv`) | ~3.7 GPU-h | `table1_breakdown.py --baselines` |
+| Rebuttal: Projected Flow and LDF in Fig. 3 and Figs. 6–8 | [`image/scripts/constrained/run_suite.sh`](image/scripts/constrained/README.md#baselines) with `ARMS="pflow ldf"` (`suite`, then `triple`) | ~7 GPU-h | `../src/plot_constrained_suite.py`, `constrained_image_rows.py` / `constrained_appendix_grids.py` with `--arms conicflow hardflow pflow ldf` |
 
 GPU-hours are on one RTX A5000 per process, model loads included. The README
 in each directory gives the design, the exact settings, and partial-run options
@@ -175,6 +182,8 @@ bash unconstrained/run_table1.sh 0           # Table 1 / Fig. 2 (left)
 bash constrained/run_suite.sh 1              # Fig. 3 (8 instances x 2 seeds x 5 thresholds)
 bash constrained/run_suite.sh 1 triple       # the three-constraint instance
 bash ablation/run_ablation.sh 0 --preset arxiv_v1   # Appendix D (includes Fig. 2 right rows 2-3)
+METHODS="gg flowchef" bash unconstrained/run_table1.sh 0   # rebuttal baselines, Table 1
+ARMS="pflow ldf" bash constrained/run_suite.sh 1           # rebuttal baselines, Fig. 3
 
 cd ../analysis
 python table1_breakdown.py
@@ -191,8 +200,10 @@ python abl_tables_arxiv_v1.py
 runs. On that data they reproduce Table 1, the per-problem breakdown, Figure 3's
 medians and feasibility counts, and every number in Tables 7–9 except one
 wall-clock time (123 s against the paper's 124 s). The image figures come out byte-identical to the
-originals, and so do Figure 1's two frontier panels when drawn from the
-shipped CSVs. A fresh run reproduces the results
+originals (for the constrained panels, to the current draft's, which judge
+feasibility in-run), and so do Figure 1's two frontier panels when drawn from
+the shipped CSVs. The baseline launchers issue exactly the `run_sweep.py`
+commands that produced the rebuttal runs. A fresh run reproduces the results
 statistically rather than digit for digit:
 
 - **Uncontrolled samples are deterministic for a given seed.** A fresh clone in
@@ -217,8 +228,13 @@ statistically rather than digit for digit:
 | **ConicFlow** (ours) | `conicflow` | `N`, `H`, `n_inner`, `lr_inner`, `lam`, `endpoint_surrogate` | the inner loop differentiates through the terminal estimate: linear in `N` with `endpoint_surrogate=jump`, quadratic with `rollout` |
 | **HardFlow** | `hardflow` | `N`, `n_inner`, `lr_inner`, `hardflow_reg` | optimizes the predicted terminal latent and never differentiates the transformer; linear in `N` |
 | **FMRG** | `fmrg` | `N`, `n_inner` (guidance steps), `lam` | open loop: `z ← z + (dt/n_inner)·lam·∇r(X(z))` |
+| Gradient guidance (baseline) | `gg` | `N`, `n_inner` (guidance steps), `lam` | ascent on the reward of the one-step clean estimate, through the transformer; linear in `N` |
+| FlowChef (baseline) | `flowchef` | `N`, `n_inner`, `lam` | gradient skipping: the reward gradient on the clean estimate only, no transformer backward; linear in `N` |
+| Projected Flow / PDM (baseline, constraints only) | `pflow` | `N`, `pflow_max_iters`, `pflow_final_iters`, `pflow_margin` | Gauss-Newton projection of the state after every step, one transformer backward per active constraint per update; linear in `N` |
+| LDF (baseline, constraints only) | `ldf` | `N`, `ldf_penalty`, `ldf_rescale`, `ldf_p`, `ldf_substeps` | a multiplier ODE beside the sample, in substeps; gradients through the decoder and scorer only; linear in `N` |
 
-**`lam` does not mean the same thing in all three.** For ConicFlow it weights
+**`lam` does not mean the same thing in all three.** (Gradient guidance and
+FlowChef take it as a gain, like FMRG; Projected Flow and LDF ignore it.) For ConicFlow it weights
 the objective `J = energy/(2·lam) − r`. For HardFlow the same physical quantity
 enters as `hardflow_reg = N/(2·lam)`, which `run_sweep.py` derives per run when
 `--sweep_hardflow_reg` is omitted. For FMRG it is an open-loop gain on the
@@ -227,7 +243,7 @@ shared grid a reasonable axis to sweep, but not a fair one to compare on. The
 paper therefore compares reward-vs-energy frontiers, which don't depend on what
 each knob means.
 
-**Constraints** (ConicFlow and HardFlow only) are given to `run_sweep.py` as
+**Constraints** (ConicFlow, HardFlow, and the constraint-only Projected Flow and LDF) are given to `run_sweep.py` as
 `--constraint_types`, `--constraint_args`, `--constraint_thresholds` and
 `--constraint_directions`, one entry per constraint. The direction is always explicit; it is never inferred
 from the reward. `--reward none` makes the objective control energy alone.

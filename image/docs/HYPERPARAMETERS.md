@@ -15,6 +15,8 @@
 > - **Not covered here:** the Table 1 / Fig. 2 (left) runs use
 >   `endpoint_surrogate = rollout` and are documented in
 >   `scripts/unconstrained/README.md`.
+> - **Section 9** covers the four baselines added for the rebuttal: gradient
+>   guidance and FlowChef (Table 1), Projected Flow and LDF (Fig. 3).
 
 Every number the released unconstrained experiments use, in one place. The
 scripts in `scripts/` are the authority; this file explains them.
@@ -191,6 +193,9 @@ On 24 GB cards, from `peak_reserved_flux_gb` on the heaviest config per arm:
 | `conicflow` | 21000 MiB |
 | `hardflow` | 18500 MiB |
 | `fmrg` | 21800 MiB |
+| `gg`, `flowchef` | 18500 MiB (CLIP is the heaviest reward, 18.8 GB) |
+| `pflow` | 22400 MiB (three constraints, 22.8 GB) |
+| `ldf` | 21600 MiB (three constraints, 21.9 GB) |
 
 ConicFlow at `N=8, H=2, n_inner=24` peaks at 16.3 GB resident, so **two ConicFlow jobs do
 not fit on one card**. Run one job per GPU.
@@ -225,13 +230,89 @@ reward). The constraint values are `h_0 .. h_{C-1}` on the final latent, with
 displacement residual `sum_k ||dx_k||^2 dt`; the paper's `sum_k ||u_k||^2 dt`
 is that times `N^2 = 64` (`plot_constrained_suite.py` applies it).
 
-**One guard that fires on HardFlow by design.** `run_sweep` flags a row
-`run_ok=False` with `stale_decode_cache_signature` when the terminal state
-equals the previous step's endpoint prediction, which for ConicFlow would mean
-a reused decode. At HardFlow's final step the terminal state *is* the previous
-endpoint prediction by construction (`alpha = 1`), so the flag is a false
-positive there; it tripped on 2 of 86 HardFlow rows in the paper's suite. The
-row's numbers are complete and correct; `compare_constrained.py` refuses to
-draw that point's figure (it insists on `run_ok`), `plot_constrained_suite.py`
-reads the row regardless.
+**A guard that used to fire on HardFlow.** `run_sweep` flags a row
+`run_ok=False` with `stale_decode_cache_signature` when a step's constraint
+value equals the previous step's endpoint value, which would mean a reused
+decode. At the final step that equality is legitimate: the nominal step to
+`t = 0` is the same flow-map jump as the endpoint prediction, so a method that
+applies no correction there ends exactly on the previous endpoint. The flag was
+a false positive on 2 of 86 HardFlow rows in the paper's suite (their numbers
+are complete and correct; `compare_constrained.py` drew no figure for those
+points, `plot_constrained_suite.py` read the rows regardless). Since
+2026-10-11 the guard exempts a step whose LATENT is bit-identical to the
+previous endpoint, so new runs are not flagged; equal `h` from different
+latents is still caught.
 
+**Feasibility in the figures** is always the in-run value above, for every
+method: Fig. 3 (left) and, since 2026-10-21, the image panels too. Re-scoring
+the saved 8-bit PNG (`comparison.json`) lowers PickScore by a median
+0.01-0.04, which would flip runs that end within a few hundredths of the
+boundary.
+
+## 9. The baselines (rebuttal): gradient guidance, FlowChef, Projected Flow, LDF
+
+Each is a `--sweep_control_type` in `run_sweep.py`, implemented next to
+`hardflow_image` in `src/control_loops.py`; each function's docstring names its
+source code and lists every deviation from it. All four advance with the same
+nominal flow-map step as the other methods, so `ctrl_energy` measures the same
+thing for every arm.
+
+### Unconstrained (Table 1): `gg`, `flowchef`
+
+Run with `METHODS="gg flowchef" scripts/unconstrained/run_table1.sh`, on the
+same problems, seeds and frozen λ grids as the paper's three methods.
+
+| | gradient guidance (`gg`) | FlowChef (`flowchef`) |
+|---|---|---|
+| source | HardFlow's "Gradient Guidance" baseline (`azizanlab/HardFlow@016adb2`, `utils/methods.py:210-241`) | the FMRG authors' FLUX port of FlowChef (Patel et al., ICCV 2025), `fmrg/fluxfm_sampler_ip.py:736-828`, reward in place of the inverse-problem loss |
+| per sampling step | `n_inner` ascent steps on the reward of the one-step clean estimate, differentiated through the transformer, then the nominal step | `n_inner` ascent steps on the clean estimate itself (gradient through the decoder and reward only), the displacement added to the nominal step |
+| what `lam` is | a gain: step `lam * dt / n_inner`, FMRG's convention | the same |
+| `n_inner` | **3** (FMRG-J's guidance steps) | **5** (the FMRG authors' setting) |
+| transformer calls at N=8 | `N (n_inner + 1)` = 32, backward on 24 | `2N` = 16, no backward |
+| control time per run (A5000, N=8) | ~30-38 s | ~11 s |
+
+On the paper's 12 problems both frontiers extend past the shared budget
+`[E1, E2]` at both ends, so adding them leaves the other methods' `G` unchanged
+(`analysis/table1_breakdown.py --baselines` reports this per problem).
+
+### Constrained (Fig. 3): `pflow`, `ldf`
+
+Run with `ARMS="pflow ldf" scripts/constrained/run_suite.sh` into the same
+trees as ConicFlow/HardFlow, so all four share the probe, thresholds and seeds.
+Both are constraint-only (`--reward none`); neither uses `lambda` or a horizon.
+
+| | Projected Flow (`pflow`) | LDF (`ldf`) |
+|---|---|---|
+| source | Projected Diffusion Models (Christopher, Baek & Fioretto, NeurIPS 2024); Zampini et al., NeurIPS 2025 for latent models. The projector is a PyTorch port of LDF's Gauss-Newton `project_batch` | Lagrangian Dual Flows (Kurtz & Davydov 2026), the inequality closed-form-slack flow of `cfm/methods/ldf.py` |
+| per sampling step | the nominal step, then a Gauss-Newton projection of the STATE onto `{h(X(z, t)) <= 0}`, with the Jacobian through the flow-map endpoint `X` | the nominal step, then the correction and multiplier ODE integrated over the same interval in midpoint substeps |
+| knobs | `pflow_max_iters` **10**, `pflow_final_iters` **50**, `pflow_activation` 0 (project from the first step, as PDM), `pflow_margin` **0** | `ldf_penalty` 5, `ldf_rescale` 1, `ldf_p` 1 (the authors' values), `ldf_substeps` **64**, initial multiplier 0 |
+| time per run (A5000) | 80-140 s with one or two constraints, ~190 s with three | 45-70 s |
+
+Why the settings in bold:
+- **Projection in bf16.** The latent is bf16, and the min-norm correction for a
+  small violation (~5e-5 per element) is below a bf16 spacing, so a plain
+  Gauss-Newton step leaves the evaluated point unchanged. The projector keeps an
+  fp32 master copy and sizes each step so that the step *as rounded* is
+  predicted to remove at least 95% of every active violation; in fp32 it is the
+  plain Gauss-Newton step.
+- **`pflow_final_iters` 50.** The last step's projection acts on the output
+  image and is cheap (decoder and scorer only, ~0.2 s per update); one hard ask
+  needed 19 updates, past the shared cap of 10.
+- **No margin.** The projection stops only when the true `h <= 0` (not its
+  linearization), so it ends just inside the boundary (median final
+  `max_i h_i` -0.005 over the suite). That is why feasibility is judged in-run:
+  re-scored from the 8-bit PNG, most of these runs read a few hundredths
+  infeasible. HardFlow's released code tightens every constraint by 0.02 to
+  make its augmented-Lagrangian solve land inside; the paper runs HardFlow
+  without it (section 8), and Projected Flow, which needs no margin to be
+  feasible, gets none either.
+- **64 LDF substeps.** The authors integrate ~100 Euler steps of the whole ODE;
+  at N=8 the late-time gain `1/(1-s)^p` makes few substeps overshoot. At 16 the
+  hardest asks (m = 1.5) failed or cost 3x the energy, and raising the gain
+  instead made the explicit substeps diverge; 64 at the authors' gain was
+  feasible on both at 2-3x lower energy. Chosen on two pilot cells (p01_smile
+  and p09_curly_old, seed 310), as ConicFlow's dual settings were chosen on a
+  pilot instance.
+
+OC-Flow (HardFlow's other baseline) was also ported and is not included: on
+FLUX at N=8 no update rule tried beat the uncontrolled sample.
