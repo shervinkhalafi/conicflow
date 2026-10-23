@@ -119,9 +119,9 @@ STACK = dict(
     uncontrolled_gap=0.04,        # extra space after the Uncontrolled column
     m_fmt=r"$same\ threshold,\mathbf{{\ m = {m:g}}}$",
     box_lw=1.3, box_pad=0.005, box_pad_b=0.04,
-    # pflow / ldf: plot_constrained_suite.py's provisional palette slots 4 and 5.
+    # pflow / ldf: the same colours as in plot_constrained_suite.py (Figure 3, left).
     title_colors=dict(unc="0.35", conicflow="#0d9488", hardflow="#c2410c",
-                      pflow="#eda100", ldf="#e87ba4"),
+                      pflow="#a21caf", ldf="#ec4899"),
     arrow=True, arrow_label=r"harder constraints ($\mathbf{{m \uparrow}}$) ",
     arrow_gap=0.025, arrow_label_gap=0.018,
     arrow_tail_w=1.2, arrow_head_w=2.4, arrow_head_l=2.0,
