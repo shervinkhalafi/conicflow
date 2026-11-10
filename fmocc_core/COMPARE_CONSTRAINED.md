@@ -1,16 +1,16 @@
 # `compare_constrained.py` — one constrained MPC-vs-HardFlow comparison
 
-Give it a prompt, an edit prompt, a λ and a threshold. It runs both methods,
-scores the results and writes a three-panel figure:
+Give it a prompt, an edit prompt, a λ and one or more constraints. It runs
+both methods, scores the results and writes a three-panel figure:
 
 ```
 uncontrolled | MPC | HardFlow
 ```
 
-The constraint is `score(image, edit_prompt) >= threshold` with **no reward**,
-so each method's objective is its control energy alone. That is the setting
-where the two are most directly comparable: both must reach the same feasible
-set, and the only question is what it costs.
+Each constraint is `score_i(image, arg_i) >= threshold_i` (or `<=`) with
+**no reward**, so each method's objective is its control energy alone. That is
+the setting where the two are most directly comparable: both must reach the
+same feasible set, and the only question is what it costs.
 
 Unlike the Section 5 tools in the main README, this one **launches runs and
 needs a GPU**. It is the whole experiment, not a reader of finished ones.
@@ -18,8 +18,60 @@ needs a GPU**. It is the whole experiment, not a reader of finished ones.
 ```bash
 python compare_constrained.py \
     --prompt "a portrait of a man" --edit_prompt "a smiling face" \
-    --lam 10 --threshold 23.0 --gpu 0 --out_dir results/cc_smile
+    --lam 20 --threshold 24.0 --gpu 0 --out_dir results/cc_smile
 ```
+
+Several constraints are parallel lists, exactly as `run_sweep.py` takes them,
+and are shared by both arms:
+
+```bash
+python compare_constrained.py ... \
+    --constraint_types pickscore clip \
+    --constraint_args "a smiling face" "with glasses" \
+    --constraint_thresholds 24.0 0.31 \
+    --constraint_directions ge ge
+```
+
+`--constraint_args` defaults to `--edit_prompt` for every constraint and
+`--constraint_directions` to `ge`. The single-constraint spellings
+`--constraint_type` / `--threshold` / `--direction` are aliases, so every
+older invocation still works. Feasible means every `h_i ≤ 0`; the figure lists
+each constraint's score and `h` per panel.
+
+## Automatic thresholds
+
+`--auto_threshold` derives the grid from **this seed's** uncontrolled image
+instead of taking `--constraint_thresholds`:
+
+```bash
+python compare_constrained.py ... --constraint_types pickscore clip \
+    --auto_threshold --auto_lo 1.1 --auto_hi 2.0 --n_grid 5
+```
+
+It runs one uncontrolled sample (`control_type=none`, no reward, ~1 min),
+scores it with every constraint to get `s0_i`, lays `n_grid` multipliers `m`
+evenly from `--auto_lo` to `--auto_hi`, and runs a full comparison at each.
+Point `k` tightens **every constraint together**:
+
+```
+ge:  threshold_i = s0_i + (m_k − 1)·|s0_i|      (= m_k·s0_i when s0_i > 0)
+le:  threshold_i = s0_i − (m_k − 1)·|s0_i|
+```
+
+Stepping by `|s0|` rather than multiplying matters in two cases a plain
+multiple gets backwards: a negative baseline (ImageReward's z-score often is,
+and `1.1×` of a negative number *loosens* a `ge` constraint) and `le`
+constraints (where multiples above 1 loosen too). For the common case —
+positive score, `ge` — it is exactly `m·s0`.
+
+Each point lands in `<out_dir>/m<mult>/` (`m1.10/`, `m1.33/`, …), so the
+directory names line up across seeds even though the absolute thresholds
+differ per seed. `<out_dir>/auto_threshold.json` records the uncontrolled
+scores, every point's thresholds, and each point's energies and feasibility
+once scored; `<out_dir>/uncontrolled/` holds the probe run. A point that fails
+is recorded in the manifest and the grid continues. `--fig_only` re-scores and
+redraws every point from the manifest; `--skip_existing` skips the probe and
+any arm that already has a `run_ok` row.
 
 ---
 
@@ -30,6 +82,10 @@ python compare_constrained.py \
 <out_dir>/hardflow/     same
 <out_dir>/compare.png   the three-panel figure
 <out_dir>/comparison.json   every number in the figure, plus the resolved args
+
+# with --auto_threshold, the above repeats under <out_dir>/m<mult>/, plus
+<out_dir>/uncontrolled/     the probe run (its __img_unc.png is what was scored)
+<out_dir>/auto_threshold.json   uncontrolled scores, per-point thresholds and results
 ```
 
 and prints, per panel, the score, `h` from both the re-scored PNG and the CSV,
@@ -54,6 +110,14 @@ for a knob that already exists there.
 `--fig_only` re-scores and redraws from finished runs without touching the
 control loop. `--skip_existing` skips an arm that already has a `run_ok=True`
 row, so an interrupted comparison resumes at the arm that did not finish.
+Neither overwrites the wall clock recorded in `comparison.json` by the run
+that actually produced an arm.
+
+Captions show score, `h`, feasibility and control energy. Wall clock is left
+off by default — it depends on the card, contention and model-load caching
+more than on the method, and the two arms' inner loops are not matched for
+compute — so a caption would invite a comparison the figure cannot support.
+`--show_time` puts it back; the terminal table always prints it.
 
 ---
 
@@ -66,16 +130,18 @@ force both onto the same values or run four configs, half of them nonsense.
 Separate processes also match the one-config-per-process rule in
 [SUITE.md](SUITE.md).
 
-**It re-scores the saved PNGs.** With `--reward none` the CSV's `r_unc`/`r_ctrl`
-are 0 and only the controlled endpoints get an `h_0`, so the uncontrolled panel
-has no score anywhere on disk. The script scores all three images with the same
-convention `run_sweep._build_reward_fn` uses for PickScore —
-`logit_scale.exp() * cos_sim` on CLIP-224 preprocessed `[0,1]` images — which
-puts every panel in one unit. It reproduces the CSV's `h_0` to within PNG
-quantization (~0.01–0.07) and prints both columns so the agreement is visible
-rather than asserted. Only `pickscore` has a scorer here; another
-`--constraint_type` will run fine and then stop at the figure, with a message
-saying to extend `_score_images`.
+**It re-scores the saved PNGs with run_sweep's own scorers.** With `--reward
+none` the CSV's `r_unc`/`r_ctrl` are 0 and only the controlled endpoints get an
+`h_i`, so the uncontrolled panel has no score anywhere on disk. Rather than
+carry a parallel scorer per reward type, the script imports `run_sweep` and
+calls `_build_reward_fn` for each constraint, feeding it the saved image through
+the `decode_fn` hook every branch already routes through. Every panel is
+therefore scored by exactly the code the control loop enforced — for any
+constraint type, including style and LPIPS — and it reproduces the CSV's `h_i`
+to within PNG quantization (~0.01–0.07); both columns are printed so the
+agreement is visible rather than asserted. The scorer is built only between
+subprocesses and freed before the next one launches: FLUX plus a run's own
+scorers already peak near 19 GB on this card.
 
 **It checks the two uncontrolled images are byte-identical.** Same seed and same
 N must give the same starting image; if they differ, the arms were not
