@@ -596,6 +596,25 @@ class RunConfig:
     # Scores of different scorers stay in their own units -- pair with
     # dual_adaptive when mixing scorers.
     constraint_calibrate: int = 0
+    # ── 2026-11-10 real-image editing (flux_inversion.py / pie_edit.py; all off
+    # by default, so every generation run is unchanged) ──────────────────────
+    # source_image: a real image (resized to width x height). Its VAE posterior
+    # mean is z_ref. Set from --source_image or --pie_example for every config.
+    source_image: str = ""
+    # x0_mode: "random" = seed noise, as every run before this; "inverted" = the
+    # noise the sampler maps back to source_image under `prompt` (fixed-point
+    # inversion for flow_map2, Euler for flow_matching). With "inverted" the
+    # uncontrolled rollout is the plain reconstruction; how close it gets
+    # depends on N and inversion_n_fp (PIE 1:43 at N=16, K=5: 11.3 dB, against
+    # 29.1 dB once MPC adds recon_weight=1 at lam=100).
+    x0_mode: str = "random"
+    # recon_weight w > 0 adds  -w/2 * ||z_hat - z_ref||^2  (sum over latent
+    # elements) to the reward the CONTROLLER sees. Reported r_unc / r_ctrl stay
+    # the --reward scorer alone, so the plausibility guard and every earlier
+    # comparison keep their meaning. w = 1 is pie_edit.py's objective.
+    recon_weight: float = 0.0
+    # fixed-point iterations per step for x0_mode="inverted" (pie_edit.py used 5).
+    inversion_n_fp: int = 5
     # boffi_fmrg only -- passed through to FluxFlowMapSampler.sample_reward_guided
     # (upstream's vendored FMRG-J implementation). Left at upstream's "off" defaults
     # so the paired comparison is a minimal single-particle run, not upstream's full
@@ -2178,6 +2197,58 @@ def _build_constraint_fn(
     return combined
 
 
+def _prepare_source(sampler, cfg, z_like, device, dtype, log=print) -> dict:
+    """Real-image editing inputs: z_ref (VAE posterior mean of cfg.source_image)
+    and, for x0_mode="inverted", the inverted noise. Uses flux_inversion.py,
+    imported here so a generation run never touches it."""
+    import numpy as np
+    from PIL import Image
+    import flux_inversion as _fi
+    img = Image.open(cfg.source_image).convert("RGB").resize((cfg.width, cfg.height), Image.BICUBIC)
+    x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)[None]
+    x = (x * 2.0 - 1.0).to(device=device, dtype=dtype)
+    z_ref = _fi.vae_encode(sampler, x).float()
+    if tuple(z_ref.shape) != tuple(z_like.shape):
+        raise ValueError(
+            f"source image latent has shape {tuple(z_ref.shape)} but this run's noise latent is "
+            f"{tuple(z_like.shape)} (height={cfg.height}, width={cfg.width}); the controllers "
+            f"would be steering a different space than the one the image lives in."
+        )
+    out = {"x_src": x.float(), "z_ref": z_ref, "fp_residual": float("nan")}
+    if cfg.x0_mode == "inverted":
+        method = {"flow_map2": "fixed_point", "flow_matching": "euler"}.get(cfg.sample_mode)
+        if method is None:
+            raise ValueError(f"x0_mode='inverted' supports sample_mode flow_map2 (fixed-point "
+                             f"inversion) or flow_matching (Euler); got {cfg.sample_mode!r}.")
+        t0 = time.perf_counter()
+        emb = (sampler.cached_prompt_embeds, sampler.cached_pooled_prompt_embeds)
+        z_inv, info = _fi.invert(sampler, z_ref, emb, cfg.N, cfg.guidance_scale, method, cfg.inversion_n_fp)
+        out["z_inv"] = z_inv.to(device=device, dtype=dtype)
+        out["fp_residual"] = float(info.get("fp_residual_max", float("nan")))
+        log(f"  source image {cfg.source_image!r}: {method} inversion under prompt {cfg.prompt!r}, "
+            f"K={cfg.inversion_n_fp}, max residual {out['fp_residual']:.2e}, "
+            f"{time.perf_counter() - t0:.0f}s")
+    else:
+        log(f"  source image {cfg.source_image!r}: z_ref only (x0_mode={cfg.x0_mode!r})")
+    return out
+
+
+def _source_metrics(x_src, images, device) -> dict:
+    """PSNR and LPIPS of each PIL image in `images` against the source image."""
+    import numpy as np
+    import flux_inversion as _fi
+    m = _fi.Metrics(device)
+    out = {}
+    for name, im in images.items():
+        if im is None:
+            continue
+        y = torch.from_numpy(np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0).permute(2, 0, 1)[None]
+        r = m(x_src.to(device), (y * 2.0 - 1.0).to(device))
+        out[f"src_psnr_{name}"], out[f"src_lpips_{name}"] = r["psnr"], r["lpips"]
+    del m
+    return out
+
+
 def _calibrate_thresholds(sampler, cfg, specs, h_fn, z_unc, device, dtype, log=print) -> dict:
     """Resolve progress thresholds (RunConfig.constraint_calibrate) to raw ones.
 
@@ -2440,6 +2511,17 @@ def _run_one(
     z0 = torch.randn(1, in_ch, cfg.height // vscale, cfg.width // vscale,
                      device=device, dtype=dtype)
 
+    # Real-image editing (off by default: no source image, random x0, no recon term).
+    if cfg.x0_mode not in ("random", "inverted"):
+        raise ValueError(f"x0_mode must be 'random' or 'inverted', got {cfg.x0_mode!r}.")
+    if (cfg.x0_mode == "inverted" or cfg.recon_weight) and not cfg.source_image:
+        raise ValueError("x0_mode='inverted' and recon_weight > 0 need --source_image or --pie_example.")
+    if cfg.recon_weight and cfg.control_type == "boffi_fmrg":
+        raise ValueError("recon_weight is not wired into boffi_fmrg, which scores pixels with its own ensemble.")
+    _src = _prepare_source(sampler, cfg, z0, device, dtype, log=log) if cfg.source_image else None
+    if _src is not None and cfg.x0_mode == "inverted":
+        z0 = _src["z_inv"]
+
     # ── Resolve constraint specs (Step 4.1) ──────────────────────────────────
     # _build_constraint_fn (below, after ref_holder exists) builds each
     # constraint's scorer via _build_reward_fn directly -- no dedicated
@@ -2480,6 +2562,15 @@ def _run_one(
         ref_holder=ref_holder,
         drop_text_tower=_drop_towers, reward_dtype=reward_dtype,
     )
+    # What the controllers optimize. Identical to r_image unless recon_weight > 0,
+    # in which case it adds the pull toward the source image's latent. Everything
+    # REPORTED (r_unc, r_ctrl, the plausibility guard, reward curves) uses r_image.
+    r_control = r_image
+    if cfg.recon_weight:
+        _zr, _w = _src["z_ref"], float(cfg.recon_weight)
+
+        def r_control(z, _base=r_image):
+            return _base(z) - 0.5 * _w * (z.float() - _zr.to(z.device)).pow(2).flatten(1).sum(1)
 
     # Device preflight (added 2026-08-21): print and assert the ACTUAL tensor
     # devices, not the CLI args -- a prior audit found the device-print line
@@ -2645,7 +2736,7 @@ def _run_one(
         if cfg.control_type == "mpc":
             z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = receding_horizon_flow_control(
                 v_theta=v_theta,
-                r=r_image,
+                r=r_control,
                 x0=z0,
                 N=cfg.N,
                 H=cfg.H,
@@ -2692,7 +2783,7 @@ def _run_one(
             # terminal estimate must be a single NFE (that is the method's whole
             # efficiency claim) rather than endpoint_map's rollout.
             z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = hardflow_image(
-                sampler, r_image, z0,
+                sampler, r_control, z0,
                 N=cfg.N,
                 n_inner=cfg.n_inner,
                 lr=hardflow_lr_eff,
@@ -2726,7 +2817,7 @@ def _run_one(
             )
         elif cfg.control_type == "fmrg":
             z_ctrl, traj_ctrl, _ = fmrg_j_image(
-                sampler, r_image, z0,
+                sampler, r_control, z0,
                 N=cfg.N,
                 n_opt=cfg.n_inner,
                 lam=cfg.lam,
@@ -3187,6 +3278,15 @@ def _run_one(
             f"reserved={_mem_cells['peak_reserved_flux_gb']:.2f} GB "
             f"on {_mem_devices['flux']}{_extra}")
 
+    # Real-image runs: how far the uncontrolled (reconstruction, when x0 is
+    # inverted) and controlled images are from the source image.
+    _src_metrics = {}
+    if _src is not None:
+        _src_metrics = _source_metrics(
+            _src["x_src"],
+            {"unc": img_unc, "ctrl": img_ctrl if cfg.control_type != "none" else None},
+            device)
+
     return dict(
         run_ok        = run_ok,
         # Empty on a clean run, so a populated error_type always means a guard
@@ -3219,6 +3319,12 @@ def _run_one(
         calib_thr   = ",".join(f"{v:.6g}" for v in _calib["thr"]) if _calib else "",
         calib_s0    = ",".join(f"{v:.6g}" for v in _calib["s0"]) if _calib else "",
         calib_s_tgt = ",".join(f"{v:.6g}" for v in _calib["s_tgt"]) if _calib else "",
+        source_image   = cfg.source_image,
+        x0_mode        = cfg.x0_mode,
+        recon_weight   = cfg.recon_weight,
+        inversion_n_fp = cfg.inversion_n_fp,
+        inv_fp_residual = _src["fp_residual"] if _src is not None else "",
+        **_src_metrics,
         drift_detach  = cfg.drift_detach,
         constraint_on = cfg.constraint_on,
         endpoint_surrogate = cfg.endpoint_surrogate,
@@ -3784,6 +3890,9 @@ CSV_KEYS = [
     # 2026-11-09, APPENDED for the same reason.
     "constraint_views", "control_stop_step", "constraint_calibrate",
     "calib_thr", "calib_s0", "calib_s_tgt",
+    # 2026-11-10 real-image editing, APPENDED likewise.
+    "source_image", "x0_mode", "recon_weight", "inversion_n_fp", "inv_fp_residual",
+    "src_psnr_unc", "src_lpips_unc", "src_psnr_ctrl", "src_lpips_ctrl",
 ]
 
 
@@ -3809,6 +3918,7 @@ _RESUME_KEY_FIELDS = [
     "seed", "lr_dual", "mu_init", "lpips_net",
     "dual_adaptive",
     "constraint_views", "control_stop_step", "constraint_calibrate",
+    "source_image", "x0_mode", "recon_weight", "inversion_n_fp",
 ]
 
 # Sweep axes that do NOT round-trip through the CSV. If a resumed sweep varies
@@ -3884,7 +3994,9 @@ def _resume_key_from_cfg(cfg, reward_model: str) -> tuple:
 # predating the column has no value for it, so reading it as "" would never
 # match a config carrying the field's default. Map missing -> the default.
 _RESUME_FIELD_DEFAULTS = {"dual_adaptive": False, "constraint_views": 0,
-                          "control_stop_step": 0, "constraint_calibrate": 0}
+                          "control_stop_step": 0, "constraint_calibrate": 0,
+                          "source_image": "", "x0_mode": "random", "recon_weight": 0.0,
+                          "inversion_n_fp": 5}
 
 
 def _resume_key_from_row(row: dict) -> tuple:
@@ -4009,6 +4121,8 @@ def _build_configs_from_args(args) -> List[RunConfig]:
         "dual_adaptive",
         # 2026-11-09, APPENDED likewise.
         "constraint_views", "control_stop_step", "constraint_calibrate",
+        # 2026-11-10, APPENDED likewise.
+        "x0_mode", "recon_weight",
     ]
     for f in sweep_fields:
         val = getattr(args, f"sweep_{f}", None)
@@ -4390,6 +4504,29 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "with --sweep_dual_adaptive true when mixing scorers. "
                              "Text-target types only, not with --constraint_normalize. "
                              "Default 0 = thresholds are raw scores.")
+    parser.add_argument("--source_image", default="", metavar="PATH",
+                        help="Real-image editing: the image to edit, resized to the run's "
+                             "width x height. Its VAE latent is the target of "
+                             "--sweep_recon_weight and the image --sweep_x0_mode inverted "
+                             "inverts. --sweep_prompt should describe it (the inversion runs "
+                             "under that prompt). Default: none, i.e. generation from noise.")
+    parser.add_argument("--pie_example", default="", metavar="SPLIT:ROW",
+                        help="Real-image editing from PIE-Bench++: '<split digit>:<row>', "
+                             "e.g. 1:43. Saves the image to <out_dir>/source_<spec>.png, uses "
+                             "it as --source_image and prints its source and target prompts.")
+    parser.add_argument("--pie_root", default="/home/shervink/datasets/PIE_Bench_pp")
+    parser.add_argument("--inversion_n_fp", type=int, default=5, metavar="K",
+                        help="Fixed-point iterations per step for --sweep_x0_mode inverted.")
+    parser.add_argument("--sweep_x0_mode", nargs="+", choices=["random", "inverted"], metavar="MODE",
+                        help="Starting noise. 'random' (default) is seed noise, as always; "
+                             "'inverted' is the inversion of --source_image under --sweep_prompt "
+                             "(fixed-point for flow_map2); the uncontrolled rollout is then the "
+                             "plain reconstruction. 'inverted' needs --source_image.")
+    parser.add_argument("--sweep_recon_weight", nargs="+", type=float, metavar="W",
+                        help="Adds -W/2 * ||z_hat - z_ref||^2 (sum over latent elements, z_ref = "
+                             "the source image's latent) to the reward the controllers optimize; "
+                             "reported r_unc / r_ctrl stay the --reward scorer alone. W = 1 is "
+                             "pie_edit.py's objective. Default 0 = off.")
     parser.add_argument("--sweep_skip_first_primal_step", nargs="+",
                         type=lambda x: x.lower() != "false", metavar="BOOL",
                         help="MPC only. Plan Step 7 option (b): one dual-ascent "
@@ -4569,9 +4706,24 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
             print(f"Using all {len(configs)} SWEEP_CONFIGS entries")
 
     # Apply seed, out_dir, and constraint params to all configs
+    if args.pie_example:
+        if args.source_image:
+            raise SystemExit("--pie_example and --source_image both name the image; pass one.")
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import flux_inversion as _fi
+        _ex = _fi.load_pie(args.pie_root, args.pie_example)
+        args.source_image = str(out_dir / f"source_{args.pie_example.replace(':', '-')}_{_ex['id']}.png")
+        _ex["image"].save(args.source_image)
+        print(f"PIE example {args.pie_example} ({_ex['split']}, id {_ex['id']}) -> {args.source_image}\n"
+              f"  source prompt: {_ex['source_prompt']}\n  target prompt: {_ex['target_prompt_marked']}")
+    if args.source_image and not os.path.isfile(args.source_image):
+        raise SystemExit(f"--source_image {args.source_image!r} does not exist.")
+
     for cfg in configs:
         cfg.seed = args.seed
         cfg.out_dir = args.out_dir
+        cfg.source_image = args.source_image
+        cfg.inversion_n_fp = args.inversion_n_fp
         if args.style_ref_paths:
             cfg.style_ref_paths = args.style_ref_paths
         if args.lpips_net:
@@ -4796,6 +4948,8 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                     "constraint_views": cfg.constraint_views,
                     "control_stop_step": cfg.control_stop_step,
                     "constraint_calibrate": cfg.constraint_calibrate,
+                    "source_image": cfg.source_image, "x0_mode": cfg.x0_mode,
+                    "recon_weight": cfg.recon_weight, "inversion_n_fp": cfg.inversion_n_fp,
                     "drift_detach": cfg.drift_detach,
                     "constraint_on": cfg.constraint_on,
                     "n_constraints": len(cfg.constraint_prompts),

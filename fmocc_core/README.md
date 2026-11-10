@@ -274,6 +274,9 @@ about 1.5×. **ImageReward** stayed at 40%: that reward is already near its
 | `--sweep_constraint_views` | Off (0) by default. `K` scores every constraint on K views of the decoded image — the image plus K−1 random crops, flips and low-passed copies (`scoring_views.py`) — and averages, during control. A single-view CLIP-family score can be raised 10+ points by a pixel-aligned texture while the image barely changes; that does not survive the views. In the 2026-11-09 diagnostic it was the one change that made the suite configuration produce the requested edit. Reported `h_i` stay single-view. Text-target constraint types only; 6 views fit with one scorer on 24 GB, three scorers need 3. |
 | `--sweep_control_stop_step` | Off (0) by default. `mpc` / `hardflow` / `fmrg`. Keeps the controlled trajectory up to this step, then follows the uncontrolled flow to the end. With single-view constraints the last steps mostly add score that other measures do not credit; stopping at 5 of 8 kept the edit and removed most artifacts. The controller still plans for all N steps. |
 | `--sweep_constraint_calibrate` | Off (0) by default. `N` reads `--constraint_thresholds` as progress α: 0 is this run's uncontrolled image, 1 is the mean score of N uncontrolled samples generated from the constraint's own text. Makes thresholds comparable across scorers (pair with `--sweep_dual_adaptive true` when mixing them). The CSV's `thr_i` keeps α; the raw values are in `calib_thr` / `calib_s0` / `calib_s_tgt`. Raises when the target samples do not score on the satisfying side of the uncontrolled image. |
+| `--source_image` / `--pie_example` | Off by default (generation from noise). Real-image editing: the image to edit, resized to the run's width × height; its VAE latent is `z_ref`. `--pie_example 1:43` loads a PIE-Bench++ row (from `--pie_root`), saves it to the out_dir and prints its source and target prompts. `--sweep_prompt` should describe the image, since inversion runs under it. |
+| `--sweep_x0_mode` | `random` (default, seed noise as always) or `inverted`: the fixed-point inversion of the source image (`flux_inversion.py`, `--inversion_n_fp` iterations per step, default 5), so the uncontrolled rollout is the plain reconstruction. |
+| `--sweep_recon_weight` | Off (0) by default. `W` adds −W/2·‖ẑ − z_ref‖² to the reward the controllers optimize; reported `r_unc`/`r_ctrl` stay the `--reward` scorer alone. With `--reward none` and a constraint on the target prompt, `W = 1` is `pie_edit.py`'s editing objective. Real-image rows also get `src_psnr_*` / `src_lpips_*` against the source image. |
 | `--pbar_rewards` | Off by default. Computes the reward shown in the MPC progress bar; costs ~4% of a run. |
 | `--hardflow_lr_alpha` | Off by default. Lifts HardFlow's `lr·reg ≥ 1` admissible floor: any run whose `lr_inner·reg` would reach 1 uses `lr = α/reg` instead (0 < α < 1; 0.5 is dead-beat at the final step), so the inner loop's contraction factor is uniform in λ. Runs above the floor are unchanged; the lr actually used is written to the `hardflow_lr_eff` column. Needed to run HardFlow on a shared λ grid with MPC/FMRG in the regularised regime. |
 | `lambda_autorange.py` / `auto_sweep.sh` | Automatic λ range finding per (reward, prompt, method), and a wrapper that chains it into the sweep. `SHARED_GRID=1` runs all methods on one grid (at a shared λ all three solve the same first-order problem — see `lambda_autorange.shared_grid`); `HF_ALPHA=0.5` passes the floor-lifting alpha through; `DIAG="--diag_winrates --diag_pareto"` runs the cross-method diagnostics at the end. Per-method knobs (`MPC_NI`, `MPC_H`, `HF_NI`, `HF_LR`, `FMRG_NOPT`) take lists. See `docs/lambda_autorange_report.html`. |
@@ -282,6 +285,29 @@ about 1.5×. **ImageReward** stayed at 40%: that reward is already near its
 | `--reward_dtype` | `fp32` default, matching every result on disk. `fp16` halves reward-model memory but changes their values. |
 | `--resume` | Skips configs already in `<out_dir>/summary.csv` with `run_ok=True`, retries failures, appends rather than truncating. |
 | `--continue_on_oom` | Off by default: an OOM aborts rather than marching the rest of a sweep through a contended card. |
+
+### Editing real images
+
+`--source_image` (or `--pie_example`) with `--sweep_x0_mode` and
+`--sweep_recon_weight` runs any controller on a real image instead of a
+generated one. The editing setting the PIE-Bench experiments used:
+
+```bash
+python run_sweep.py --pie_example 1:43 \
+    --sweep_prompt "a white bulldog is walking on the grass" \
+    --sweep_edit_prompt "a white rat is walking on the grass" \
+    --sweep_control_type mpc --sweep_N 16 --sweep_H 2 --sweep_n_inner 12 \
+    --sweep_lam 100 --sweep_endpoint_surrogate jump --sweep_drift_detach true \
+    --reward none --sweep_x0_mode inverted random --sweep_recon_weight 1 \
+    --constraint_types pickscore --constraint_args "a white rat is walking on the grass" \
+    --constraint_thresholds 26.3 --constraint_directions ge --lr_dual 0.5 --mu_init 0.5
+```
+
+`random` x0 with the same reconstruction reward is the control:
+with enough pull any noise reconstructs the image, so what the inversion should
+buy is getting there for less energy. In those experiments the constraint was
+met with a texture rather than the edit; the options in the next section are
+the fixes that worked for generated images.
 
 ### Making constrained edits less conservative
 
