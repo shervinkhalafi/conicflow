@@ -311,23 +311,72 @@ the fixes that worked for generated images.
 
 ### Making constrained edits less conservative
 
-The three flags above came out of a ten-arm diagnostic on two prompts
-(`edit_diag.py`, results in `results/edit_diag/`). What it found, at one seed
-per prompt: the suite configuration was meeting the PickScore threshold with
-changes PickScore rewards and other measures do not. Multi-view scoring fixed
-that on its own. Raising `mu_init` or `lr_inner` alone bought single-view score
-and artifacts, not edit. PickScore, CLIP and ImageReward work as **separate**
-calibrated constraints; averaged into one constraint, PickScore carries the
-average. A starting point that combines them:
+The three edit-strength flags above came out of a ten-arm diagnostic on two
+prompts, red hair and log cabin + fog (`edit_diag.py`, one seed each, 256 px,
+N = 8, λ = 100; results and figures in `results/edit_diag/`). The suite
+configuration was not making weak edits. It was meeting its PickScore threshold
+with a fine texture that PickScore rewards and other measures do not: single-view
+PickScore 26.5 against 23.7 when the same image is scored over 16 views, with the
+hair barely changed. Raising the threshold, `mu_init` or `lr_inner` only bought
+more of that texture.
+
+"16-view PickScore" below is an evaluation measure, not a setting: each output
+image scored once, without gradients, on a fixed seeded set of 16 random views.
+It shows whether a score survives crops and blur. The number of views used
+during control is `--sweep_constraint_views`, which is limited by memory
+because every view is backpropagated through the scorer. The `views` arm was
+optimized and evaluated with the same kind of views (different draws), so for
+it CLIP and ImageReward are the independent checks.
+
+**Recommended settings** for a stronger edit that keeps the subject:
+
+| knob | setting | why |
+|---|---|---|
+| `--sweep_constraint_views` | **6** with one scorer, **3** with three | The one change that turned the suite setting into a visible edit on its own: red hair went from auburn to clearly red with the face intact, 16-view PickScore 27.4 vs 23.7, CLIP and ImageReward both up. Six views with three scorers do not fit in 24 GB. |
+| scorers | **PickScore, CLIP and ImageReward as separate constraints** on the edit text | Separate constraints bring all three to their target level. Averaged into one constraint, PickScore carries the average (log cabin: progress 2.24 vs 0.60 for CLIP and 0.40 for ImageReward). ImageReward disagrees with PickScore most, so it adds the most. |
+| thresholds | `--sweep_constraint_calibrate 4` with `--constraint_thresholds 1.0` each | α = 1 asks the image to score like a real sample of the edit text. Calibration alone gave a smaller edit, so treat it as what makes mixed scorers comparable, not as a strength knob; α = 1.5 changed almost nothing over 1.0. |
+| `--sweep_dual_adaptive` | **true** when mixing scorers | PickScore, CLIP and ImageReward move on scales two orders of magnitude apart; this equalizes their dual pressure. |
+| `--sweep_control_stop_step` | **about 60% of N** (5 of 8, 10 of 16) | With single-view constraints the last steps were mostly texture: stopping after step 5 dropped single-view PickScore by up to 11 points while the 16-view score held or rose slightly. On the strongest arm it cut energy from 160 to 96 and removed most artifacts. With views on it costs a little real edit (16-view 27.4 to 25.9), so use it when artifacts appear. |
+| `--mu_init` | **2 to 5** (untested; see below) | μ₀ = 20 pushed harder everywhere and degraded skin without moving the 16-view score (23.9 vs 23.7); 0.5 is the suite value. |
+| `--lr_dual` | 0.5 | Suite value; unchanged in the diagnostic. |
+| `--sweep_lr_inner` | **0.01** | Tripling it tripled energy under strong dual pressure and produced artifacts. |
+| `--sweep_lam` | **100 to 300** for MPC | In the λ sweep (`results/lam_sweep/`) MPC's edits became visibly stronger up to λ ≈ 300 at the same threshold; HardFlow at fixed `lr_inner` destabilizes as λ rises, because its deviation penalty is N/(2λ). |
+
+Together:
 
 ```bash
-python run_sweep.py ... --reward none \
+python run_sweep.py ... --sweep_control_type mpc --sweep_N 8 --sweep_H 2 \
+    --sweep_n_inner 24 --sweep_lr_inner 0.01 --sweep_lam 100 300 \
+    --sweep_endpoint_surrogate jump --sweep_drift_detach true --reward none \
     --constraint_types pickscore clip imagereward \
     --constraint_args "<edit text>" "<edit text>" "<edit text>" \
     --constraint_thresholds 1.0 1.0 1.0 --constraint_directions ge ge ge \
     --sweep_constraint_calibrate 4 --sweep_dual_adaptive true \
-    --sweep_constraint_views 3 --sweep_control_stop_step 5
+    --sweep_constraint_views 3 --sweep_control_stop_step 5 \
+    --mu_init 2 --lr_dual 0.5
 ```
+
+**How much of this is measured.** Each row's evidence is from one seed per
+prompt. Multi-view scoring, separate scorers, early stopping and the step-size
+result were each tested one at a time. The full combination above was not run
+as written: the strongest measured edit (`combo` in `edit_diag.py`) used the
+same scoring with μ₀ = 20 and `lr_inner` 0.03, which gave bright red hair and
+the only visible log cabin but at 6 to 20 times baseline energy and with the
+scene drifting (a new mountain, a path, different clothing). The settings above
+replace that force with the moderate solver; μ₀ = 2 to 5 is the range the
+diagnostic pointed to, not a measured optimum. Before relying on it, run views
+plus three scorers with the suite solver to see how much of the edit comes from
+the scoring alone.
+
+**Calibration and views together.** Calibration measures the start and target
+levels on the plain image, but with views on the constraint is enforced on the
+view-averaged score, which runs lower (23.7 vs 26.5 on the red-hair baseline).
+So α = 1 is a somewhat stricter target than it reads. `edit_diag.py` calibrates
+in view units instead.
+
+**For a milder edit,** drop to PickScore alone with 6 views and a raw
+threshold at m = 1.3 of the uncontrolled score: the cleanest edit in the
+diagnostic, at about three times baseline energy.
 
 `edit_diag.py` (generated images) and `pie_diag.py` (real PIE-Bench images, on
 top of `flux_inversion.py` / `pie_edit.py`) are the scripts that ran the
