@@ -211,10 +211,11 @@ touch a GPU.
 | `compare_methods.py` | figures of four images in a row — uncontrolled, MPC, HardFlow, FMRG — at a **matched operating point**: `--match reward` holds achieved reward as equal as the grid allows and lets energy differ, `--match energy` does the reverse, `both` writes both. Each panel carries its λ and config; energy and reward go underneath. `--num_rows N` removes the runs already used and repeats the match, so one figure can show several operating points. |
 
 `compare_constrained.py` is the opposite shape: it *runs* the comparison rather
-than reading one, so it needs a GPU. Given a prompt, edit prompt, λ and
-constraint threshold it runs MPC and HardFlow in turn and writes an
-uncontrolled | MPC | HardFlow figure with each panel's score, feasibility,
-energy and wall clock. See **[COMPARE_CONSTRAINED.md](COMPARE_CONSTRAINED.md)**.
+than reading one, so it needs a GPU. Given a prompt, edit prompt, λ and one or
+more constraints (or `--auto_threshold`, which derives a threshold grid from the
+seed's uncontrolled image) it runs MPC and HardFlow in turn and writes an
+uncontrolled | MPC | HardFlow figure with every constraint's score per panel,
+feasibility and energy. See **[COMPARE_CONSTRAINED.md](COMPARE_CONSTRAINED.md)**.
 
 The same `--diag_*` flags are accepted by `run_sweep.py` (run after the sweep)
 and by `auto_sweep.sh` via `DIAG=` (run once all three methods are done, since
@@ -270,6 +271,9 @@ about 1.5×. **ImageReward** stayed at 40%: that reward is already near its
 | `--sweep_*` | Cartesian product over all sweep axes, in a fixed order. |
 | `--constraint_types` / `--constraint_args` / `--constraint_thresholds` / `--constraint_directions` | **`mpc` and `hardflow` only** — `fmrg`/`boffi_fmrg` raise. So does `lr_dual=0` with `mu_init=0` (a silent no-op). |
 | `--sweep_endpoint_surrogate` | `rollout` (default) or `jump`. **mpc only.** `jump` replaces the inner objective's (N−j−H)-step endpoint rollout with ONE flow-map call at `t_next=0`, making MPC's cost linear in N instead of quadratic. Only the surrogate the optimiser differentiates changes — the applied trajectory, and everything scored from it, are unaffected. Measured at N=8/H=4: −33% wall clock, objective better at λ=1 and inside the noise floor at λ=10/100. Opt-in because it has not been re-checked at the suite's N=10. |
+| `--sweep_constraint_views` | Off (0) by default. `K` scores every constraint on K views of the decoded image — the image plus K−1 random crops, flips and low-passed copies (`scoring_views.py`) — and averages, during control. A single-view CLIP-family score can be raised 10+ points by a pixel-aligned texture while the image barely changes; that does not survive the views. In the 2026-11-09 diagnostic it was the one change that made the suite configuration produce the requested edit. Reported `h_i` stay single-view. Text-target constraint types only; 6 views fit with one scorer on 24 GB, three scorers need 3. |
+| `--sweep_control_stop_step` | Off (0) by default. `mpc` / `hardflow` / `fmrg`. Keeps the controlled trajectory up to this step, then follows the uncontrolled flow to the end. With single-view constraints the last steps mostly add score that other measures do not credit; stopping at 5 of 8 kept the edit and removed most artifacts. The controller still plans for all N steps. |
+| `--sweep_constraint_calibrate` | Off (0) by default. `N` reads `--constraint_thresholds` as progress α: 0 is this run's uncontrolled image, 1 is the mean score of N uncontrolled samples generated from the constraint's own text. Makes thresholds comparable across scorers (pair with `--sweep_dual_adaptive true` when mixing them). The CSV's `thr_i` keeps α; the raw values are in `calib_thr` / `calib_s0` / `calib_s_tgt`. Raises when the target samples do not score on the satisfying side of the uncontrolled image. |
 | `--pbar_rewards` | Off by default. Computes the reward shown in the MPC progress bar; costs ~4% of a run. |
 | `--hardflow_lr_alpha` | Off by default. Lifts HardFlow's `lr·reg ≥ 1` admissible floor: any run whose `lr_inner·reg` would reach 1 uses `lr = α/reg` instead (0 < α < 1; 0.5 is dead-beat at the final step), so the inner loop's contraction factor is uniform in λ. Runs above the floor are unchanged; the lr actually used is written to the `hardflow_lr_eff` column. Needed to run HardFlow on a shared λ grid with MPC/FMRG in the regularised regime. |
 | `lambda_autorange.py` / `auto_sweep.sh` | Automatic λ range finding per (reward, prompt, method), and a wrapper that chains it into the sweep. `SHARED_GRID=1` runs all methods on one grid (at a shared λ all three solve the same first-order problem — see `lambda_autorange.shared_grid`); `HF_ALPHA=0.5` passes the floor-lifting alpha through; `DIAG="--diag_winrates --diag_pareto"` runs the cross-method diagnostics at the end. Per-method knobs (`MPC_NI`, `MPC_H`, `HF_NI`, `HF_LR`, `FMRG_NOPT`) take lists. See `docs/lambda_autorange_report.html`. |
@@ -278,6 +282,32 @@ about 1.5×. **ImageReward** stayed at 40%: that reward is already near its
 | `--reward_dtype` | `fp32` default, matching every result on disk. `fp16` halves reward-model memory but changes their values. |
 | `--resume` | Skips configs already in `<out_dir>/summary.csv` with `run_ok=True`, retries failures, appends rather than truncating. |
 | `--continue_on_oom` | Off by default: an OOM aborts rather than marching the rest of a sweep through a contended card. |
+
+### Making constrained edits less conservative
+
+The three flags above came out of a ten-arm diagnostic on two prompts
+(`edit_diag.py`, results in `results/edit_diag/`). What it found, at one seed
+per prompt: the suite configuration was meeting the PickScore threshold with
+changes PickScore rewards and other measures do not. Multi-view scoring fixed
+that on its own. Raising `mu_init` or `lr_inner` alone bought single-view score
+and artifacts, not edit. PickScore, CLIP and ImageReward work as **separate**
+calibrated constraints; averaged into one constraint, PickScore carries the
+average. A starting point that combines them:
+
+```bash
+python run_sweep.py ... --reward none \
+    --constraint_types pickscore clip imagereward \
+    --constraint_args "<edit text>" "<edit text>" "<edit text>" \
+    --constraint_thresholds 1.0 1.0 1.0 --constraint_directions ge ge ge \
+    --sweep_constraint_calibrate 4 --sweep_dual_adaptive true \
+    --sweep_constraint_views 3 --sweep_control_stop_step 5
+```
+
+`edit_diag.py` (generated images) and `pie_diag.py` (real PIE-Bench images, on
+top of `flux_inversion.py` / `pie_edit.py`) are the scripts that ran the
+diagnostic; each prints its plan with `--dry_run`. They carry their own
+constraint scaling and an averaged-constraint arm that `run_sweep.py` does not
+have.
 
 ## 7. Output
 

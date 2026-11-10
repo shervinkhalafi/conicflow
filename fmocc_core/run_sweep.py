@@ -354,6 +354,7 @@ def _assert_boffi_rng_reachability_closed(cfg, latent: Optional[torch.Tensor]) -
 # per-reward provenance comments (moved there verbatim, not summarized).
 from reward_ranges import REWARD_PLAUSIBLE_RANGE as _REWARD_PLAUSIBLE_RANGE
 import reward_normalization as _rn
+from scoring_views import augment as _augment_views
 
 # Step 4.2: explicit per-constraint direction flag. Never inferred from a
 # reward's name or sign -- CLIP/hpsv2/pickscore/imagereward/style all return
@@ -572,6 +573,29 @@ class RunConfig:
     # violation is small are not starved of dual pressure under a shared
     # lr_dual. See receding_horizon_flow_control's dual_adaptive docstring.
     dual_adaptive: bool = False
+    # ── 2026-11-09 edit-strength options (results/edit_diag; all off by default,
+    # so every earlier run is reproduced unchanged) ──────────────────────────
+    # constraint_views K > 0: every constraint score is the mean over K views of
+    # the decoded image (the image itself plus K-1 random crops / flips /
+    # low-passed copies, scoring_views.augment) during CONTROL. A single-view
+    # CLIP-family score can be raised many points by a pixel-aligned texture;
+    # that does not survive the views. Reported h_i (CSV, traces) are always
+    # single-view, so they stay comparable with runs that had this off.
+    # Text-target constraint types only; batch size 1.
+    constraint_views: int = 0
+    # control_stop_step k > 0: keep the controlled trajectory up to step k, then
+    # follow the uncontrolled flow to the end. The controller still plans as if
+    # it controlled all N steps; mu/h_dual histories keep their full length.
+    control_stop_step: int = 0
+    # constraint_calibrate n > 0: thresholds are read as PROGRESS alpha instead
+    # of raw scores. For constraint i, s0_i = score of this run's uncontrolled
+    # image, s_tgt_i = mean score of n uncontrolled samples generated FROM the
+    # constraint's own text, and the enforced threshold is
+    # s0_i + alpha_i * (s_tgt_i - s0_i). The CSV's thr_i keeps alpha (so --resume
+    # still matches); the raw values are in calib_thr / calib_s0 / calib_s_tgt.
+    # Scores of different scorers stay in their own units -- pair with
+    # dual_adaptive when mixing scorers.
+    constraint_calibrate: int = 0
     # boffi_fmrg only -- passed through to FluxFlowMapSampler.sample_reward_guided
     # (upstream's vendored FMRG-J implementation). Left at upstream's "off" defaults
     # so the paired comparison is a minimal single-particle run, not upstream's full
@@ -1967,8 +1991,16 @@ def _build_constraint_fn(
     ref_holder: dict,
     drop_text_tower: bool = False,
     reward_dtype: torch.dtype = torch.float32,
+    views: int = 0,
 ):
     """Build h(z) -> (B, C) from a list of ConstraintSpec (Step 4.1).
+
+    `views` (RunConfig.constraint_views): K > 0 scores every constraint on K
+    views of the decoded image and averages. The returned callable carries
+    `set_views(k)` (0 = single-view, used for everything that is REPORTED),
+    `set_thresholds(list)` and `score_fns` (per-constraint z -> score), which
+    is what threshold calibration needs. With views == 0 and neither setter
+    called, h is exactly what it was before these existed.
 
     Reuses ``_build_reward_fn`` per spec rather than writing parallel scorers
     (4.5): each spec gets a shallow-copied `cfg` (via ``dataclasses.replace``)
@@ -2030,6 +2062,18 @@ def _build_constraint_fn(
     # autograd graph alive between inner-loop iterations, which this box's
     # memory budget cannot spare.
     _decode_slot: dict = {"ref": None, "val": None}
+    if views:
+        _bad = [s.reward_type for s in specs if s.reward_type not in _TEXT_TARGET_REWARD_TYPES]
+        if _bad:
+            raise ValueError(
+                f"constraint_views={views} supports only text-target constraint "
+                f"types {_TEXT_TARGET_REWARD_TYPES}; got {_bad}. A style or LPIPS "
+                f"score compares against a fixed reference image, and scoring "
+                f"cropped views against the uncropped reference would measure "
+                f"the crop, not the image."
+            )
+    _view_state = {"k": int(views)}
+    _thr = [s.threshold for s in specs]
 
     def _shared_decode(z: torch.Tensor) -> torch.Tensor:
         ref = _decode_slot["ref"]
@@ -2039,16 +2083,31 @@ def _build_constraint_fn(
         _decode_slot["ref"] = None
         _decode_slot["val"] = None
         out = sampler.decode(z)
+        if _view_state["k"]:
+            if out.shape[0] != 1:
+                raise ValueError(f"constraint_views needs batch size 1, got {out.shape[0]}.")
+            out = _augment_views(out, _view_state["k"])
         _decode_slot["ref"] = weakref.ref(z)
         _decode_slot["val"] = out
         return out
 
-    def _make_hi(r_image_i, threshold, direction, normalizer):
-        """Factory to capture (r_image_i, threshold, direction, normalizer) by value."""
-        def hi(z: torch.Tensor) -> torch.Tensor:
+    def _make_score(r_image_i, normalizer):
+        def score_i(z: torch.Tensor) -> torch.Tensor:
             score = r_image_i(z)
+            if _view_state["k"]:
+                score = score.float().mean().reshape(1)     # mean over the K views
             if normalizer is not None:
                 score = normalizer(score)
+            return score
+        return score_i
+
+    def _make_hi(i, score_i, direction):
+        """Factory to capture (i, score_i, direction) by value. The threshold is
+        read from _thr at call time so calibration can set it after the scorers
+        (and the uncontrolled image they are calibrated on) exist."""
+        def hi(z: torch.Tensor) -> torch.Tensor:
+            score = score_i(z)
+            threshold = _thr[i]
             if direction == "ge":
                 return threshold - score
             else:  # "le", validated by ConstraintSpec.__post_init__
@@ -2056,7 +2115,8 @@ def _build_constraint_fn(
         return hi
 
     h_fns = []
-    for spec in specs:
+    score_fns = []
+    for _i, spec in enumerate(specs):
         spec_cfg = cfg
         if spec.reward_type in _TEXT_TARGET_REWARD_TYPES:
             spec_cfg = _dc_replace(cfg, edit_prompt=spec.arg)
@@ -2094,9 +2154,96 @@ def _build_constraint_fn(
                 prompt=(cfg.prompt if spec.bind_mode == "prompt" else None),
             )
 
-        h_fns.append(_make_hi(r_image_i, spec.threshold, spec.direction, normalizer))
+        score_fns.append(_make_score(r_image_i, normalizer))
+        h_fns.append(_make_hi(_i, score_fns[-1], spec.direction))
 
-    return stack_constraints(h_fns)
+    combined = stack_constraints(h_fns)
+
+    def _set_views(k: int) -> None:
+        if int(k) == _view_state["k"]:
+            return                       # nothing changes; in particular a run with views off
+        _view_state["k"] = int(k)
+        _decode_slot["ref"] = None       # a cached decode belongs to the old view count
+        _decode_slot["val"] = None
+
+    def _set_thresholds(new) -> None:
+        new = [float(t) for t in new]
+        if len(new) != len(_thr):
+            raise ValueError(f"set_thresholds: {len(new)} values for {len(_thr)} constraints.")
+        _thr[:] = new
+
+    combined.set_views = _set_views
+    combined.set_thresholds = _set_thresholds
+    combined.score_fns = score_fns
+    return combined
+
+
+def _calibrate_thresholds(sampler, cfg, specs, h_fn, z_unc, device, dtype, log=print) -> dict:
+    """Resolve progress thresholds (RunConfig.constraint_calibrate) to raw ones.
+
+    For constraint i with text t_i:  s0_i = score_i(uncontrolled image),
+    s_tgt_i = mean of score_i over n uncontrolled samples generated from t_i,
+    raw threshold = s0_i + alpha_i * (s_tgt_i - s0_i), alpha_i = spec.threshold.
+    alpha = 1 asks the image to score like a real sample of the text.
+
+    Single-view scores throughout, whatever constraint_views is. Target samples
+    use their own generators (seeds 1000..), so the global RNG, and with it
+    everything a non-calibrated run draws, is untouched. Raises rather than
+    guesses when a text was not embedded at load or when the target samples do
+    not score on the satisfying side of the uncontrolled image.
+    """
+    bad = [s.reward_type for s in specs if s.reward_type not in _TEXT_TARGET_REWARD_TYPES]
+    if bad:
+        raise ValueError(f"constraint_calibrate supports only text-target constraint types "
+                         f"{_TEXT_TARGET_REWARD_TYPES}; got {bad}.")
+    if any(s.normalize for s in specs):
+        raise ValueError("constraint_calibrate and --constraint_normalize are two different "
+                         "normalizations of the same threshold; use one.")
+    missing = [s.arg for s in specs if s.arg not in sampler.prompt_cache]
+    if missing:
+        raise ValueError(
+            f"constraint_calibrate needs samples generated from each constraint text, but "
+            f"{missing} were not embedded when the sampler loaded (the text encoders are "
+            f"freed after that). run_sweep's CLI embeds them itself; a caller building its "
+            f"own sampler must pass them as additional_prompts."
+        )
+    n = int(cfg.constraint_calibrate)
+    saved = (sampler.cached_prompt_embeds, sampler.cached_pooled_prompt_embeds, sampler.prompt_text)
+    h_fn.set_views(0)
+    try:
+        with torch.no_grad():
+            zu = z_unc.to(device=device, dtype=dtype)
+            s0 = [float(f(zu).float().mean()) for f in h_fn.score_fns]
+            tgt = [[] for _ in specs]
+            for text in dict.fromkeys(s.arg for s in specs):
+                sampler.set_prompt_embeddings(text)
+                for j in range(n):
+                    g = torch.Generator(device=device).manual_seed(1000 + j)
+                    zi = torch.randn(tuple(z_unc.shape), device=device, dtype=dtype, generator=g)
+                    zt, _ = _run_uncontrolled(sampler, zi, cfg, device, dtype, log=lambda *a, **k: None)
+                    for i, s in enumerate(specs):
+                        if s.arg == text:
+                            tgt[i].append(float(h_fn.score_fns[i](zt).float().mean()))
+                    _free(zt)
+    finally:
+        sampler.cached_prompt_embeds, sampler.cached_pooled_prompt_embeds, sampler.prompt_text = saved
+        h_fn.set_views(cfg.constraint_views)
+    s_tgt = [sum(v) / len(v) for v in tgt]
+    thr = []
+    log(f"  calibration ({n} sample(s) per constraint text):")
+    for i, s in enumerate(specs):
+        gap = s_tgt[i] - s0[i]
+        if (gap <= 0) if s.direction == "ge" else (gap >= 0):
+            raise ValueError(
+                f"constraint_calibrate: samples generated from {s.arg!r} score {s_tgt[i]:.4g} on "
+                f"{s.reward_type}, not on the satisfying ({s.direction}) side of the uncontrolled "
+                f"image's {s0[i]:.4g}. This scorer does not separate the two, so a progress "
+                f"threshold on it is undefined; drop it or give it a raw threshold in a separate run."
+            )
+        thr.append(s0[i] + float(s.threshold) * gap)
+        log(f"    {s.reward_type}:{s.arg!r}  s0={s0[i]:.4g}  s_tgt={s_tgt[i]:.4g}  "
+            f"alpha={float(s.threshold):g}  ->  {s.direction} {thr[-1]:.4g}")
+    return {"s0": s0, "s_tgt": s_tgt, "thr": thr}
 
 
 def _build_boffi_reward_ensemble(reward_device, reward_model: str) -> RewardEnsemble:
@@ -2379,6 +2526,7 @@ def _run_one(
         h_fn = _build_constraint_fn(
             sampler, cfg, _constraint_specs, reward_device, dtype, ref_holder,
             drop_text_tower=_drop_towers, reward_dtype=reward_dtype,
+            views=cfg.constraint_views,
         )
         log(f"  constraint: {n_constraints} constraint(s)  "
             f"{[(s.reward_type, s.arg, s.direction, s.threshold, s.normalize) for s in _constraint_specs]}  "
@@ -2430,6 +2578,13 @@ def _run_one(
         "this assert; this should be structurally unreachable, so hitting "
         "it means the _lpips_needs_ref condition itself has a gap."
     )
+    _calib = None
+    if cfg.constraint_calibrate:
+        if h_fn is None:
+            raise ValueError("constraint_calibrate needs at least one constraint.")
+        _calib = _calibrate_thresholds(sampler, cfg, _constraint_specs, h_fn, z_unc,
+                                       device, dtype, log=log)
+        h_fn.set_thresholds(_calib["thr"])
     r_unc_final = eval_r(z_unc).mean().item()
     _free(z_unc)
 
@@ -2462,6 +2617,19 @@ def _run_one(
             f"silently record nothing."
         )
 
+    # Bound before the guard, not inside it: control_type="none" skips the whole
+    # control block but _run_one still writes hardflow_lr_eff into its result
+    # dict, so leaving it to the hardflow path made every "none" run die with
+    # UnboundLocalError (found 2026-09-22 probing a new prompt pair's baseline).
+    hardflow_lr_eff = ""          # filled on the hardflow path; blank elsewhere
+
+    if cfg.control_stop_step and not (
+            cfg.control_type in ("mpc", "hardflow", "fmrg") and 0 < cfg.control_stop_step < cfg.N):
+        raise ValueError(
+            f"control_stop_step={cfg.control_stop_step} needs control_type mpc / hardflow / fmrg "
+            f"and 0 < step < N={cfg.N}; got control_type={cfg.control_type!r}."
+        )
+
     if cfg.control_type != "none":
         v_theta, _, endpoint_map = make_flux_wrappers(
             sampler, cfg.prompt,
@@ -2473,7 +2641,6 @@ def _run_one(
 
         log(f"  {cfg.control_type} run...")
         t0 = time.perf_counter()
-        hardflow_lr_eff = ""          # filled on the hardflow path; blank elsewhere
 
         if cfg.control_type == "mpc":
             z_ctrl, traj_ctrl, _, mu_final, mu_hist, h_dual_hist = receding_horizon_flow_control(
@@ -2583,6 +2750,30 @@ def _run_one(
             del boffi_reward
 
         time_ctrl = time.perf_counter() - t0
+
+        # Everything from here on is REPORTED, so constraints go back to
+        # single-view scoring (no-op when constraint_views is 0).
+        if h_fn is not None:
+            h_fn.set_views(0)
+
+        # control_stop_step: keep the controlled states up to step k, then the
+        # uncontrolled flow. The tail uses the same v_theta the energy
+        # accounting uses, so its control norms sit at the bf16 rounding floor
+        # rather than at exactly zero (measured: ~0.2 in norm per step, under
+        # 0.5% of the run's energy).
+        if cfg.control_stop_step:
+            _k = int(cfg.control_stop_step)
+            log(f"  control_stop_step={_k}: uncontrolled flow for steps {_k}..{cfg.N - 1}")
+            with torch.no_grad():
+                _dt = 1.0 / cfg.N
+                _sg = torch.linspace(0.0, 1.0, cfg.N + 1)
+                _z = traj_ctrl[_k].to(device=device, dtype=dtype)
+                _tail = []
+                for _j in range(_k, cfg.N):
+                    _z = _z + _dt * v_theta(_sg[_j].to(device), _z)
+                    _tail.append(_z.to(device=traj_ctrl.device, dtype=traj_ctrl.dtype))
+                traj_ctrl = torch.cat([traj_ctrl[:_k + 1], torch.stack(_tail, dim=0)], dim=0)
+                z_ctrl = _z
 
         if cfg.control_type == "boffi_fmrg":
             if reward_model.lower() != "clip":
@@ -2781,6 +2972,14 @@ def _run_one(
         if use_endpoint and len(constraint_traj) > 1:
             _stale = [k for k in range(1, len(constraint_traj))
                       if np.array_equal(constraint_traj_raw[k], constraint_traj[k - 1])]
+            # control_stop_step makes the LAST step uncontrolled, and an
+            # uncontrolled last step lands exactly on the endpoint the previous
+            # state predicted (it is the same flow-map call), so there the
+            # equality is the dynamics, not a cache collision. Found 2026-11-09:
+            # both control_stop_step=5 verification runs were flagged at step N
+            # and nowhere else. Only that one index is exempt, only with the option on.
+            if cfg.control_stop_step:
+                _stale = [k for k in _stale if k != len(constraint_traj) - 1]
             if _stale:
                 run_ok_stale = True
                 print(
@@ -3014,6 +3213,12 @@ def _run_one(
         n_alt         = cfg.n_alt,
         skip_first_primal_step = cfg.skip_first_primal_step,
         dual_adaptive = cfg.dual_adaptive,
+        constraint_views     = cfg.constraint_views,
+        control_stop_step    = cfg.control_stop_step,
+        constraint_calibrate = cfg.constraint_calibrate,
+        calib_thr   = ",".join(f"{v:.6g}" for v in _calib["thr"]) if _calib else "",
+        calib_s0    = ",".join(f"{v:.6g}" for v in _calib["s0"]) if _calib else "",
+        calib_s_tgt = ",".join(f"{v:.6g}" for v in _calib["s_tgt"]) if _calib else "",
         drift_detach  = cfg.drift_detach,
         constraint_on = cfg.constraint_on,
         endpoint_surrogate = cfg.endpoint_surrogate,
@@ -3576,6 +3781,9 @@ CSV_KEYS = [
     # rows under the header already on disk, so inserting a column mid-list
     # silently shifts every column after it in the appended rows.
     "dual_adaptive",
+    # 2026-11-09, APPENDED for the same reason.
+    "constraint_views", "control_stop_step", "constraint_calibrate",
+    "calib_thr", "calib_s0", "calib_s_tgt",
 ]
 
 
@@ -3600,6 +3808,7 @@ _RESUME_KEY_FIELDS = [
     "hardflow_endpoint_mode", "hardflow_lr_alpha",
     "seed", "lr_dual", "mu_init", "lpips_net",
     "dual_adaptive",
+    "constraint_views", "control_stop_step", "constraint_calibrate",
 ]
 
 # Sweep axes that do NOT round-trip through the CSV. If a resumed sweep varies
@@ -3674,7 +3883,8 @@ def _resume_key_from_cfg(cfg, reward_model: str) -> tuple:
 # Fields added to _RESUME_KEY_FIELDS after rows were already written: a CSV
 # predating the column has no value for it, so reading it as "" would never
 # match a config carrying the field's default. Map missing -> the default.
-_RESUME_FIELD_DEFAULTS = {"dual_adaptive": False}
+_RESUME_FIELD_DEFAULTS = {"dual_adaptive": False, "constraint_views": 0,
+                          "control_stop_step": 0, "constraint_calibrate": 0}
 
 
 def _resume_key_from_row(row: dict) -> tuple:
@@ -3797,6 +4007,8 @@ def _build_configs_from_args(args) -> List[RunConfig]:
         "endpoint_surrogate",
         # dual_adaptive (2026-09-20) APPENDED for the same reason.
         "dual_adaptive",
+        # 2026-11-09, APPENDED likewise.
+        "constraint_views", "control_stop_step", "constraint_calibrate",
     ]
     for f in sweep_fields:
         val = getattr(args, f"sweep_{f}", None)
@@ -4158,6 +4370,26 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                              "invariant to rescaling any h_c. Requires constraints "
                              "active (h + lr_dual>0), same as the other dual "
                              "options. Default False = plain dual ascent.")
+    parser.add_argument("--sweep_constraint_views", nargs="+", type=int, metavar="K",
+                        help="Score every constraint on K views of the decoded image "
+                             "(the image plus K-1 random crops / flips / low-passed "
+                             "copies) and average, during control. Stops a CLIP-family "
+                             "constraint being met by a pixel-aligned texture. Reported "
+                             "h_i stay single-view. Text-target constraint types only. "
+                             "Default 0 = off. 6 fits with one scorer on a 24 GB card; "
+                             "three scorers need 3.")
+    parser.add_argument("--sweep_control_stop_step", nargs="+", type=int, metavar="STEP",
+                        help="mpc / hardflow / fmrg. Keep the controlled trajectory up to "
+                             "this step, then follow the uncontrolled flow to the end "
+                             "(0 < STEP < N). Default 0 = control every step.")
+    parser.add_argument("--sweep_constraint_calibrate", nargs="+", type=int, metavar="N",
+                        help="Read --constraint_thresholds as progress alpha: 0 = this "
+                             "run's uncontrolled image, 1 = the mean score of N "
+                             "uncontrolled samples generated from the constraint's own "
+                             "text. Makes thresholds comparable across scorers; pair "
+                             "with --sweep_dual_adaptive true when mixing scorers. "
+                             "Text-target types only, not with --constraint_normalize. "
+                             "Default 0 = thresholds are raw scores.")
     parser.add_argument("--sweep_skip_first_primal_step", nargs="+",
                         type=lambda x: x.lower() != "false", metavar="BOOL",
                         help="MPC only. Plan Step 7 option (b): one dual-ascent "
@@ -4446,6 +4678,13 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
     # Use the first prompt as the initial cached embedding; it will be
     # re-encoded in _run_one when a different prompt is encountered.
     first_prompt = configs[0].prompt if configs else "a photo"
+    # constraint_calibrate samples from each constraint's own text, and the text
+    # encoders are freed once the sampler has loaded, so those texts are embedded
+    # now. None (the default for every run without it) leaves the load unchanged.
+    _calib_prompts = sorted({
+        s.arg for c in configs if c.constraint_calibrate
+        for s in _resolve_constraint_specs(c) if s.reward_type in _TEXT_TARGET_REWARD_TYPES
+    }) or None
     try:
         sampler = FluxFlowMapSampler(
             model_id=args.model_id,
@@ -4453,6 +4692,7 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
             device=str(flux_device),
             dtype=torch.bfloat16,
             prompt=first_prompt,
+            additional_prompts=_calib_prompts,
             quantize_mode=args.quantize,
         )
     except Exception as e:
@@ -4553,6 +4793,9 @@ Filter SWEEP_CONFIGS by index with --configs 0,2,4.
                     "warmstart": cfg.warmstart, "n_alt": cfg.n_alt,
                     "skip_first_primal_step": cfg.skip_first_primal_step,
                     "dual_adaptive": cfg.dual_adaptive,
+                    "constraint_views": cfg.constraint_views,
+                    "control_stop_step": cfg.control_stop_step,
+                    "constraint_calibrate": cfg.constraint_calibrate,
                     "drift_detach": cfg.drift_detach,
                     "constraint_on": cfg.constraint_on,
                     "n_constraints": len(cfg.constraint_prompts),
